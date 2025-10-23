@@ -1,0 +1,2 @@
+recursive-include trisul_ai_cli/chroma_store *
+
