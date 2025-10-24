@@ -23,26 +23,26 @@ logging.basicConfig(
 
 mcp = FastMCP(name="trisul-mcp-server")
 
-
+# helper function
 def normalize_context(ctx: str) -> str:
     try:
-        logging.debug(f"[Server] Normalizing context: {ctx}")
+        logging.debug(f"[normalize_context] Normalizing context: {ctx}")
         if ctx.startswith("context_"):
             ctx = ctx.split("_", 1)[-1]
         if ctx == "default" or ctx == "context0":
             normalized = "context0"
         else:
             normalized = f"context_{ctx}"
-        logging.debug(f"[Server] Normalized context: {normalized}")
+        logging.debug(f"[normalize_context] Normalized context: {normalized}")
         return normalized
     except Exception as e:
-        logging.error(f"Error normalizing context '{ctx}': {str(e)}")
+        logging.error(f"[normalize_context] Error normalizing context '{ctx}': {str(e)}")
         return "context0"  # Default fallback
 
 
-
-def countergroup_info(context: str = "context0", get_meter_info: bool = False):
-    """Fetch all counter groups information from Trisul via ZMQ for a given context.
+# helper function
+def countergroup_info(zmq_endpoint: str = None, context: str = "context0", get_meter_info: bool = False):
+    """Fetch all counter groups information from Trisul via ZMQ for a given zmq_endpoint.
     and it will also fetch meters info for each counter group so that we can determine what each meter means and its index.
     for example if we want to get the counter group guid for "FlowIntfs" and meter index for "Received traffic" we can use this function.
     Example output:
@@ -56,107 +56,109 @@ def countergroup_info(context: str = "context0", get_meter_info: bool = False):
             ]
         }, ...]
     
-    Arguments: context (str): Context name
+    Arguments: zmq_endpoint (str): ZMQ Endpoint
     Returns: dict: Dictionary containing counter group information.
     """
     try:
-        logging.info(f"[Server] Starting countergroup_info for context: {context}, get_meter_info: {get_meter_info}")
-        context = normalize_context(context)
+        logging.info(f"[countergroup_info] Starting countergroup_info for zmq_endpoint: {zmq_endpoint}, get_meter_info: {get_meter_info}")
+        # context = normalize_context(context)
         
-        zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{context}/run/trp_0"
+        # zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{context}/run/trp_0"
             
-        logging.info(f"[Server] Connecting to ZMQ endpoint: {zmq_endpoint}")
+        logging.info(f"[countergroup_info] Connecting to ZMQ endpoint: {zmq_endpoint}")
         
         # helper with timeout
         def get_response(zmq_endpoint, req, timeout_ms=10000):
             context_zmq = None
             socket = None
             try:
-                logging.debug(f"[Server] Initializing ZMQ context and socket")
+                logging.debug(f"[countergroup_info] Initializing ZMQ context and socket")
                 context_zmq = zmq.Context()
                 socket = context_zmq.socket(zmq.REQ)
                 socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
                 socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
                 
                 socket.connect(zmq_endpoint)
-                logging.info("[Server] Connected, sending request...")
+                logging.info("[countergroup_info] Connected, sending request...")
                 socket.send(req.SerializeToString())
-                logging.info("[Server] Request sent, waiting for response...")
+                logging.info("[countergroup_info] Request sent, waiting for response...")
                 
                 data = socket.recv()
-                logging.info(f"[Server] Response received, size: {len(data)} bytes")
+                logging.info(f"[countergroup_info] Response received, size: {len(data)} bytes")
                 resp = unwrap_response(data)
                 return resp
             except zmq.Again:
-                error_msg = f"ZMQ timeout after {timeout_ms}ms - no response from {zmq_endpoint}"
+                error_msg = f"[countergroup_info] ZMQ timeout after {timeout_ms}ms - no response from {zmq_endpoint}"
                 logging.error(error_msg)
                 raise Exception(error_msg)
             except zmq.ZMQError as e:
-                error_msg = f"ZMQ error: {str(e)}"
+                error_msg = f"[countergroup_info] ZMQ error: {str(e)}"
                 logging.error(error_msg)
                 raise Exception(error_msg)
             except Exception as e:
-                error_msg = f"Unexpected error in get_response: {str(e)}"
+                error_msg = f"[countergroup_info] Unexpected error in get_response: {str(e)}"
                 logging.error(error_msg)
                 raise Exception(error_msg)
             finally:
                 if socket:
                     try:
                         socket.close()
-                        logging.debug("[Server] Socket closed")
+                        logging.debug("[countergroup_info] Socket closed")
                     except Exception as e:
                         logging.warning(f"Error closing socket: {str(e)}")
                 if context_zmq:
                     try:
                         context_zmq.term()
-                        logging.debug("[Server] ZMQ context terminated")
+                        logging.debug("[countergroup_info] ZMQ context terminated")
                     except Exception as e:
-                        logging.warning(f"Error terminating ZMQ context: {str(e)}")
+                        logging.warning(f"[countergroup_info] Error terminating ZMQ context: {str(e)}")
         
         # helper
         def unwrap_response(data):
             try:
-                logging.debug("[Server] Unwrapping response")
+                logging.debug("[countergroup_info] Unwrapping response")
                 resp = trp_pb2.Message()
                 resp.ParseFromString(data)
                 for x in resp.DESCRIPTOR.enum_types:
                     name = x.values_by_number.get(int(resp.trp_command)).name
-                logging.debug(f"[Server] Response command: {name}")
+                logging.debug(f"[countergroup_info] Response command: {name}")
                 return {
                     'COUNTER_GROUP_INFO_RESPONSE': resp.counter_group_info_response
                 }.get(name, resp)
             except Exception as e:
-                logging.error(f"Error unwrapping response: {str(e)}")
+                logging.error(f"[countergroup_info] Error unwrapping response: {str(e)}")
                 raise
         
         # to retrieve all counter groups send an empty COUNTER_GROUP_INFO_REQUEST
         try:
-            logging.debug("[Server] Building COUNTER_GROUP_INFO_REQUEST")
+            logging.debug("[countergroup_info] Building COUNTER_GROUP_INFO_REQUEST")
             req = trp_pb2.Message()
             req.trp_command = req.COUNTER_GROUP_INFO_REQUEST
             req.counter_group_info_request.get_meter_info = get_meter_info
         except Exception as e:
-            logging.error(f"Error building request: {str(e)}")
+            logging.error(f"[countergroup_info] Error building request: {str(e)}")
             raise
         
-        logging.info("[Server] Sending COUNTER_GROUP_INFO_REQUEST...")
+        logging.info("[countergroup_info] Sending COUNTER_GROUP_INFO_REQUEST...")
         resp = get_response(zmq_endpoint, req)
         result = MessageToDict(resp)
-        logging.info(f"[Server] Received response with {len(result.get('groupDetails', []))} groups")
+        logging.info(f"[countergroup_info] Received response with {len(result.get('groupDetails', []))} groups")
         return result
         
     except Exception as e:
-        logging.error(f"Error in countergroup_info: {str(e)}", exc_info=True)
+        logging.error(f"[countergroup_info] Error in countergroup_info: {str(e)}", exc_info=True)
         return {"error": str(e), "groupDetails": []}
 
 
 
 @mcp.tool()
-def list_all_available_counter_groups(context: str = "context0"):
-    """List all available counter groups from Trisul via ZMQ for a given context.
-    Arguments: context (str): Context name, should be like context_XYZ or default or context0 etc.
+def list_all_available_counter_groups(context: str = "context0", zmq_endpoint: str = None):
+    """List all available counter groups from Trisul via ZMQ for a given context or the zmq_endpoint.
+    Arguments: 
+        context (str): Context name, should be like context_XYZ or default or context0 etc.
+        zmq_endpoint (str): ZMQ endpoint in the format "tcp://<ip_address>:<port>", for example "tcp://10.16.8.44:5008". The IP address and port may vary.
     Returns: dict: Dictionary containing counter group information.
-    Example: list_all_available_counter_groups("context_XYZ") -> 
+    Example: list_all_available_counter_groups("context_XYZ") or list_all_available_counter_groups("tcp://10.16.8.44:5008") -> 
         {
             "groupDetails": [
                 {"guid": "{XXXXXXXX-XXXX-XXXXXXXX-XXXXXXXXXXXXX}", "name": "ABC"},
@@ -166,45 +168,51 @@ def list_all_available_counter_groups(context: str = "context0"):
         }
     """
     try:
-        logging.info(f"[Server] Listing all available counter groups for context: {context}")
-        all_cgs = countergroup_info(context, get_meter_info=False)
+        if not zmq_endpoint:
+            context = normalize_context(context)
+            zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{context}/run/trp_0"
+
+        logging.info(f"[list_all_available_counter_groups] Listing all available counter groups for zmq_endpoint: {zmq_endpoint}")
+
+        all_cgs = countergroup_info(zmq_endpoint, get_meter_info=False)
         
         if "error" in all_cgs:
-            logging.error(f"Error from countergroup_info: {all_cgs['error']}")
+            logging.error(f"[list_all_available_counter_groups] Error from countergroup_info: {all_cgs['error']}")
             return {"error": all_cgs["error"], "groupDetails": []}
         
         group_details = all_cgs.get("groupDetails", [])
-        logging.debug(f"[Server] Processing {len(group_details)} counter groups")
+        logging.debug(f"[list_all_available_counter_groups] Processing {len(group_details)} counter groups")
         
         simplified_groups = []
         for g in group_details:
             try:
                 simplified_groups.append({"guid": g["guid"], "name": g["name"]})
             except KeyError as e:
-                logging.warning(f"Missing key in group details: {str(e)}, skipping group")
+                logging.warning(f"[list_all_available_counter_groups] Missing key in group details: {str(e)}, skipping group")
                 continue
         
-        logging.info(f"[Server] Retrieved {len(simplified_groups)} counter groups")
+        logging.info(f"[list_all_available_counter_groups] Retrieved {len(simplified_groups)} counter groups")
         return {"groupDetails": simplified_groups}
         
     except Exception as e:
-        logging.error(f"Error in list_all_available_counter_groups: {str(e)}", exc_info=True)
+        logging.error(f"[list_all_available_counter_groups] Error in list_all_available_counter_groups: {str(e)}", exc_info=True)
         return {"error": str(e), "groupDetails": []}
 
 
 
 @mcp.tool()
-def get_cginfo_from_countergroup_name(countergroup_name: str, context: str = "context0"):
-    """Fetch counter group details by counter group name from Trisul via ZMQ for a given context.
+def get_cginfo_from_countergroup_name(countergroup_name: str, context: str = "context0", zmq_endpoint: str = None):
+    """Fetch counter group details by counter group name from Trisul via ZMQ for a given context or the zmq_endpoint.
     and it will also fetch meters info for each counter group so that we can determine what each meter means and its index.
-    for example if we want to get the counter group guid for "FlowIntfs" and meter index for "Received traffic" we can use this function.
+    for example if we want to get the counter group guid for "ABCDE" and meter index for "Received traffic" we can use this function.
     Arguments: 
         countergroup_name (str): Counter group name
         context (str): Context name, should be like context_XYZ or default or context0 etc.
+        zmq_endpoint (str): ZMQ endpoint in the format "tcp://<ip_address>:<port>", for example "tcp://10.16.8.44:5008". The IP address and port may vary.
     Returns: dict: Counter Group Details . If not found, it will return the list of all available counter groups name and the guid.
     Example: get_cginfo_from_countergroup_name("ABC", "context0") -> 
         {
-            "guid": "{XXXXXXXX-XXXX-XXXXXXXX-XXXXXXXXXXXXX}","name": "FlowIntfs","bucketSize": "60000","topperBucketSize": "300",
+            "guid": "{XXXXXXXX-XXXX-XXXXXXXX-XXXXXXXXXXXXX}","name": "ABCDE","bucketSize": "60000","topperBucketSize": "300",
             "timeInterval": { "from": {"tvSec": "1718711400","tvUsec": "0"}, "to": {"tvSec": "1718712060","tvUsec": "0"} },
             "meters": [
                 { "id": 0, "type": "VT_RATE_COUNTER", "topcount": 1000, "name": "Bps", "description": "Total", "units": "Bps" },
@@ -214,21 +222,25 @@ def get_cginfo_from_countergroup_name(countergroup_name: str, context: str = "co
         }
     """
     try:
-        logging.info(f"[Server] Fetching counter group info for name: {countergroup_name}, context: {context}")
+        if not zmq_endpoint:
+            context = normalize_context(context)
+            zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{context}/run/trp_0"
+            
+        logging.info(f"[get_cginfo_from_countergroup_name] Fetching counter group info for name: {countergroup_name}, zmq_endpoint: {zmq_endpoint}")
         
         # Get all counter groups (with meter info if available)
-        all_cgs = countergroup_info(context, get_meter_info=True)
+        all_cgs = countergroup_info(zmq_endpoint, get_meter_info=True)
         
         if "error" in all_cgs:
-            logging.error(f"Error from countergroup_info: {all_cgs['error']}")
+            logging.error(f"[get_cginfo_from_countergroup_name] Error from countergroup_info: {all_cgs['error']}")
             return {"name": countergroup_name, "guid": f"Error: {all_cgs['error']}"}
         
         group_details = all_cgs.get("groupDetails", [])
-        logging.info(f"[Server] Retrieved {len(group_details)} counter groups")
+        logging.info(f"[get_cginfo_from_countergroup_name] Retrieved {len(group_details)} counter groups")
         
         group_names = []
         normalized_search_name = countergroup_name.lower().replace(" ", "")
-        logging.debug(f"[Server] Normalized search name: {normalized_search_name}")
+        logging.debug(f"[get_cginfo_from_countergroup_name] Normalized search name: {normalized_search_name}")
         
         for group in group_details:
             try:
@@ -237,14 +249,14 @@ def get_cginfo_from_countergroup_name(countergroup_name: str, context: str = "co
                 
                 normalized_group_name = group_name.lower().replace(" ", "")
                 if normalized_group_name == normalized_search_name:
-                    logging.info(f"[Server] Found matching counter group: {group_name}")
+                    logging.info(f"[get_cginfo_from_countergroup_name] Found matching counter group: {group_name}")
                     return group  # return full raw group dict
             except Exception as e:
-                logging.warning(f"Error processing group: {str(e)}, skipping")
+                logging.warning(f"[get_cginfo_from_countergroup_name] Error processing group: {str(e)}, skipping")
                 continue
         
         # If not found
-        logging.warning(f"Counter group '{countergroup_name}' not found. Available groups: {group_names}")
+        logging.warning(f"[get_cginfo_from_countergroup_name] Counter group '{countergroup_name}' not found. Available groups: {group_names}")
         return {
             "name": countergroup_name,
             "guid": "Not Found",
@@ -252,7 +264,7 @@ def get_cginfo_from_countergroup_name(countergroup_name: str, context: str = "co
         }
             
     except Exception as e:
-        logging.error(f"Error in get_cginfo_from_countergroup_name: {str(e)}", exc_info=True)
+        logging.error(f"[get_cginfo_from_countergroup_name] Error in get_cginfo_from_countergroup_name: {str(e)}", exc_info=True)
         return {"name": countergroup_name, "guid": f"Error: {str(e)}"}
     
 
@@ -261,7 +273,10 @@ def get_cginfo_from_countergroup_name(countergroup_name: str, context: str = "co
 def get_counter_group_topper(counter_group_guid: str, meter: int = 0, duration_secs: int = 3600, max_count: int = 10, context: str = "context0", zmq_endpoint: str = None):
     """
     Fetch the topper metrics for a given counter group and meter over the last `duration_secs` seconds.
-    Arguments: counter_group_guid (str): GUID of the Counter group , meter (int): Meter index, duration_secs (int): Duration in seconds, max_count (int): maximum number of toppers retrive, context (str): Context name, zmp_endpoint (str): a zmq endpoint to connect over tcp
+    Arguments: 
+    counter_group_guid (str): GUID of the Counter group , meter (int): Meter index, duration_secs (int): Duration in seconds, max_count (int): maximum number of toppers retrive, 
+    context (str): Context name, 
+    zmp_endpoint (str): ZMQ endpoint in the format "tcp://<ip_address>:<port>", for example "tcp://10.16.8.44:5008". The IP address and port may vary.
     Returns: dict: Dictionary containing topper metrics.
     Example: get_counter_group_topper("{XXXXXXXX-XXXX-XXXXXXXX-XXXXXXXXXXXXX}", 0, 3600, "context0") or
              get_counter_group_topper("{XXXXXXXX-XXXX-XXXXXXXX-XXXXXXXXXXXXX}", 0, 3600, "tcp://10.16.8.44:5008")-> 
@@ -277,69 +292,68 @@ def get_counter_group_topper(counter_group_guid: str, meter: int = 0, duration_s
         if not zmq_endpoint:
             context = normalize_context(context)
             zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{context}/run/trp_0"
-            logging.info(f"[Server] Fetching counter group topper: counter_group_guid={counter_group_guid}, meter={meter}, duration_secs={duration_secs}, max_count={max_count}, context={context}")
-        else:
-            logging.info(f"[Server] Fetching counter group topper: counter_group_guid={counter_group_guid}, meter={meter}, duration_secs={duration_secs}, max_count={max_count}, zmq_endpoint={zmq_endpoint}")
+        
+        logging.info(f"[get_counter_group_topper] Fetching counter group topper: counter_group_guid={counter_group_guid}, meter={meter}, duration_secs={duration_secs}, max_count={max_count}, context={zmq_endpoint}")
 
         def get_response(req):
             nonlocal zmq_context, socket
             try:
-                logging.debug("[Server] Initializing ZMQ context and socket for get_response")
+                logging.debug("[get_counter_group_topper] Initializing ZMQ context and socket for get_response")
                 zmq_context = zmq.Context()
                 socket = zmq_context.socket(zmq.REQ)
                 socket.connect(zmq_endpoint)
-                logging.debug("[Server] Sending request")
+                logging.debug("[get_counter_group_topper] Sending request")
                 socket.send(req.SerializeToString())
-                logging.debug("[Server] Waiting for response")
+                logging.debug("[get_counter_group_topper] Waiting for response")
                 data = socket.recv()
-                logging.debug(f"[Server] Received response, size: {len(data)} bytes")
+                logging.debug(f"[get_counter_group_topper] Received response, size: {len(data)} bytes")
                 return unwrap_response(data)
             except zmq.ZMQError as e:
-                logging.error(f"ZMQ error in get_response: {str(e)}")
+                logging.error(f"[get_counter_group_topper] ZMQ error in get_response: {str(e)}")
                 raise
             except Exception as e:
-                logging.error(f"Error in get_response: {str(e)}")
+                logging.error(f"[get_counter_group_topper] Error in get_response: {str(e)}")
                 raise
             finally:
                 if socket:
                     try:
                         socket.close()
-                        logging.debug("[Server] Socket closed")
+                        logging.debug("[get_counter_group_topper] Socket closed")
                     except Exception as e:
-                        logging.warning(f"Error closing socket: {str(e)}")
+                        logging.warning(f"[get_counter_group_topper] Error closing socket: {str(e)}")
                 if zmq_context:
                     try:
                         zmq_context.term()
-                        logging.debug("[Server] ZMQ context terminated")
+                        logging.debug("[get_counter_group_topper] ZMQ context terminated")
                     except Exception as e:
-                        logging.warning(f"Error terminating ZMQ context: {str(e)}")
+                        logging.warning(f"[get_counter_group_topper] Error terminating ZMQ context: {str(e)}")
 
         def unwrap_response(data):
             try:
-                logging.debug("[Server] Unwrapping response")
+                logging.debug("[get_counter_group_topper] Unwrapping response")
                 resp = trp_pb2.Message()
                 resp.ParseFromString(data)
                 for x in resp.DESCRIPTOR.enum_types:
                     name = x.values_by_number.get(int(resp.trp_command)).name
-                logging.debug(f"[Server] Response command: {name}")
+                logging.debug(f"[get_counter_group_topper] Response command: {name}")
                 return {
                     'TIMESLICES_RESPONSE': resp.time_slices_response,
                     'COUNTER_GROUP_TOPPER_RESPONSE': resp.counter_group_topper_response
                 }.get(name, resp)
             except Exception as e:
-                logging.error(f"Error unwrapping response: {str(e)}")
+                logging.error(f"[get_counter_group_topper] Error unwrapping response: {str(e)}")
                 raise
 
         # Step 1: Get available timeslices
-        logging.debug("[Server] Step 1: Getting available timeslices")
+        logging.debug("[get_counter_group_topper] Step 1: Getting available timeslices")
         req = trp_pb2.Message()
         req.trp_command = req.TIMESLICES_REQUEST
         req.time_slices_request.get_total_window = True
         resp = get_response(req)
-        logging.debug("[Server] Timeslices received")
+        logging.debug("[get_counter_group_topper] Timeslices received")
 
         # Step 2: Build topper request
-        logging.debug("[Server] Step 2: Building topper request")
+        logging.debug("[get_counter_group_topper] Step 2: Building topper request")
         req = trp_pb2.Message()
         req.trp_command = req.COUNTER_GROUP_TOPPER_REQUEST
         req.counter_group_topper_request.counter_group = counter_group_guid
@@ -347,24 +361,24 @@ def get_counter_group_topper(counter_group_guid: str, meter: int = 0, duration_s
         req.counter_group_topper_request.maxitems = max_count
 
         # Step 3: Time interval for last duration_secs
-        logging.debug("[Server] Step 3: Setting time interval")
+        logging.debug("[get_counter_group_topper] Step 3: Setting time interval")
         tm = trp_pb2.TimeInterval()
         tm.to.tv_sec = resp.total_window.to.tv_sec
         object = getattr(tm, 'from')
         object.tv_sec = tm.to.tv_sec - duration_secs
         req.counter_group_topper_request.time_interval.MergeFrom(tm)
-        logging.debug(f"[Server] Time interval: from={object.tv_sec}, to={tm.to.tv_sec}")
+        logging.debug(f"[get_counter_group_topper] Time interval: from={object.tv_sec}, to={tm.to.tv_sec}")
 
         # Step 4: Get topper response
-        logging.debug("[Server] Step 4: Getting topper response")
+        logging.debug("[get_counter_group_topper] Step 4: Getting topper response")
         resp = get_response(req)
-        logging.info("[Server] Successfully retrieved counter group topper")
+        logging.info("[get_counter_group_topper] Successfully retrieved counter group topper")
 
         # Step 5: Return JSON-serializable dict
         return MessageToDict(resp)
     
     except Exception as e:
-        logging.error(f"Error in get_counter_group_topper: {str(e)}", exc_info=True)
+        logging.error(f"[get_counter_group_topper] Error in get_counter_group_topper: {str(e)}", exc_info=True)
         return {"error": str(e)}
 
 
@@ -376,7 +390,10 @@ def get_key_traffic_data(counter_group: str, readable: str = None, duration_secs
     the duration_secs can be any value other than 0.
     It will return data for all meter.
     But it will not Generate the chart display the data. you need to call the next appropriate tool to do that.
-    Arguments: counter_group (str): Counter group GUID, readable (str): Key value, duration_secs (int): Duration in seconds, context (str): Context name, zmq_endpoint (str): a zmq endpoint to connect over tcp
+    Arguments: 
+        counter_group (str): Counter group GUID, readable (str): Key value, duration_secs (int): Duration in seconds, 
+        context (str): Context name, 
+        zmq_endpoint (str): ZMQ endpoint in the format "tcp://<ip_address>:<port>", for example "tcp://10.16.8.44:5008". The IP address and port may vary.
     Returns: dict: Dictionary containing key traffic metrics.
     always try to pass the readable value as readable format like 10.25.46.1 or https, not in key format like 0A.19.2E.01 or p-01BB.
     Example: key_traffic("{XXXXXXXX-XXXX-XXXXXXXX-XXXXXXXXXXXXX}", "163.70.151.21", 3600, "XYZ") or
@@ -406,140 +423,139 @@ def get_key_traffic_data(counter_group: str, readable: str = None, duration_secs
         if not zmq_endpoint:
             context = normalize_context(context)
             zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{context}/run/trp_0"
-            logging.info(f"[key_traffic] Fetching key traffic: counter_group={counter_group}, readable={readable}, duration_secs={duration_secs}, start_ts={start_ts}, end_ts={end_ts}, context={context}")
-        else:
-            logging.info(f"[key_traffic] Fetching key traffic: counter_group={counter_group}, readable={readable}, duration_secs={duration_secs}, start_ts={start_ts}, end_ts={end_ts}, zmq_endpoint={zmq_endpoint}")
+ 
+        logging.info(f"[get_key_traffic_data] Fetching key traffic: counter_group={counter_group}, readable={readable}, duration_secs={duration_secs}, start_ts={start_ts}, end_ts={end_ts}, zmq_endpoint={zmq_endpoint}")
                         
             
         #get the availble time from trp 
         def get_response(zmq_endpoint, req):
             nonlocal zmq_context, socket
             try:
-                logging.debug("[key_traffic] Initializing ZMQ context and socket for get_response")
+                logging.debug("[get_key_traffic_data] Initializing ZMQ context and socket for get_response")
                 #zmq send
                 zmq_context = zmq.Context()
                 socket = zmq_context.socket(zmq.REQ)
                 socket.connect(zmq_endpoint)
-                logging.info(f"[key_traffic] Connected to the socket {zmq_endpoint}")
+                logging.info(f"[get_key_traffic_data] Connected to the socket {zmq_endpoint}")
                 socket.send(req.SerializeToString())
-                logging.debug("[key_traffic] Request sent to socket")
+                logging.debug("[get_key_traffic_data] Request sent to socket")
 
                 #zmq receive
                 data = socket.recv()
-                logging.info(f"[key_traffic] Received data from the socket, size: {len(data)} bytes")
+                logging.info(f"[get_key_traffic_data] Received data from the socket, size: {len(data)} bytes")
                 resp = unwrap_response(data)
                 return resp
             except zmq.ZMQError as e:
-                logging.error(f"ZMQ error in get_response: {str(e)}")
+                logging.error(f"[get_key_traffic_data] ZMQ error in get_response: {str(e)}")
                 raise
             except Exception as e:
-                logging.error(f"Error in get_response: {str(e)}")
+                logging.error(f"[get_key_traffic_data] Error in get_response: {str(e)}")
                 raise
             finally:
                 if socket:
                     try:
                         socket.close()
-                        logging.debug("[key_traffic] Socket closed")
+                        logging.debug("[get_key_traffic_data] Socket closed")
                     except Exception as e:
-                        logging.warning(f"Error closing socket: {str(e)}")
+                        logging.warning(f"[get_key_traffic_data] Error closing socket: {str(e)}")
 
         def unwrap_response(data):
             try:
-                logging.debug("[key_traffic] Unwrapping response data")
+                logging.debug("[get_key_traffic_data] Unwrapping response data")
                 resp = trp_pb2.Message()
                 resp.ParseFromString(data)
                 for x in resp.DESCRIPTOR.enum_types:
                     name = x.values_by_number.get(int(resp.trp_command)).name
-                logging.debug(f"[key_traffic] Response command type: {name}")
+                logging.debug(f"[get_key_traffic_data] Response command type: {name}")
                 return {
                     'TIMESLICES_RESPONSE': resp.time_slices_response,
                     'COUNTER_ITEM_RESPONSE': resp.counter_item_response
                 }.get(name, resp)
             except Exception as e:
-                logging.error(f"Error unwrapping response: {str(e)}")
+                logging.error(f"[get_key_traffic_data] Error unwrapping response: {str(e)}")
                 raise
 
         #Construct time request
         try:
-            logging.debug("[key_traffic] Constructing TIMESLICES_REQUEST")
+            logging.debug("[get_key_traffic_data] Constructing TIMESLICES_REQUEST")
             req = trp_pb2.Message()
             req.trp_command = req.TIMESLICES_REQUEST
             req.time_slices_request.get_total_window = True
-            logging.debug("[key_traffic] Sending TIMESLICES_REQUEST")
+            logging.debug("[get_key_traffic_data] Sending TIMESLICES_REQUEST")
             tint_resp = get_response(zmq_endpoint, req)
-            logging.info("[key_traffic] Received timeslices response")
+            logging.info("[get_key_traffic_data] Received timeslices response")
         except Exception as e:
-            logging.error(f"Error getting timeslices: {str(e)}")
+            logging.error(f"[get_key_traffic_data] Error getting timeslices: {str(e)}")
             raise
 
 
         #construct counter item request request for internal host
         try:
-            logging.debug("[key_traffic] Constructing COUNTER_ITEM_REQUEST")
+            logging.debug("[get_key_traffic_data] Constructing COUNTER_ITEM_REQUEST")
             req = trp_pb2.Message()
             req.trp_command = req.COUNTER_ITEM_REQUEST
             req.counter_item_request.counter_group = counter_group
             req.counter_item_request.key.label = readable.lower()
-            logging.debug(f"[key_traffic] Counter item request configured: counter_group={counter_group}, readable={readable}")
+            logging.debug(f"[get_key_traffic_data] Counter item request configured: counter_group={counter_group}, readable={readable}")
         except Exception as e:
-            logging.error(f"Error constructing counter item request: {str(e)}")
+            logging.error(f"[get_key_traffic_data] Error constructing counter item request: {str(e)}")
             raise
 
         #construct time interval for last 1 hour
         try:
-            logging.debug("[key_traffic] Constructing time interval")
+            logging.debug("[get_key_traffic_data] Constructing time interval")
             tm = trp_pb2.TimeInterval()
             tm.MergeFrom(tint_resp.total_window)
             object = getattr(tm, 'from')
             object.tv_sec = tm.to.tv_sec - duration_secs
             
-            logging.debug(f"[key_traffic] Default time interval: from={object.tv_sec}, to={tm.to.tv_sec}")
+            logging.debug(f"[get_key_traffic_data] Default time interval: from={object.tv_sec}, to={tm.to.tv_sec}")
 
             #assign time interval to counter group topper request
             if start_ts and end_ts:
-                logging.debug(f"[key_traffic] Overriding time interval with start_ts={start_ts}, end_ts={end_ts}")
+                logging.debug(f"[get_key_traffic_data] Overriding time interval with start_ts={start_ts}, end_ts={end_ts}")
                 object = getattr(tm, 'from')
                 object.tv_sec = start_ts
                 object = getattr(tm, 'to')
                 object.tv_sec = end_ts
-                logging.info(f"[key_traffic] Time interval set: from={start_ts}, to={end_ts}")
+                logging.info(f"[get_key_traffic_data] Time interval set: from={start_ts}, to={end_ts}")
             else:
-                logging.info(f"[key_traffic] Time interval set: from={object.tv_sec}, to={tm.to.tv_sec} (duration: {duration_secs}s)")
+                logging.info(f"[get_key_traffic_data] Time interval set: from={object.tv_sec}, to={tm.to.tv_sec} (duration: {duration_secs}s)")
                 
             req.counter_item_request.time_interval.MergeFrom(tm)
         except Exception as e:
-            logging.error(f"Error setting time interval: {str(e)}")
+            logging.error(f"[get_key_traffic_data] Error setting time interval: {str(e)}")
             raise
         
-        logging.debug("[key_traffic] Sending COUNTER_ITEM_REQUEST")
+        logging.debug("[get_key_traffic_data] Sending COUNTER_ITEM_REQUEST")
         resp = get_response(zmq_endpoint, req)
-        logging.info("[key_traffic] Successfully received key traffic response")
+        logging.info("[get_key_traffic_data] Successfully received key traffic response")
         
         result = MessageToDict(resp)
-        logging.debug(f"[key_traffic] Response converted to dict, keys: {result.keys()}")
+        logging.debug(f"[get_key_traffic_data] Response converted to dict, keys: {result.keys()}")
         
         return result
     
         
     except zmq.ZMQError as e:
-        logging.error(f"ZMQ error in key_traffic: {str(e)}", exc_info=True)
+        logging.error(f"[get_key_traffic_data] ZMQ error in key_traffic: {str(e)}", exc_info=True)
         return {"error": f"ZMQ error: {str(e)}"}
     except Exception as e:
-        logging.error(f"Error in key_traffic: {str(e)}", exc_info=True)
+        logging.error(f"[get_key_traffic_data] Error in key_traffic: {str(e)}", exc_info=True)
         return {"error": str(e)}
     finally:
         if socket:
             try:
                 socket.close()
-                logging.debug("[key_traffic] Final socket cleanup")
+                logging.debug("[get_key_traffic_data] Final socket cleanup")
             except Exception as e:
-                logging.warning(f"Error in final socket cleanup: {str(e)}")
+                logging.warning(f"[get_key_traffic_data] Error in final socket cleanup: {str(e)}")
         if zmq_context:
             try:
                 zmq_context.term()
-                logging.debug("[key_traffic] Final ZMQ context cleanup")
+                logging.debug("[get_key_traffic_data] Final ZMQ context cleanup")
             except Exception as e:
-                logging.warning(f"Error in final ZMQ context cleanup: {str(e)}")
+                logging.warning(f"[get_key_traffic_data] Error in final ZMQ context cleanup: {str(e)}")
 
 
 
@@ -548,6 +564,7 @@ def get_key_traffic_data(counter_group: str, readable: str = None, duration_secs
 def create_crosskey_counter_group( context: str = "context0", name: str = None, description: str = "No description", toppers_interval: int = 300, bucket_size: int = 60, track_hi_water: int = 500, track_lo_water: int = 100, tail_prune_factor: int = None, last_topper_bucket_ts: str = None, row_status: str = "Active", cardinality_estimate_bits: int = None, topper_traffic_only: bool = None, enable_slice_keys: int = 1, resolver_counter_guid: str = None, cross_guid1: str = None, cross_guid2: str = None, cross_guid3: str = None, balance_depth : int = None):
     """
     Create a new crosskey counter group in Trisul.
+    We cannot create the crosskey with the zmq_endpoint, it require the context name.
     Arguments:
         context (str): Context name, should be like context_XYZ or default or context0 etc.
         name (str): Name of the counter group
@@ -569,20 +586,20 @@ def create_crosskey_counter_group( context: str = "context0", name: str = None, 
     cursor = None
     
     try:
-        logging.info(f"[Server] Creating crosskey counter group: name={name}, context={context}")
+        logging.info(f"[create_crosskey_counter_group] Creating crosskey counter group: name={name}, context={context}")
         
         if not name:
-            error_msg = "Counter group name is required"
+            error_msg = "[create_crosskey_counter_group] Counter group name is required"
             logging.error(error_msg)
             return {"status": "error", "message": error_msg}
         
         context = normalize_context(context)
         db_path = f"/usr/local/var/lib/trisul-config/domain0/{context}/profile0/TRISULCONFIG.SQDB"
-        logging.info(f"[Server] Connecting to database: {db_path}")
+        logging.info(f"[create_crosskey_counter_group] Connecting to database: {db_path}")
         
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        logging.debug("[Server] Database connection established")
+        logging.debug("[create_crosskey_counter_group] Database connection established")
         
         # Create the Counter Group
         cg_sql = """
@@ -592,7 +609,7 @@ def create_crosskey_counter_group( context: str = "context0", name: str = None, 
         """
         
         new_guid = f'{{{str(uuid.uuid4()).upper()}}}'
-        logging.info(f"[Server] Generated new GUID: {new_guid}")
+        logging.info(f"[create_crosskey_counter_group] Generated new GUID: {new_guid}")
         
         cg_values = (
             new_guid,
@@ -613,10 +630,10 @@ def create_crosskey_counter_group( context: str = "context0", name: str = None, 
             resolver_counter_guid
         )
 
-        logging.debug(f"[Server] Executing counter group insert with values: {cg_values}")
+        logging.debug(f"[create_crosskey_counter_group] Executing counter group insert with values: {cg_values}")
         cursor.execute(cg_sql, cg_values)
         conn.commit()
-        logging.info("[Server] Counter group inserted successfully")
+        logging.info("[create_crosskey_counter_group] Counter group inserted successfully")
         
         cross_sql = """
             INSERT INTO TRISUL_COUNTER_GROUP_CROSSKEYS
@@ -637,27 +654,27 @@ def create_crosskey_counter_group( context: str = "context0", name: str = None, 
             None
         )
         
-        logging.debug(f"[Server] Executing crosskey insert with values: {cross_values}")
+        logging.debug(f"[create_crosskey_counter_group] Executing crosskey insert with values: {cross_values}")
         cursor.execute(cross_sql, cross_values)
         conn.commit()
-        logging.info("[Server] Crosskey configuration inserted successfully")
+        logging.info("[create_crosskey_counter_group] Crosskey configuration inserted successfully")
         
-        success_msg = f"Counter group '{name}' successfully created with guid {new_guid}."
+        success_msg = f"[create_crosskey_counter_group] Counter group '{name}' successfully created with guid {new_guid}."
         logging.info(success_msg)
         return {"status": "success", "message": success_msg}
         
     except sqlite3.IntegrityError as e:
-        error_msg = f"Database integrity error: {str(e)}"
+        error_msg = f"[create_crosskey_counter_group] Database integrity error: {str(e)}"
         logging.error(error_msg)
         if conn:
             conn.rollback()
         return {"status": "error", "message": error_msg}
     except sqlite3.OperationalError as e:
-        error_msg = f"Database operational error: {str(e)}"
+        error_msg = f"[create_crosskey_counter_group] Database operational error: {str(e)}"
         logging.error(error_msg)
         return {"status": "error", "message": error_msg}
     except Exception as e:
-        error_msg = f"Error creating counter group: {str(e)}"
+        error_msg = f"[create_crosskey_counter_group] Error creating counter group: {str(e)}"
         logging.error(error_msg, exc_info=True)
         if conn:
             conn.rollback()
@@ -666,15 +683,15 @@ def create_crosskey_counter_group( context: str = "context0", name: str = None, 
         if cursor:
             try:
                 cursor.close()
-                logging.debug("[Server] Cursor closed")
+                logging.debug("[create_crosskey_counter_group] Cursor closed")
             except Exception as e:
-                logging.warning(f"Error closing cursor: {str(e)}")
+                logging.warning(f"[create_crosskey_counter_group] Error closing cursor: {str(e)}")
         if conn:
             try:
                 conn.close()
-                logging.debug("[Server] Database connection closed")
+                logging.debug("[create_crosskey_counter_group] Database connection closed")
             except Exception as e:
-                logging.warning(f"Error closing database connection: {str(e)}")
+                logging.warning(f"[create_crosskey_counter_group] Error closing database connection: {str(e)}")
 
 
 
@@ -682,6 +699,7 @@ def create_crosskey_counter_group( context: str = "context0", name: str = None, 
 def rag_query(question: str):
     """
     Perform a RAG (Retrieval-Augmented Generation) query using Gemini and ChromaDB.
+    It does not need any context or the zmq_endpoint
     Arguments: question (str): The question to query.
     Returns: str: The answer generated by Gemini.
         Example: rag_query("what is crosskey?") -> 
@@ -690,10 +708,10 @@ def rag_query(question: str):
     """
 
     try:
-        logging.info(f"[Server] Starting RAG query for question: {question}")
+        logging.info(f"[rag_query] Starting RAG query for question: {question}")
         
         # Embed query
-        logging.info("[Server] Initializing Gemini API for embedding")
+        logging.info("[rag_query] Initializing Gemini API for embedding")
         try:
             # getting the api key
             from dotenv import dotenv_values
@@ -703,95 +721,95 @@ def rag_query(question: str):
             GEMINI_API_KEY = config.get("TRISUL_GEMINI_API_KEY")
             
             genai.configure(api_key=GEMINI_API_KEY)
-            logging.debug("[Server] Gemini API configured")
+            logging.debug("[rag_query] Gemini API configured")
             
-            logging.debug("[Server] Generating embedding for question")
+            logging.debug("[rag_query] Generating embedding for question")
             resp = genai.embed_content(model="models/gemini-embedding-001", content=question)
             q_emb = resp['embedding']
-            logging.info(f"[Server] Embedding generated successfully, dimension: {len(q_emb)}")
+            logging.info(f"[rag_query] Embedding generated successfully, dimension: {len(q_emb)}")
         except KeyError as e:
-            logging.error(f"Missing key in embedding response: {str(e)}")
+            logging.error(f"[rag_query] Missing key in embedding response: {str(e)}")
             return f"Error: Failed to generate embedding - {str(e)}"
         except Exception as e:
-            logging.error(f"Error generating embedding: {str(e)}", exc_info=True)
+            logging.error(f"[rag_query] Error generating embedding: {str(e)}", exc_info=True)
             return f"Error: Failed to generate embedding - {str(e)}"
 
         # Search in Chroma
         try:
-            logging.info("[Server] Initializing ChromaDB client")
+            logging.info("[rag_query] Initializing ChromaDB client")
             CHROMA_STORE = Path(__file__).resolve().parent / "chroma_store"
-            logging.debug(f"[Server] ChromaDB store path: {CHROMA_STORE}")
+            logging.debug(f"[rag_query] ChromaDB store path: {CHROMA_STORE}")
             
             if not CHROMA_STORE.exists():
-                logging.warning(f"ChromaDB store path does not exist: {CHROMA_STORE}")
+                logging.warning(f"[rag_query] ChromaDB store path does not exist: {CHROMA_STORE}")
             
             chroma_client = chromadb.PersistentClient(path=str(CHROMA_STORE))
             collection = chroma_client.get_or_create_collection("pdf_docs")
-            logging.info("[Server] ChromaDB client initialized successfully")
+            logging.info("[rag_query] ChromaDB client initialized successfully")
         except Exception as e:
-            logging.error(f"Error initializing ChromaDB: {str(e)}", exc_info=True)
+            logging.error(f"[rag_query] Error initializing ChromaDB: {str(e)}", exc_info=True)
             return f"Error: Failed to initialize ChromaDB - {str(e)}"
 
         try:
-            logging.debug("[Server] Querying ChromaDB collection")
+            logging.debug("[rag_query] Querying ChromaDB collection")
             results = collection.query(
                 query_embeddings=[q_emb], 
                 n_results=3, 
                 include=['documents', 'distances', 'embeddings']
             )
-            logging.info("[Server] ChromaDB query completed successfully")
-            logging.debug(f"[Server] Query results structure - Keys: {results.keys()}")
+            logging.info("[rag_query] ChromaDB query completed successfully")
+            logging.debug(f"[rag_query] Query results structure - Keys: {results.keys()}")
             
             if 'documents' in results:
-                logging.debug(f"[Server] Number of document groups: {len(results['documents'])}")
+                logging.debug(f"[rag_query] Number of document groups: {len(results['documents'])}")
                 if results['documents']:
-                    logging.debug(f"[Server] Number of documents in first group: {len(results['documents'][0])}")
+                    logging.debug(f"[rag_query] Number of documents in first group: {len(results['documents'][0])}")
             
             if 'distances' in results:
-                logging.debug(f"[Server] Distances: {results.get('distances', [])}")
+                logging.debug(f"[rag_query] Distances: {results.get('distances', [])}")
         except Exception as e:
-            logging.error(f"Error querying ChromaDB: {str(e)}", exc_info=True)
+            logging.error(f"[rag_query] Error querying ChromaDB: {str(e)}", exc_info=True)
             return f"Error: Failed to query ChromaDB - {str(e)}"
 
         try:
-            logging.debug("[Server] Extracting retrieved documents")
+            logging.debug("[rag_query] Extracting retrieved documents")
             if 'documents' not in results or not results['documents']:
-                logging.warning("No documents found in query results")
+                logging.warning("[rag_query] No documents found in query results")
                 return "No relevant documents found in the knowledge base."
             
             retrieved_docs = results["documents"][0]
-            logging.info(f"[Server] Retrieved {len(retrieved_docs)} documents")
+            logging.info(f"[rag_query] Retrieved {len(retrieved_docs)} documents")
             
             if not retrieved_docs:
-                logging.warning("Retrieved documents list is empty")
+                logging.warning("[rag_query] Retrieved documents list is empty")
                 return "No relevant documents found in the knowledge base."
             
             for i, doc in enumerate(retrieved_docs):
-                logging.debug(f"[Server] Document {i+1} preview: {doc[:100]}..." if len(doc) > 100 else f"Document {i+1}: {doc}")
+                logging.debug(f"[rag_query] Document {i+1} preview: {doc[:100]}..." if len(doc) > 100 else f"Document {i+1}: {doc}")
         except (KeyError, IndexError) as e:
-            logging.error(f"Error extracting documents from results: {str(e)}")
+            logging.error(f"[rag_query] Error extracting documents from results: {str(e)}")
             return f"Error: Failed to extract documents - {str(e)}"
         except Exception as e:
-            logging.error(f"Unexpected error processing documents: {str(e)}", exc_info=True)
+            logging.error(f"[rag_query] Unexpected error processing documents: {str(e)}", exc_info=True)
             return f"Error: Failed to process documents - {str(e)}"
         
         # Build prompt
         try:
-            logging.debug("[Server] Building context from retrieved documents")
+            logging.debug("[rag_query] Building context from retrieved documents")
             context = "\n".join(retrieved_docs)
-            logging.info(f"[Server] Context built successfully, length: {len(context)} characters")
-            logging.debug(f"[Server] Context preview: {context[:200]}..." if len(context) > 200 else f"Context: {context}")
+            logging.info(f"[rag_query] Context built successfully, length: {len(context)} characters")
+            logging.debug(f"[rag_query] Context preview: {context[:200]}..." if len(context) > 200 else f"Context: {context}")
             
             return context
         except Exception as e:
-            logging.error(f"Error building context: {str(e)}", exc_info=True)
+            logging.error(f"[rag_query] Error building context: {str(e)}", exc_info=True)
             return f"Error: Failed to build context - {str(e)}"
             
     except Exception as e:
-        logging.error(f"Unexpected error in rag_query: {str(e)}", exc_info=True)
+        logging.error(f"[rag_query] Unexpected error in rag_query: {str(e)}", exc_info=True)
         return f"Error: An unexpected error occurred - {str(e)}"
     
-    
+
 
 
 @mcp.tool()
@@ -800,6 +818,7 @@ def generate_and_show_chart(data):
     Plots a static traffic chart using matplotlib based on the provided JSON-like input and show it in a new pop-up window.
     the input values should be in raw bytes format  not in mb or kb.
     the time stamps should be in epoc seconds format as integer not in the string date time format like this '2025-10-16 01:00:00'.
+    It does not need any context name or the zmq_endpoint.
     Args:
         data (dict): Chart configuration and series data.
                      Example format:
@@ -814,9 +833,9 @@ def generate_and_show_chart(data):
                      }
     """
     
-    logging.info(f"[generate_and_show_chart]")
+    logging.info(f"[generate_and_show_chart] Generating the chart for the given data")
 
-    return {"status": "success", "message" : f"The chart is displayed in the pop-up window, kindly check that.", "message_to_llm": "show this chart data as table in text format even if the chart is generated"}
+    return {"status": "success", "message" : f"The chart is displayed in the pop-up window, tell the user to kindly check that. then show this data in the table format and give a short summary about the data."}
 
 
 
