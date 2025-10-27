@@ -75,6 +75,7 @@ def countergroup_info(zmq_endpoint: str = None, context: str = "context0", get_m
                 logging.debug(f"[countergroup_info] Initializing ZMQ context and socket")
                 context_zmq = zmq.Context()
                 socket = context_zmq.socket(zmq.REQ)
+                socket.setsockopt(zmq.LINGER, 0)
                 socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
                 socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
                 
@@ -90,15 +91,15 @@ def countergroup_info(zmq_endpoint: str = None, context: str = "context0", get_m
             except zmq.Again:
                 error_msg = f"[countergroup_info] ZMQ timeout after {timeout_ms}ms - no response from {zmq_endpoint}"
                 logging.error(error_msg)
-                raise Exception(error_msg)
+                return {"error": error_msg}
             except zmq.ZMQError as e:
                 error_msg = f"[countergroup_info] ZMQ error: {str(e)}"
                 logging.error(error_msg)
-                raise Exception(error_msg)
+                return {"error": error_msg}
             except Exception as e:
                 error_msg = f"[countergroup_info] Unexpected error in get_response: {str(e)}"
                 logging.error(error_msg)
-                raise Exception(error_msg)
+                return {"error": error_msg}
             finally:
                 if socket:
                     try:
@@ -141,6 +142,13 @@ def countergroup_info(zmq_endpoint: str = None, context: str = "context0", get_m
         
         logging.info("[countergroup_info] Sending COUNTER_GROUP_INFO_REQUEST...")
         resp = get_response(zmq_endpoint, req)
+        
+        # Check if an error occurred and return immediately
+        if isinstance(resp, dict) and "error" in resp:
+            logging.error(f"[countergroup_info] Aborting due to error: {resp['error']}")
+            return resp
+
+
         result = MessageToDict(resp)
         logging.info(f"[countergroup_info] Received response with {len(result.get('groupDetails', []))} groups")
         return result

@@ -15,6 +15,8 @@ from datetime import datetime
 from matplotlib.ticker import FuncFormatter
 import matplotlib.dates as mdates
 import os
+import readline
+
 
 
 os.environ["QT_QPA_PLATFORM"] = "xcb"
@@ -774,9 +776,13 @@ async def main():
     except KeyboardInterrupt:
         print("\nExiting ...")
         sys.exit(0)
-        
-        
-    await cleanup()
+
+    finally:
+        # Always clean up async resources
+        await cleanup()
+        # Give ZeroMQ sockets time to close cleanly
+        await asyncio.sleep(0.1)
+        sys.exit(0)
 
 if __name__ == "__main__":
     asyncio.run(main())
