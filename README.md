@@ -1,6 +1,6 @@
 # Trisul AI CLI
 
-> Conversational AI for Next-Generation Network Monitoring
+> Conversational AI for Next-Generation Network Monitoring 
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
