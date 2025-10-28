@@ -221,6 +221,8 @@ conversation_history = [
                 6. When using the ZMQ endpoint (IP and port), data can be retrieved from any other Trisul server within the same network.
                 7. When the user provides the IP and port and says something like "connect to this endpoint" or "connect to this server" or "this is the IP and port", you must remember these values for upcoming queries and reply with "OK" to confirm.
                 8. These remembered values should be used for all subsequent queries unless the user explicitly specifies a new context or ZMQ endpoint.
+                9. Always display data in a table format by default. Visualize the data as a chart only if the user explicitly requests it.
+                10. Always display the values of the first three meters when showing data in a table or chart, unless the user explicitly requests values for other meters.
 
 
             Data Presentation Rules
@@ -235,7 +237,15 @@ conversation_history = [
                 give the raw bytes input only for generate_and_show_chart.
                 Before calling the generate_and_show_chart multiply the raw bytes with 8 if the meter type is VT_RATE_COUNTER
                 
-                Time Display: Always show date/time in IST timezone
+                Time Display: 
+                    - Convert epoch timestamps to IST timezone (UTC+5:30)
+                    - When converting epoch seconds (like 1761638100):
+                        1. First convert to UTC datetime
+                        2. Then add 5 hours 30 minutes for IST
+                        3. Format as: YYYY-MM-DD HH:MM:SS
+                    - Example: 1761638100 → 2025-10-28 13:25:00 (IST)
+                    - Always label times as "(IST)" in tables
+                
                 Special Value Handling: Display SYS:GROUP_TOTALS as "Others"
                 Response Format Priority:
                     Tables > Bullet lists > Structured blocks > Paragraphs
@@ -278,6 +288,12 @@ conversation_history = [
                 * Use KB if value < 1 MB, MB if value >= 1 MB and < 1 GB, GB if value >= 1 GB.
             - Round values to 1-2 decimal places.
             - Keep column headers descriptive without specifying a fixed unit.
+            - Convert timestamps from epoch seconds to IST timezone (UTC+5:30)
+            - Display format: YYYY-MM-DD HH:MM:SS
+            - Example calculation:
+              * Epoch: 1761638100
+              * UTC: 2025-10-28 07:55:00
+              * IST (UTC+5:30): 2025-10-28 13:25:00
             - Maintain timestamps and table structure.
             - Align columns evenly for readability.
             - Provide a short summary highlighting trends and peaks.

@@ -161,9 +161,9 @@ Peak traffic occurred at 15:23:00 with 8.91 MB total.
 ### Connecting to Remote Servers
 
 ```bash
-👤 (You): Connect to tcp://10.16.8.44:5008
+👤 (You): Connect to the remote server with IP address 10.16.8.44 and port 5008.
 
-🤖 (Bot): OK
+🤖 (Bot): OK. I will use the ZMQ endpoint 'tcp://10.16.8.44:5008' for all subsequent queries.
 
 👤 (You): Show top apps by traffic
 
