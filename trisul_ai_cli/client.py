@@ -16,6 +16,8 @@ from matplotlib.ticker import FuncFormatter
 import matplotlib.dates as mdates
 import os
 import readline
+from importlib.metadata import version
+
 
 
 
@@ -739,19 +741,28 @@ async def main():
     global chart_data
     await connect_to_server("trisul_ai_cli.server")
     get_api_key()
+
+
+    print("\033[1;36m" + "╔══════════════════════════════════════════════════════════════╗")
+    print("║  🚀  Trisul AI CLI - Because your network should talk back.  ║")
+    print("║                                                              ║")
+    print("║  💡  Type 'exit' or 'quit' to close the CLI                  ║")
+    print("║                                                              ║")
+    print(f"║  📦  Version: {version('trisul_ai_cli')}                                          ║")
+    print("╚══════════════════════════════════════════════════════════════╝" + "\033[0m")
     
     try:
         while True:
-            query = input("👤 (You) : ")
+            query = input("👤 (You) : ").strip()
             logging.info(f"[Client] Query: {query}")
             
-            # Exit on empty input
-            if query.strip().lower() == "exit" or query.strip().lower() == "quit":
+            # Exit
+            if query.lower() in ["exit", "quit"]:
+                print("\n🤖 (Bot) : 👋 Goodbye!")
                 break
             
             # skip empty inputs
-            if not query.strip():
-                print("\n🤖 (Bot) : Empty query, Try again ...\n")
+            if not query:
                 continue
             
             # change the api key
@@ -763,18 +774,19 @@ async def main():
                 response = await process_query(query)
                 logging.info(f"[Client] Full Conversation History: \n{json.dumps(conversation_history[2:], indent=2)}")
                 logging.info(f"[Client] Response: \n{response}")
-                print(f"\n🤖 (Bot) : {response}\n")
+                print(f"\n🤖 (Bot) : {response.strip()}\n")
                 
+                # If a chart was prepared, display it
                 if(chart_data):
                     await display_chart()
+                    
             except Exception as e:
                 logging.error(f"[Client] Error: {e}")
-                print(f"\nError: {e}")
-
-        print("\n🤖 (Bot) : Bye!")
+                print("\n👋 Exiting gracefully...")
+                sys.exit(0)
 
     except KeyboardInterrupt:
-        print("\nExiting ...")
+        print("\n👋 Exiting gracefully...")
         sys.exit(0)
 
     finally:
