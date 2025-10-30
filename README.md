@@ -94,7 +94,7 @@ Trisul AI CLI combines several cutting-edge technologies:
 
 3. **Install Trisul AI CLI**:
    ```bash
-   pip install trisul_ai_cli-0.1.0-py3-none-any.whl
+   pip install trisul_ai_cli
    ```
 
 4. **Launch the CLI**:
