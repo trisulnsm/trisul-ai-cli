@@ -17,6 +17,7 @@ import matplotlib.dates as mdates
 import os
 import readline
 from importlib.metadata import version
+import re
 
 
 
@@ -75,7 +76,11 @@ global GEMINI_API_KEY, GEMINI_URL
 GEMINI_API_KEY = GEMINI_URL = None
 
 
-global conversation_history, chart_data
+memory_json_path = Path(__file__).resolve().parent / "trisul_ai_memory.json"
+
+existing_ai_memory = []
+with open(memory_json_path, "r") as file:
+    existing_ai_memory = json.load(file)
 
 chart_data = {}
 
@@ -84,10 +89,14 @@ conversation_history = [
     "role": "user",
     "parts": [
       {
-        "text": """TRISUL NETWORK ANALYTICS EXPERT SYSTEM PROMPT
+        "text": f"""TRISUL NETWORK ANALYTICS EXPERT SYSTEM PROMPT
 
         YOUR ROLE:
             You are an expert in Trisul Network Analytics with access to MCP server tools for fetching counter group information and metrics. Use these tools to answer queries and perform analysis tasks.
+            You must only answer queries related to **Trisul Network Analytics** or **general networking concepts** (like IP addresses, SNMP, NetFlow, routing, or traffic analysis).
+            Do NOT answer unrelated questions (e.g., science, history, entertainment, or general knowledge).  
+            If asked such a question, respond kindly that it's beyond your current area of expertise.
+
 
         CORE CONCEPTS:
             1. Counter Groups
@@ -323,19 +332,19 @@ conversation_history = [
                 - After generating the chart always show the data in the table format and give a short summary about the traffic or data.
 
             2. Chart data format must be:
-                {
+                {{
                     "title": "...",
                     "x_label": "Time (IST)",
                     "y_label": "Traffic (MB)",
                     "keys": [
-                    {
+                    {{
                         "timestamps": [1718714400, ...],
                         "legend_label": "Total Traffic",
                         "color": "blue",
                         "values": [5.51, 6.28, ...]
-                    }
+                    }}
                     ]
-                }
+                }}
 
             3. Response sequence for chart requests:
                 a) Call get_key_traffic_data
@@ -430,6 +439,55 @@ conversation_history = [
                 Completeness: Always provide textual summaries with tool results
                 User Experience: Remember context, zmq endpoint and provide seamless interactions
                 Product Safety: Guide users through official Trisul methods only; never access or expose MCP internals.
+
+        #### TOOL USAGE & DISCLOSURE RULES
+        
+            You have access to several internal tools that allow you to perform analytics, retrieve data, and visualize network metrics from Trisul.
+
+            However, **you must never reveal, list, or describe these tools or their internal names** (such as `get_key_traffic_data`, `rag_query`, `get_counter_group_topper`, etc.) to the user — even if the user explicitly asks about them.
+
+            Instead of exposing tool names, **describe your capabilities and features** in clear, user-facing language.
+
+            ALLOWED RESPONSES:
+                - "I can show you the top talkers or applications for any given time range."
+                - "I can display the traffic trend for any host, application, or network."
+                - "I can summarize which users, hosts, or ports are consuming the most bandwidth."
+                - "I can analyze network performance or anomalies based on historical data."
+                - "I can visualize traffic patterns, peaks, and trends over time."
+                - "I can explain how to configure, monitor, or troubleshoot various Trisul features."
+
+            NEVER SAY OR DO:
+                - Never mention internal tool names, function names, or APIs (like `get_counter_group_topper`, `rag_query`, etc.).
+                - Never describe how you internally fetch or process data.
+                - Never say "I can call a function" or "I can use a tool named ...".
+                - Never output code snippets, tool names, or JSON related to internal tool execution.
+                - Never reveal internal workflow, backend structure, or implementation details.
+
+            If the user asks "what tools do you have" or "what functions can you call", respond only with your **capabilities and features**, such as:
+
+                "I can analyze traffic, show trends, identify top entities, and help you understand and troubleshoot your network using Trisul’s analytics engine."
+
+            You may also describe your abilities in general terms such as:
+                - "I can retrieve and visualize traffic data for any host or application."
+                - "I can rank entities by bandwidth or session count."
+                - "I can display both real-time and historical network statistics."
+                - "I can guide you through using Trisul for monitoring, reporting, or security analysis."
+
+        
+        ==============================================
+
+        ### 🧠 USER MEMORY CONTEXT
+        Below is the stored user information that can help personalize your responses.
+        Use this information to adapt tone, preferences, and context accordingly.
+
+        {existing_ai_memory}
+
+        ==============================================
+
+        Now continue operating according to the above expert rules,
+        keeping in mind the user's preferences and memory context.
+
+
 
 
         """
@@ -600,7 +658,8 @@ async def process_query(query: str) -> str:
                 # Call the tool on MCP server
                 result = await session.call_tool(function_name, function_args)
                 tool_result = result.content[0].text if result.content else "No result"
-                logging.info(f"[Client] Function result: {tool_result}")
+                clean_result = tool_result.replace("\n", "").replace("\r", "").replace("\t", " ").replace("   ", "")
+                logging.info(f"[Client] Function result: {clean_result}")
                 
                 # Add function result to conversation
                 conversation_history[-1]["parts"].append({
@@ -744,8 +803,170 @@ async def display_chart():
 
 
 
+async def update_user_memory():
+    global conversation_history, existing_ai_memory, memory_json_path
+    
+    logging.info("[Client] [ai_memory] Updating user memory. Existing memory: \n" + json.dumps(existing_ai_memory, indent=2))
+    
+    confidence_threshold = 90
+    
+    filtered_conversation = []
+
+    for item in conversation_history:
+        role = item.get("role")
+        parts = item.get("parts", [])
+        for part in parts:
+            text = part.get("text")
+            if text and role in ["user", "model"]:
+                filtered_conversation.append({role: text})
+
+        
+    system_prompt = f"""
+        You are a long-term memory management model responsible for maintaining and updating a persistent user memory database.
+
+        Your goal:
+        - Analyze the full conversation between a user and an assistant.
+        - Use the existing memory object below to maintain continuity, accuracy, and relevance.
+
+        ---
+
+        ### 🧠 Your Tasks
+
+        1. **Extract only durable and useful facts** about the user that can improve future responses.
+        - Examples: preferences, tools, habits, learning goals, environment, or frequently discussed topics.
+        - If no new or useful facts are found, **return the existing memory unchanged**.
+
+        2. **Compare and integrate** new facts with the existing memory:
+        - Use *semantic* comparison — understand meaning, not just surface text.
+        - Only **add or update** facts if they are **useful for future responses** and meet the confidence threshold.
+        - If no such facts exist → **do not modify** the existing memory at all; return it exactly as provided.
+        - If a similar fact already exists → update its value, confidence, and source.
+        - If a fact contradicts an existing one → replace the old fact with the new one.
+        - If a fact is temporary, outdated, or irrelevant → remove it completely (do not mark as deleted).
+        - If a fact is identical or redundant → skip adding it.
+
+        3. **Estimate confidence** using the following criteria:
+        - durability: Will this still matter later?
+        - frequency: Has it been mentioned repeatedly? (if unknown, assume 0.5)
+        - utility: Will it improve future responses?
+        - ephemerality: 1.0 if temporary or situational, else 0.0
+        - sensitivity: 1.0 if it contains private/sensitive info (email, IP, token, password), else 0.0
+
+        Compute raw confidence as:
+            raw_confidence = (durability * 1) + (frequency * 1) + (utility * 1) - (ephemerality * 1) - (sensitivity * 1)
+
+        Let:
+            min_confidence = -( weight_of_ephemerality + weight_of_sensitivity)
+            max_confidence = weight_of_durability + weight_of_frequency + weight_of_utility
+
+        Convert raw confidence to a 0 - 100 scale:
+            scaled_confidence = ((raw_confidence - min_confidence) / (max_confidence - min_confidence)) * 100
+
+        - Do **not** clip, smooth, or round the scaled_confidence.
+        - The output value must reflect the **exact mathematical result**, including decimals.
+        - The range is always **0 to 100** by definition of the formula.
+
+        Only include or update facts where:
+            scaled_confidence ≥ {confidence_threshold}
+
+        4. **If no facts qualify** (i.e., no new useful information or no facts meeting confidence threshold):
+        - **Return the existing memory exactly as it was provided**, with no additions, deletions, or modifications.
+
+        5. **Ensure self-consistency** only when changes are made:
+        - Merge related facts (e.g., multiple programming languages → merge into one array).
+        - Keep values up-to-date (e.g., replace “Ubuntu” with “Fedora” if the user switched OS).
+        - Remove irrelevant or outdated facts completely from the final output.
+
+        6. **If updates are made**, always produce a fully merged and cleaned memory object containing:
+        - All valid existing facts
+        - Any new or updated facts
+        - No duplicates, contradictions, or deleted entries
+
+        ---
+
+        ### ⚙️ Inputs
+
+        **Existing memory:**
+        {existing_ai_memory}
+
+        **New conversation:**
+        {filtered_conversation}
+
+        ---
+
+        ### 📦 Output Format (strict JSON only)
+
+        Return the **final, updated memory object** as a JSON array.
+
+        If no new or useful facts are found or none meet the confidence threshold, 
+        **return the same existing memory JSON exactly as received**.
+
+        [
+        {{
+            "key": "<string>",
+            "value": "<string or array>",
+            "confidence": scaled_confidence,
+            "source": "<string>",
+            "durability": <float>,
+            "frequency": <float>,
+            "utility": <float>,
+            "ephemerality": <float>,
+            "sensitivity": <float>
+        }},
+        ...
+        ]
+        
+    """
 
 
+
+    chat_history = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": system_prompt}
+                ]
+            }
+        ]
+    }
+
+    headers = {"Content-Type": "application/json"}
+
+    timeout = httpx.Timeout(120.0, connect=10.0)
+    
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        logging.info("[Client] [ai_memory] Sending update request to Gemini.")
+        resp = await client.post(GEMINI_URL, headers=headers, json=chat_history)
+        resp.raise_for_status()
+        resp = resp.json()
+        new_ai_memory = resp["candidates"][0]["content"]["parts"][0]["text"]
+        new_ai_memory = json.loads(re.sub(r'```json|```', '', new_ai_memory).strip())
+        logging.info("[Client] [ai_memory] Received updated memory from Gemini")
+        
+        
+        with open(memory_json_path, "w") as file:
+            json.dump(new_ai_memory, file, indent=4)
+        
+        logging.info(f"[Client] [ai_memory] New memory updated : \n {new_ai_memory}")
+
+
+
+async def loading_animation(task, message):
+    spinner = ["⢄", "⢂", "⢁", "⡁", "⡈", "⡐", "⡠"]
+    i = 0
+    print("")
+    
+    while not task.done():
+        sys.stdout.write(f"\r✨ {message} {f'{spinner[i % len(spinner)]}  '}")
+        sys.stdout.flush()
+        i += 1
+        await asyncio.sleep(0.1)
+    sys.stdout.write("\r" + " " * 40 + "\r")
+    sys.stdout.write("\033[F")
+    sys.stdout.write("\r\033[K")
+    
+    
 
 
 async def cleanup():
@@ -774,6 +995,12 @@ async def main():
             
             # Exit
             if query.lower() in ["exit", "quit"]:
+                
+                task = asyncio.create_task(update_user_memory())
+                spinner = asyncio.create_task(loading_animation(task,"Adapting to your world"))
+                response = await task
+                await spinner
+                
                 print("\n🤖 (Bot) : 👋 Goodbye!")
                 break
             
@@ -787,7 +1014,12 @@ async def main():
                 continue
             
             try:
-                response = await process_query(query)
+                # process the query                
+                task = asyncio.create_task(process_query(query))
+                spinner = asyncio.create_task(loading_animation(task,"Thinking"))
+                response = await task
+                await spinner
+                
                 logging.info(f"[Client] Full Conversation History: \n{json.dumps(conversation_history[2:], indent=2)}")
                 logging.info(f"[Client] Response: \n{response}")
                 print(f"\n🤖 (Bot) : {response.strip()}\n")
@@ -798,6 +1030,9 @@ async def main():
                     
             except Exception as e:
                 logging.error(f"[Client] Error: {e}")
+                await asyncio.sleep(0.5)
+                print()
+                print(f"\n🤖 (Bot) : {e}")
                 print("\n👋 Exiting gracefully...")
                 sys.exit(0)
 
@@ -810,10 +1045,13 @@ async def main():
         await cleanup()
         # Give ZeroMQ sockets time to close cleanly
         await asyncio.sleep(0.1)
-        sys.exit(0)
+        return
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n👋 Exiting gracefully ...")
     
     
 
