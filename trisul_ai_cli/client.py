@@ -82,7 +82,9 @@ existing_ai_memory = []
 with open(memory_json_path, "r") as file:
     existing_ai_memory = json.load(file)
 
-chart_data = {}
+line_chart_data = {}
+
+pie_chart_data = {}
 
 conversation_history = [
   {
@@ -242,9 +244,9 @@ conversation_history = [
                 
 
                 for Bps values: multiply by 8 before conversion. Example: 1500000000 → 1.4 GB
-                Chart Input Rule: For generate_and_show_chart, always pass raw bytes (no conversion) and timestamps in epoh seconds format lke this [1718714400, 1718714460].
-                give the raw bytes input only for generate_and_show_chart.
-                Before calling the generate_and_show_chart multiply the raw bytes with 8 if the meter type is VT_RATE_COUNTER
+                Chart Input Rule: For show_line_chart, always pass raw bytes (no conversion) and timestamps in epoh seconds format lke this [1718714400, 1718714460].
+                give the raw bytes input only for show_line_chart.
+                Before calling the show_line_chart multiply the raw bytes with 8 if the meter type is VT_RATE_COUNTER
                 
                 Time Display: 
                     - Convert epoch timestamps to IST timezone (UTC+5:30)
@@ -295,21 +297,27 @@ conversation_history = [
         TABLE FORMATTING:
             - Convert each cell individually to the most readable unit:
                 * Use KB if value < 1 MB, MB if value >= 1 MB and < 1 GB, GB if value >= 1 GB.
-            - Round values to 1-2 decimal places.
-            - Keep column headers descriptive without specifying a fixed unit.
-            - Convert timestamps from epoch seconds to IST timezone (UTC+5:30)
-            - Display format: YYYY-MM-DD HH:MM:SS
-            - Example calculation:
-              * Epoch: 1761638100
-              * UTC: 2025-10-28 07:55:00
-              * IST (UTC+5:30): 2025-10-28 13:25:00
-            - Maintain timestamps and table structure.
+            - You should not show the value as Mbp or Kbp . just show MB or KB
+            - Round values to 1-2 decimal places for clarity.
+            - Keep column headers descriptive but avoid fixing a specific unit.
+            - Timestamps:
+                * Trisul API timestamps are already in IST (Indian Standard Time).
+                * Do **not** apply any UTC→IST or timezone conversion.
+                * Simply interpret the epoch seconds as IST and format as:
+                    YYYY-MM-DD HH:MM:SS (IST)
+                * Example:
+                    Epoch: 1718711400  
+                    IST:   2024-06-18 17:20:00 (IST)
+            - Maintain all timestamps and table structure consistently.
             - Align columns evenly for readability.
-            - Provide a short summary highlighting trends and peaks.
-            - Never leave any cell empty.
+            - Always include borders on **all four sides** — top, bottom, left, and right.
+            - Provide a concise summary below the table highlighting trends, peaks, or anomalies.
+            - Never leave any cell empty; fill with “0” or “N/A” where data is missing.
+            - The table output must always be fully enclosed within borders.
             - The table must have borders on **all four sides** — top, bottom, left, and right
-            - Never output tables without the full enclosing border.
-            - **Never show raw Python code** to the user; the table should always be directly visible.
+            - **Never show raw Python code** or intermediate data structures to the user.
+            - The final output should always be a clean, readable table with a brief summary.
+
 
 
             EXAMPLE:
@@ -326,9 +334,11 @@ conversation_history = [
             1. After receiving traffic data from get_key_traffic_data:
                 - ALWAYS format the data into a table first
                 - Always produce a textual summary highlighting trends and peaks.
-                - If user requested a chart, IMMEDIATELY call generate_and_show_chart
+                - If user requested a chart, IMMEDIATELY call show_line_chart
                 - NEVER leave response empty after function calls
-                - Before calling the generate_and_show_chart multiply the raw bytes with 8 if the meter type is VT_RATE_COUNTER
+                - Before calling the show_line_chart multiply the raw bytes with 8 if the meter type is VT_RATE_COUNTER
+                - When generating JSON for this tool Ensure the output is strictly valid JSON. Always close all arrays and objects properly with matching brackets (], '}}').
+                
                 - After generating the chart always show the data in the table format and give a short summary about the traffic or data.
 
             2. Chart data format must be:
@@ -349,7 +359,7 @@ conversation_history = [
             3. Response sequence for chart requests:
                 a) Call get_key_traffic_data
                 b) Generate table summary
-                c) Call generate_and_show_chart with formatted data
+                c) Call show_line_chart with formatted data
                 d) Provide final text confirmation
 
 
@@ -476,6 +486,23 @@ conversation_history = [
         
         ==============================================
 
+        ### 🧠 USER MEMORY CONTEXT HANDLING
+
+        If the user says something like:
+        - “What do you know about me?”
+        - “Remember this about me …”
+        - “Forget this thing about me …”
+
+        Then follow these rules:
+            1. Respond naturally and conversationally within the chat.  
+                Acknowledge or confirm the user's request **without invoking any tools** or performing memory actions immediately.
+            2. **Do not mention** anything about modifying, accessing, or lacking access to a "memory context" or any internal memory system.
+            3. The **actual memory update or deletion** will be automatically handled at the end of the chat session.  
+                You do not need to call any tool or take explicit action for it.
+            4. Always maintain a **kind, natural, and respectful tone** when responding to such memory-related queries.
+
+        ==============================================
+
         ### 🧠 USER MEMORY CONTEXT
         Below is the stored user information that can help personalize your responses.
         Use this information to adapt tone, preferences, and context accordingly.
@@ -583,7 +610,7 @@ async def call_gemini_rest() -> Dict:
 
 async def process_query(query: str) -> str:
     """Process a query using Gemini REST API and MCP tools."""
-    global conversation_history, chart_data
+    global conversation_history, line_chart_data, pie_chart_data
     
     conversation_history.append({
         "role": "user", 
@@ -651,8 +678,12 @@ async def process_query(query: str) -> str:
             
             logging.info(f"[Client] Calling function: {function_name} with args: {function_args}")
             
-            if(function_name == "generate_and_show_chart"):
-                chart_data = function_args["data"]
+            if(function_name == "show_line_chart"):
+                line_chart_data = function_args["data"]
+            
+            if(function_name == "show_pie_chart"):
+                pie_chart_data = function_args["data"]
+
             
             try:
                 # Call the tool on MCP server
@@ -697,7 +728,7 @@ async def process_query(query: str) -> str:
 
 
 
-# Convert bytes to human-readable format
+# LINE CHART
 def human_bytes(num):
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if num < 1024:
@@ -713,17 +744,18 @@ def bytes_to_unit(num):
         num /= 1024
     return num, 'PB'
 
-async def display_chart():
-    global chart_data
-    data = chart_data   
+async def display_line_chart():
+    logging.info("[Client] [display_line_chart] Generating the line chart")
+    global line_chart_data
+    data = line_chart_data   
     
     # Convert JSON string → dict if needed
-    if isinstance(chart_data, str):
-        data = json.loads(chart_data)
-    elif isinstance(chart_data, dict):
-        data = chart_data
+    if isinstance(line_chart_data, str):
+        data = json.loads(line_chart_data)
+    elif isinstance(line_chart_data, dict):
+        data = line_chart_data
     else:
-        raise TypeError("chart_data must be a dict or JSON string")
+        raise TypeError("line_chart_data must be a dict or JSON string")
     
 
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -797,9 +829,206 @@ async def display_chart():
 
     fig.canvas.mpl_connect("motion_notify_event", hover)
     plt.tight_layout()
-    chart_data = {}
+    line_chart_data = {}
     plt.show()
     print("🤖 (Bot) : Chart Closed\n")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# PIE CHART
+def human_readable_bytes(num):
+    """Convert bytes to human-readable format."""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if num < 1024:
+            return f"{num:.2f} {unit}"
+        num /= 1024
+    return f"{num:.2f} PB"
+
+async def display_pie_chart():
+    logging.info("[Client] [display_pie_chart] Generating the pie chart")
+    global pie_chart_data
+    chart_opts = pie_chart_data   
+    
+    
+    # Convert JSON string → dict if needed
+    if isinstance(pie_chart_data, str):
+        chart_opts = json.loads(pie_chart_data)
+    elif isinstance(pie_chart_data, dict):
+        chart_opts = pie_chart_data
+    else:
+        raise TypeError("pie_chart_data must be a dict or JSON string")
+
+
+    labels = chart_opts.get('labels', [])
+    volumes = chart_opts.get('volumes', [])
+    colors = chart_opts.get('colors', [])
+    chart_title = chart_opts.get('chart_title', "Pie Chart")
+    legend_title = chart_opts.get('legend_title', "Legend")
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    total_volume = sum(volumes)
+    if total_volume == 0:
+        print("Warning: all volume values are 0.")
+        return
+
+    # ✅ Clean look (no white gaps)
+    wedges, texts = ax.pie(
+        volumes,
+        labels=labels,
+        colors=colors,
+        startangle=90,
+        labeldistance=0.7,
+        wedgeprops=dict(edgecolor='none')
+    )
+
+    ax.axis('equal')
+    plt.title(chart_title, pad=20)
+
+    # ✅ Add legend
+    legend = ax.legend(
+        wedges,
+        labels,
+        loc="center left",
+        bbox_to_anchor=(1.05, 0.5),
+        frameon=False,
+        title=legend_title
+    )
+
+    # ✅ Tooltip setup
+    tooltip = ax.annotate(
+        "",
+        xy=(0, 0),
+        xytext=(15, 15),
+        textcoords="offset points",
+        ha='left', va='bottom',
+        fontsize=10, fontweight='bold', color='black',
+        bbox=dict(facecolor='white', alpha=0.9, boxstyle='round', ec='gray'),
+        visible=False
+    )
+
+    hovered_index = {'value': None}
+    selected_index = {'value': None}  # Track clicked (expanded) slice
+
+    # ----------------------------
+    # HOVER BEHAVIOR
+    # ----------------------------
+    def on_motion(event):
+        found = False
+
+        if event.inaxes != ax:
+            if hovered_index['value'] is not None:
+                for w in wedges:
+                    w.set_alpha(1.0)
+                tooltip.set_visible(False)
+                hovered_index['value'] = None
+                fig.canvas.draw_idle()
+            return
+
+        # Hover on slices
+        for i, w in enumerate(wedges):
+            contains, _ = w.contains(event)
+            if contains:
+                if hovered_index['value'] != i:
+                    for ww in wedges:
+                        ww.set_alpha(0.6)
+                    w.set_alpha(1.0)
+                    hovered_index['value'] = i
+                tooltip.xy = (event.xdata, event.ydata)
+                tooltip.set_text(f"{labels[i]}: {human_readable_bytes(volumes[i])}")
+                tooltip.set_visible(True)
+                fig.canvas.draw_idle()
+                found = True
+                break
+
+        # Hover on legend
+        if not found:
+            renderer = fig.canvas.get_renderer()
+            for i, leg_text in enumerate(legend.get_texts()):
+                bbox = leg_text.get_window_extent(renderer=renderer)
+                if bbox.contains(event.x, event.y):
+                    if hovered_index['value'] != i:
+                        for ww in wedges:
+                            ww.set_alpha(0.6)
+                        wedges[i].set_alpha(1.0)
+                        hovered_index['value'] = i
+                    tooltip.xy = (event.xdata, event.ydata)
+                    tooltip.set_text(f"{labels[i]}: {human_readable_bytes(volumes[i])}")
+                    tooltip.set_visible(True)
+                    fig.canvas.draw_idle()
+                    found = True
+                    break
+
+        # Reset
+        if not found and hovered_index['value'] is not None:
+            for ww in wedges:
+                ww.set_alpha(1.0)
+            tooltip.set_visible(False)
+            hovered_index['value'] = None
+            fig.canvas.draw_idle()
+
+    # ----------------------------
+    # CLICK BEHAVIOR ON LEGEND
+    # ----------------------------
+    def on_click(event):
+        renderer = fig.canvas.get_renderer()
+        for i, leg_text in enumerate(legend.get_texts()):
+            bbox = leg_text.get_window_extent(renderer=renderer)
+            if bbox.contains(event.x, event.y):
+                # Reset all wedges to normal
+                for w in wedges:
+                    w.set_center((0, 0))
+                    w.set_alpha(0.8)
+                    w.set_radius(1.0)
+
+                # If same slice clicked again → deselect
+                if selected_index['value'] == i:
+                    selected_index['value'] = None
+                    fig.canvas.draw_idle()
+                    return
+
+                # Slightly "pop out" the clicked slice
+                w = wedges[i]
+                w.set_radius(1.1)  # increase size slightly
+                w.set_alpha(1.0)
+                selected_index['value'] = i
+                fig.canvas.draw_idle()
+                break
+
+    fig.canvas.mpl_connect("motion_notify_event", on_motion)
+    fig.canvas.mpl_connect("button_press_event", on_click)
+
+    plt.tight_layout()    
+    pie_chart_data = {}
+    plt.show()
+    print("🤖 (Bot) : Chart Closed\n")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -975,7 +1204,7 @@ async def cleanup():
 
 
 async def main():
-    global chart_data
+    global line_chart_data, pie_chart_data
     await connect_to_server("trisul_ai_cli.server")
     get_api_key()
 
@@ -1025,8 +1254,11 @@ async def main():
                 print(f"\n🤖 (Bot) : {response.strip()}\n")
                 
                 # If a chart was prepared, display it
-                if(chart_data):
-                    await display_chart()
+                if(line_chart_data):
+                    await display_line_chart()
+                
+                if(pie_chart_data):
+                    await display_pie_chart()
                     
             except Exception as e:
                 logging.error(f"[Client] Error: {e}")

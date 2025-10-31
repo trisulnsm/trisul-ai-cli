@@ -817,18 +817,50 @@ def rag_query(question: str):
         logging.error(f"[rag_query] Unexpected error in rag_query: {str(e)}", exc_info=True)
         return f"Error: An unexpected error occurred - {str(e)}"
     
+    
+
+@mcp.tool()
+def show_pie_chart(data):
+    """
+    Plots a static traffic chart (pie chart) using matplotlib based on the provided JSON-like input and show it in a new pop-up window.
+    
+    Usage:
+        To display pie chart to show the topper values for any counter group and meter.
+        It does not need any context name or the zmq_endpoint.
+        It can be used to display the traffic distribution for any key like IP address, protocol, port etc.
+
+    Args:
+        data (dict): Pie Chart configuration and series data.
+                    Example format:
+                    {
+                       'chart_title': 'Top Applications by Traffic',
+                       'legend_title': 'Applications',
+                       'labels': ['HTTP', 'HTTPS', 'DNS', 'SSH', 'FTP'],
+                       'volumes': [5776124, 4733635, 1028367, 14143, 14001],
+                       'colors': ['#1F77B4', '#FF7F0E', '#2CA02C', '#D62728', '#9467BD']
+                    }
+
+    Returns:
+        dict: Status and message about the pie chart display.
+    """
+    logging.info(f"[show_pie_chart] Generating the pie chart for the given data")
+
+    return {"status": "success", "message" : f"The pie chart is displayed in the pop-up window, tell the user to kindly check that. then show this data in the table format and give a short summary about the data."}
+
 
 
 
 @mcp.tool()
-def generate_and_show_chart(data):
+def show_line_chart(data):
     """
-    Plots a static traffic chart using matplotlib based on the provided JSON-like input and show it in a new pop-up window.
+    Plots a static traffic chart (line chart) using matplotlib based on the provided JSON-like input and show it in a new pop-up window.
     the input values should be in raw bytes format  not in mb or kb.
     the time stamps should be in epoc seconds format as integer not in the string date time format like this '2025-10-16 01:00:00'.
     It does not need any context name or the zmq_endpoint.
+    It can be used to display the traffic data for any key like IP address, protocol, port etc over a time period.
+    
     Args:
-        data (dict): Chart configuration and series data.
+        data (dict): Line Chart configuration and series data.
                      Example format:
                      {
                         "title": "Network Traffic Over 24 Hours", "x_label": "Time", "y_label": "Traffic",
@@ -841,9 +873,9 @@ def generate_and_show_chart(data):
                      }
     """
     
-    logging.info(f"[generate_and_show_chart] Generating the chart for the given data")
+    logging.info(f"[show_line_chart] Generating the line chart for the given data")
 
-    return {"status": "success", "message" : f"The chart is displayed in the pop-up window, tell the user to kindly check that. then show this data in the table format and give a short summary about the data."}
+    return {"status": "success", "message" : f"The line chart is displayed in the pop-up window, tell the user to kindly check that. then show this data in the table format and give a short summary about the data."}
 
 
 
