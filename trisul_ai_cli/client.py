@@ -292,12 +292,181 @@ conversation_history = [
                 Do not explain or expose MCP server internals or describe internal tools/automation
 
 
+        BYTE-TO-HUMAN CONVERSION (STRICT ZERO-ERROR MODE)
+
+            You must follow every rule in this prompt **exactly and without exception**.  
+            Your primary objective is to always produce **fully accurate, reverse-verified, binary-scaled human readable values on the first attempt**, with zero re-calculation requested by the user.
+
+            ---
+
+            ## 🚨 PRE-RESPONSE VALIDATION REQUIREMENT (MANDATORY BEFORE ANY ANSWER)
+
+            Before generating **any** response that includes converted values:
+
+            1. Perform all calculations **internally first**, including reverse-verification.
+            2. Validate every converted value using the exact reverse verification rules.
+            3. If any value fails verification, **recalculate with higher precision** BEFORE responding.
+            4. **You must not output** any unverified or approximate values.
+            5. Only once ALL values PASS verification, you may provide the final answer.
+
+            If validation fails, you must fix the calculation first — do **not** output the intermediate wrong value.
+
+            **NEVER** produce a response that will require the user to ask for a recalculation.
+
+            ---
+
+            ## 🔍 ACCURACY ENFORCEMENT — ZERO-TOLERANCE RULE
+
+            - Never guess, approximate, or assume values from memory.
+            - Always compute fresh from raw inputs every time.
+            - Never reuse or rely on earlier outputs for math — always recompute.
+            - If you previously corrected a value in a conversation, the corrected logic becomes the baseline going forward.
+
+            **If the final value is not 100% reproducible by reverse-calculation, you must not display it.**
+
+            ---
+
+            ## 📏 CRITICAL CONVERSION RULES (NO EXCEPTIONS)
+
+            ### ✅ Rule 1: Binary Scaling Only
+
+                Use **binary units**, never decimal:
+
+                - 1 KB = 1024 bytes  
+                - 1 MB = 1024 KB = 1,048,576 bytes  
+                - 1 GB = 1024 MB = 1,073,741,824 bytes  
+                - 1 TB = 1024 GB = 1,099,511,627,776 bytes  
+
+                Decimal (1000-based) scaling is strictly prohibited.
+
+            ---
+
+            ### 🔁 Rule 2: Mandatory Reverse-Verification
+
+                Before displaying any converted value:
+
+                1. Compute the human-readable value using binary scaling.
+                2. Reverse-calculate:  
+                `human_value * (1024 ** unit_level)`
+                3. The reverse result **must match the raw value within ±1 byte**.
+                4. If it does not match:
+                - Increase precision and recalculate
+                - Try adjacent unit selections if needed
+                5. Only after a perfect match, round to 2 decimals for display.
+
+                Never show a value that fails reverse verification.
+
+            ---
+
+            ### 🧠 Rule 3: Logical Validation Before Conversion
+
+                Perform these checks **in this exact order**:
+
+                 1. Identify the context:
+                - If the data represents **key traffic data**, follow the standard conversion rules.
+                - If the data represents **topper traffic data**, follow the same rules except that 
+                    you must **not multiply by 8**, and you must multiply by the **topper bucket size ** instead (see Rule 3).
+
+                2. Determine how to handle the raw value based on counter type:
+                - For **key traffic data**:
+                    - If the counter type is `VT_RATE_COUNTER`, the value represents a rate (bytes per second).
+                        → Multiply the raw value by 8 before conversion, to convert bytes/sec into bits/sec (bps).
+                    - For all other counter types, treat the raw value as bytes and convert it directly (no multiplication by 8).
+                - For **topper traffic data**, skip the x8 step regardless of counter type.
+
+                3. Additional rule for **topper traffic data**:
+                - multiply the topper bucket size with the base value (without x8).
+                    Example:
+                    Raw value = 100  
+                    Counter type = VT_RATE_COUNTER → (do NOT multiply by 8)
+                    Topper Bucket size (topperBucketSize) = 600 seconds  
+                    Final value before conversion = 100 x 600 = 60000  
+                    
+                
+                
+                
+
+                4. **Reverse-Verification Enforcement**
+                - Reverse check must pass before display (±1 byte tolerance).
+                
+                
+                5. Examples:
+                    Example 1 — Rate Counter (Key Traffic Data)
+                        Input:
+                            value = 1500000000
+                            type  = 'VT_RATE_COUNTER'
+
+                        Calculation:
+                            1500000000 x 8 = 12000000000 bytes/sec
+                            → 11.18 GB
+
+                        Output: '11.18 GB'
+
+                    Example 2 — Total Counter (Key Traffic Data)
+                        Input:
+                            value = 1500000000
+                            type  = 'VT_COUNTER'
+
+                        Calculation:
+                            1500000000 bytes = 1.40 GB
+
+                        Output: '1.40 GB'
+
+                    Example 3 — Rate Counter (Topper Traffic Data)
+                        Input:
+                            value = 1500000000
+                            type  = 'VT_RATE_COUNTER'
+                            topperBucketSize = 600 (seconds)
+
+                        Calculation:
+                            (Do not multiply by 8)
+                            1500000000 x 600 = 900000000000  
+                            → 838.19 GB
+
+                        Output: '838.19 GB'
+                    
+
+                6. **Final Precision Rule**
+                - Round only **after** reverse verification.
+                - Display must be reproducible manually.
+
+            ---
+
+            ### 🧮 Rule 4.1: Deterministic Unit Selection (MUST FOLLOW EXACT ORDER)
+
+                Units list (in descending priority):
+                    [('TB', 10244), ('GB', 10243), ('MB', 1024**2), ('KB', 1024), ('B', 1)]
+                    
+                Algorithm:
+
+                1. Iterate TB → B
+                2. Select the first unit where full-precision value ≥ 1.0
+                3. Perform reverse-verification
+                4. If fail, try:
+                - Higher precision
+                - One unit lower
+                - One unit higher (if applicable)
+                5. If **none** yield a valid match → show raw bytes with “N/A (verification failed)”
+
+            ---
+
+            ### ✔️ Final Self-Check Before Sending Response
+
+                Before responding, internally answer this:
+
+                > “Have I verified every converted value using the reverse-calculation rule and confirmed it matches within ±1 byte?”
+
+                If **NO**, fix internally first.  
+                If **YES**, then answer.
+
+            ---
+
 
 
         TABLE FORMATTING:
             - Convert each cell individually to the most readable unit:
                 * Use KB if value < 1 MB, MB if value >= 1 MB and < 1 GB, GB if value >= 1 GB.
-            - You should not show the value as Mbp or Kbp . just show MB or KB
+            - You should not show the value as Mb or Kb . just show MB or KB
             - Round values to 1-2 decimal places for clarity.
             - Keep column headers descriptive but avoid fixing a specific unit.
             - Timestamps:
@@ -312,11 +481,13 @@ conversation_history = [
             - Align columns evenly for readability.
             - Always include borders on **all four sides** — top, bottom, left, and right.
             - Provide a concise summary below the table highlighting trends, peaks, or anomalies.
-            - Never leave any cell empty; fill with “0” or “N/A” where data is missing.
+            - Never leave any cell empty; fill with "0" or "N/A" where data is missing.
             - The table output must always be fully enclosed within borders.
             - The table must have borders on **all four sides** — top, bottom, left, and right
             - **Never show raw Python code** or intermediate data structures to the user.
             - The final output should always be a clean, readable table with a brief summary.
+            - Always recalculate to check if the bytes values are converted to exact human format.
+            - Before displaying the values in the table always double check to ensure the bytes are correctly converted to the human readable format.
 
 
 
@@ -334,80 +505,19 @@ conversation_history = [
             1. After receiving traffic data from get_key_traffic_data:
                 - ALWAYS format the data into a table first
                 - Always produce a textual summary highlighting trends and peaks.
-                - If user requested a chart, IMMEDIATELY call show_line_chart
+                - If user requested a chart, IMMEDIATELY call line chart tool or pie chart tool
                 - NEVER leave response empty after function calls
-                - Before calling the show_line_chart multiply the raw bytes with 8 if the meter type is VT_RATE_COUNTER
+                - Before calling the line chart or pie chart multiply the raw bytes with 8 if the meter type is VT_RATE_COUNTER
                 - When generating JSON for this tool Ensure the output is strictly valid JSON. Always close all arrays and objects properly with matching brackets (], '}}').
-                
                 - After generating the chart always show the data in the table format and give a short summary about the traffic or data.
 
-            2. Chart data format must be:
-                {{
-                    "title": "...",
-                    "x_label": "Time (IST)",
-                    "y_label": "Traffic (MB)",
-                    "keys": [
-                    {{
-                        "timestamps": [1718714400, ...],
-                        "legend_label": "Total Traffic",
-                        "color": "blue",
-                        "values": [5.51, 6.28, ...]
-                    }}
-                    ]
-                }}
-
-            3. Response sequence for chart requests:
+            2. Response sequence for chart requests:
                 a) Call get_key_traffic_data
                 b) Generate table summary
-                c) Call show_line_chart with formatted data
+                c) Call line chart or pie chart tool with formatted data
                 d) Provide final text confirmation
 
 
-
-        BYTE-TO-HUMAN CONVERSION LOGIC FOR CONTER TYPES
-            
-            Whenever you convert the raw byte values into human-readable format, follow these precise rules:
-
-            1. Check the counter type for each meter in its counter group:
-            - If the counter type is 'VT_RATE_COUNTER', it represents a rate (bytes per second).
-                Multiply the value by 8 before conversion, since it must be expressed in bits per second (bps).
-            - For all other counter types, treat the raw value as bytes and convert it directly into a readable format (KB, MB, GB, etc.) without multiplying by 8.
-
-            2. Conversion behavior:
-            - Use binary scaling (1 KB = 1024 bytes).
-            - Display numeric values with two decimal places.
-            
-
-            3. Examples:
-
-            Example 1 — Rate Counter
-            Input:
-                value = 1500000000
-                type  = 'VT_RATE_COUNTER'
-
-            Calculation:
-                1500000000 x 8 = 12000000000 bits/sec
-                → 11.18 Gbp
-
-            Output: '11.18 Gbp'
-
-            Example 2 — Total Counter
-            Input:
-                value = 1500000000
-                type  = 'VT_COUNTER'
-
-            Calculation:
-                1500000000 bytes = 1.40 GB
-
-            Output: '1.40 GB'
-
-            4. Summary logic (Python-like pseudocode):
-
-            if counter_type == 'VT_RATE_COUNTER':
-                display_value = human_bytes(value * 8) + 'bps'
-            else:
-                display_value = human_bytes(value)
-        
         
         RESPONSE REQUIREMENTS:
             After EVERY Tool Call
@@ -489,9 +599,9 @@ conversation_history = [
         ### 🧠 USER MEMORY CONTEXT HANDLING
 
         If the user says something like:
-        - “What do you know about me?”
-        - “Remember this about me …”
-        - “Forget this thing about me …”
+        - "What do you know about me?"
+        - "Remember this about me …"
+        - "Forget this thing about me …"
 
         Then follow these rules:
             1. Respond naturally and conversationally within the chat.  
@@ -500,6 +610,8 @@ conversation_history = [
             3. The **actual memory update or deletion** will be automatically handled at the end of the chat session.  
                 You do not need to call any tool or take explicit action for it.
             4. Always maintain a **kind, natural, and respectful tone** when responding to such memory-related queries.
+            5. If you know the user's name, **greet them personally** at the start of your response to make the interaction warm and friendly.
+
 
         ==============================================
 
@@ -763,7 +875,7 @@ async def display_line_chart():
     all_values = []  # collect all values to find best axis scale
 
     for series in data.get("keys", []):
-        # ✅ Convert epoch seconds → datetime
+        # Convert epoch seconds → datetime
         timestamps = [datetime.fromtimestamp(ts) for ts in series["timestamps"]]
         values = series["values"]
         all_values.extend(values)
@@ -785,7 +897,7 @@ async def display_line_chart():
     # Apply formatter to y-axis
     ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y / scale_factor:.2f} {unit}"))
 
-    # ✅ Format the x-axis as date/time
+    # Format the x-axis as date/time
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M:%S'))
     ax.xaxis.set_major_locator(mdates.AutoDateLocator())
 
@@ -838,17 +950,6 @@ async def display_line_chart():
 
 
 
-
-
-
-
-
-
-
-
-
-
-
 # PIE CHART
 def human_readable_bytes(num):
     """Convert bytes to human-readable format."""
@@ -865,8 +966,26 @@ async def display_pie_chart():
     
     
     # Convert JSON string → dict if needed
-    if isinstance(pie_chart_data, str):
-        chart_opts = json.loads(pie_chart_data)
+    if isinstance(pie_chart_data, str):        
+        try:
+            chart_opts = json.loads(pie_chart_data)
+        except json.JSONDecodeError:
+            # Fallback: clean and normalize Python-style dict string
+            normalized = pie_chart_data.strip()
+
+            # Replace single quotes around keys and values → double quotes
+            normalized = re.sub(r"(?<!\\)'", '"', normalized)
+
+            # Remove potential invalid characters (like trailing commas)
+            normalized = re.sub(r",\s*}", "}", normalized)
+            normalized = re.sub(r",\s*]", "]", normalized)
+
+            try:
+                chart_opts = json.loads(normalized)
+                logging.warning("[Client] Non-standard JSON detected — normalized string quotes before parsing.")
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid chart data format after normalization: {e}")
+
     elif isinstance(pie_chart_data, dict):
         chart_opts = pie_chart_data
     else:
@@ -885,7 +1004,7 @@ async def display_pie_chart():
         print("Warning: all volume values are 0.")
         return
 
-    # ✅ Clean look (no white gaps)
+    # Clean look (no white gaps)
     wedges, texts = ax.pie(
         volumes,
         labels=labels,
@@ -898,7 +1017,7 @@ async def display_pie_chart():
     ax.axis('equal')
     plt.title(chart_title, pad=20)
 
-    # ✅ Add legend
+    # Add legend
     legend = ax.legend(
         wedges,
         labels,
@@ -908,7 +1027,7 @@ async def display_pie_chart():
         title=legend_title
     )
 
-    # ✅ Tooltip setup
+    # Tooltip setup
     tooltip = ax.annotate(
         "",
         xy=(0, 0),
@@ -1035,7 +1154,7 @@ async def display_pie_chart():
 async def update_user_memory():
     global conversation_history, existing_ai_memory, memory_json_path
     
-    logging.info("[Client] [ai_memory] Updating user memory. Existing memory: \n" + json.dumps(existing_ai_memory, indent=2))
+    logging.info(f"[Client] [ai_memory] Updating user memory. Existing memory: \n {existing_ai_memory}")
     
     confidence_threshold = 90
     
@@ -1103,7 +1222,7 @@ async def update_user_memory():
 
         5. **Ensure self-consistency** only when changes are made:
         - Merge related facts (e.g., multiple programming languages → merge into one array).
-        - Keep values up-to-date (e.g., replace “Ubuntu” with “Fedora” if the user switched OS).
+        - Keep values up-to-date (e.g., replace "Ubuntu" with "Fedora" if the user switched OS).
         - Remove irrelevant or outdated facts completely from the final output.
 
         6. **If updates are made**, always produce a fully merged and cleaned memory object containing:
@@ -1220,22 +1339,24 @@ async def main():
     try:
         while True:
             query = input("👤 (You) : ").strip()
-            logging.info(f"[Client] Query: {query}")
-            
-            # Exit
-            if query.lower() in ["exit", "quit"]:
-                
-                task = asyncio.create_task(update_user_memory())
-                spinner = asyncio.create_task(loading_animation(task,"Adapting to your world"))
-                response = await task
-                await spinner
-                
-                print("\n🤖 (Bot) : 👋 Goodbye!")
-                break
             
             # skip empty inputs
             if not query:
                 continue
+            else:
+                logging.info(f"[Client] Query: {query}")
+            
+            # Exit
+            if query.lower() in ["exit", "quit"]:
+                task = asyncio.create_task(update_user_memory())
+                spinner = asyncio.create_task(loading_animation(task,"Adapting to your world"))
+                response = await task
+                await spinner
+                    
+                logging.info("[Client] Goodbye! ")
+                print("\n🤖 (Bot) : 👋 Goodbye!")
+                break
+
             
             # change the api key
             if query.lower() == "change_api_key":
@@ -1262,6 +1383,7 @@ async def main():
                     
             except Exception as e:
                 logging.error(f"[Client] Error: {e}")
+                logging.info("[Client] Exiting gracefully...")
                 await asyncio.sleep(0.5)
                 print()
                 print(f"\n🤖 (Bot) : {e}")
@@ -1269,6 +1391,7 @@ async def main():
                 sys.exit(0)
 
     except KeyboardInterrupt:
+        logging.info("[Client] Exiting gracefully...")
         print("\n👋 Exiting gracefully...")
         sys.exit(0)
 
@@ -1283,6 +1406,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
+        logging.info("[Client] Exiting gracefully ...")
         print("\n👋 Exiting gracefully ...")
     
     
