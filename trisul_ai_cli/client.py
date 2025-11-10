@@ -98,7 +98,40 @@ conversation_history = [
             You must only answer queries related to **Trisul Network Analytics** or **general networking concepts** (like IP addresses, SNMP, NetFlow, routing, or traffic analysis).
             Do NOT answer unrelated questions (e.g., science, history, entertainment, or general knowledge).  
             If asked such a question, respond kindly that it's beyond your current area of expertise.
+            Adapt your tone, style, content and response format based on the user's preferences stored in memory context.
 
+
+        
+        ==============================================
+
+        ### 🧠 USER MEMORY CONTEXT HANDLING
+
+        If the user says something like:
+        - "What do you know about me?"
+        - "Remember this about me …"
+        - "Forget this thing about me …"
+
+        Then follow these rules:
+            1. Respond naturally and conversationally within the chat.  
+                Acknowledge or confirm the user's request **without invoking any tools** or performing memory actions immediately.
+            2. **Do not mention** anything about modifying, accessing, or lacking access to a "memory context" or any internal memory system.
+            3. The **actual memory update or deletion** will be automatically handled at the end of the chat session.  
+                You do not need to call any tool or take explicit action for it.
+            4. Always maintain a **kind, natural, and respectful tone** when responding to such memory-related queries.
+            5. If you know the user's name, **greet them personally** at the start of your response to make the interaction warm and friendly.
+
+
+        ==============================================
+
+        ### 🧠 USER MEMORY CONTEXT
+        Below is the stored user information that can help personalize your responses.
+        Use this information to adapt tone, preferences, and context accordingly.
+
+        {existing_ai_memory}
+
+        ==============================================
+        
+        
 
         CORE CONCEPTS:
             1. Counter Groups
@@ -207,6 +240,15 @@ conversation_history = [
                 Unleash Apps: Application unleashing
                 Remote Office: Remote site traffic
                 Organization: Organizational traffic
+                
+        ALERT GROUPS GUIDS:
+            These are the complete list of Alert Counter Groups available in Trisul:
+                Blacklist Alerts : '{{5E97C3A3-41DB-4E34-92C3-87C904FAB83E}}'
+                IDS Alerts : '{{9AFD8C08-07EB-47E0-BF05-28B4A7AE8DC9}}'
+                User Alerts : '{{B5F1DECB-51D5-4395-B71B-6FA730B772D9}}'
+                Threshold crossing Alerts : '{{03AC6B72-FDB7-44C0-9B8C-7A1975C1C5BA}}'
+                Threshold Band Alerts : '{{0E7E367D-4455-4680-BC73-699D81B7CBE0}}'
+                Flow Tracker Alerts : '{{BE7F367F-8533-45F7-9AE8-A33E5E1AA783}}'
 
         OPERATIONAL GUIDELINES:
             Default Values (Use When Not Specified)
@@ -594,34 +636,7 @@ conversation_history = [
                 - "I can guide you through using Trisul for monitoring, reporting, or security analysis."
 
         
-        ==============================================
-
-        ### 🧠 USER MEMORY CONTEXT HANDLING
-
-        If the user says something like:
-        - "What do you know about me?"
-        - "Remember this about me …"
-        - "Forget this thing about me …"
-
-        Then follow these rules:
-            1. Respond naturally and conversationally within the chat.  
-                Acknowledge or confirm the user's request **without invoking any tools** or performing memory actions immediately.
-            2. **Do not mention** anything about modifying, accessing, or lacking access to a "memory context" or any internal memory system.
-            3. The **actual memory update or deletion** will be automatically handled at the end of the chat session.  
-                You do not need to call any tool or take explicit action for it.
-            4. Always maintain a **kind, natural, and respectful tone** when responding to such memory-related queries.
-            5. If you know the user's name, **greet them personally** at the start of your response to make the interaction warm and friendly.
-
-
-        ==============================================
-
-        ### 🧠 USER MEMORY CONTEXT
-        Below is the stored user information that can help personalize your responses.
-        Use this information to adapt tone, preferences, and context accordingly.
-
-        {existing_ai_memory}
-
-        ==============================================
+        ================================================================
 
         Now continue operating according to the above expert rules,
         keeping in mind the user's preferences and memory context.
@@ -642,7 +657,6 @@ conversation_history = [
     ]
   }
 ]
-
 
 
 async def connect_to_server(server_module: str = "trisul_ai_cli.server"):
@@ -959,38 +973,41 @@ def human_readable_bytes(num):
         num /= 1024
     return f"{num:.2f} PB"
 
+
 async def display_pie_chart():
-    logging.info("[Client] [display_pie_chart] Generating the pie chart")
+    logging.info("[Client] Starting pie chart render workflow")
+
     global pie_chart_data
-    chart_opts = pie_chart_data   
-    
-    
-    # Convert JSON string → dict if needed
-    if isinstance(pie_chart_data, str):        
+    raw_input_type = type(pie_chart_data).__name__
+    logging.debug("[Client] Inbound chart data type=%s", raw_input_type)
+
+    chart_opts = pie_chart_data
+
+    # Normalize data to dict
+    if isinstance(pie_chart_data, str):
+        logging.debug("[Client] Attempt JSON parsing for string input")
         try:
             chart_opts = json.loads(pie_chart_data)
+            logging.info("[Client] Chart config loaded from JSON string")
         except json.JSONDecodeError:
-            # Fallback: clean and normalize Python-style dict string
+            logging.warning("[Client] Non-standard JSON received. Attempting normalization")
             normalized = pie_chart_data.strip()
-
-            # Replace single quotes around keys and values → double quotes
             normalized = re.sub(r"(?<!\\)'", '"', normalized)
-
-            # Remove potential invalid characters (like trailing commas)
             normalized = re.sub(r",\s*}", "}", normalized)
             normalized = re.sub(r",\s*]", "]", normalized)
 
             try:
                 chart_opts = json.loads(normalized)
-                logging.warning("[Client] Non-standard JSON detected — normalized string quotes before parsing.")
+                logging.info("[Client] Chart config normalized and parsed successfully")
             except json.JSONDecodeError as e:
+                logging.error("[Client] Normalization failed. Root cause=%s", e)
                 raise ValueError(f"Invalid chart data format after normalization: {e}")
 
     elif isinstance(pie_chart_data, dict):
-        chart_opts = pie_chart_data
+        logging.info("[Client] Chart config loaded from dict")
     else:
+        logging.error("[Client] Unsupported data type for pie_chart_data: %s", raw_input_type)
         raise TypeError("pie_chart_data must be a dict or JSON string")
-
 
     labels = chart_opts.get('labels', [])
     volumes = chart_opts.get('volumes', [])
@@ -998,13 +1015,19 @@ async def display_pie_chart():
     chart_title = chart_opts.get('chart_title', "Pie Chart")
     legend_title = chart_opts.get('legend_title', "Legend")
 
-    fig, ax = plt.subplots(figsize=(7, 6))
+    logging.debug("[Client] Chart metadata loaded: labels=%d volumes=%d colors=%d",
+                 len(labels), len(volumes), len(colors))
+
     total_volume = sum(volumes)
     if total_volume == 0:
+        logging.warning("[Client] All volume values are zero. Chart aborted.")
         print("Warning: all volume values are 0.")
         return
 
-    # Clean look (no white gaps)
+    logging.info("[Client] Rendering chart: title='%s' total_items=%d total_volume=%s",
+                chart_title, len(volumes), human_readable_bytes(total_volume))
+
+    fig, ax = plt.subplots(figsize=(7, 6))
     wedges, texts = ax.pie(
         volumes,
         labels=labels,
@@ -1016,8 +1039,6 @@ async def display_pie_chart():
 
     ax.axis('equal')
     plt.title(chart_title, pad=20)
-
-    # Add legend
     legend = ax.legend(
         wedges,
         labels,
@@ -1027,7 +1048,9 @@ async def display_pie_chart():
         title=legend_title
     )
 
-    # Tooltip setup
+    logging.debug("[Client] Hover and click event handlers initializing")
+
+    # Tooltip
     tooltip = ax.annotate(
         "",
         xy=(0, 0),
@@ -1040,14 +1063,11 @@ async def display_pie_chart():
     )
 
     hovered_index = {'value': None}
-    selected_index = {'value': None}  # Track clicked (expanded) slice
+    selected_index = {'value': None}
 
-    # ----------------------------
-    # HOVER BEHAVIOR
-    # ----------------------------
     def on_motion(event):
+        # Keep logging light inside event loop
         found = False
-
         if event.inaxes != ax:
             if hovered_index['value'] is not None:
                 for w in wedges:
@@ -1057,7 +1077,6 @@ async def display_pie_chart():
                 fig.canvas.draw_idle()
             return
 
-        # Hover on slices
         for i, w in enumerate(wedges):
             contains, _ = w.contains(event)
             if contains:
@@ -1073,7 +1092,6 @@ async def display_pie_chart():
                 found = True
                 break
 
-        # Hover on legend
         if not found:
             renderer = fig.canvas.get_renderer()
             for i, leg_text in enumerate(legend.get_texts()):
@@ -1091,7 +1109,6 @@ async def display_pie_chart():
                     found = True
                     break
 
-        # Reset
         if not found and hovered_index['value'] is not None:
             for ww in wedges:
                 ww.set_alpha(1.0)
@@ -1099,29 +1116,25 @@ async def display_pie_chart():
             hovered_index['value'] = None
             fig.canvas.draw_idle()
 
-    # ----------------------------
-    # CLICK BEHAVIOR ON LEGEND
-    # ----------------------------
     def on_click(event):
         renderer = fig.canvas.get_renderer()
         for i, leg_text in enumerate(legend.get_texts()):
             bbox = leg_text.get_window_extent(renderer=renderer)
             if bbox.contains(event.x, event.y):
-                # Reset all wedges to normal
+                logging.info("[Client] Legend item clicked index=%d label='%s'", i, labels[i])
                 for w in wedges:
                     w.set_center((0, 0))
                     w.set_alpha(0.8)
                     w.set_radius(1.0)
 
-                # If same slice clicked again → deselect
                 if selected_index['value'] == i:
+                    logging.debug("[Client] Slice deselected index=%d", i)
                     selected_index['value'] = None
                     fig.canvas.draw_idle()
                     return
 
-                # Slightly "pop out" the clicked slice
                 w = wedges[i]
-                w.set_radius(1.1)  # increase size slightly
+                w.set_radius(1.1)
                 w.set_alpha(1.0)
                 selected_index['value'] = i
                 fig.canvas.draw_idle()
@@ -1130,22 +1143,13 @@ async def display_pie_chart():
     fig.canvas.mpl_connect("motion_notify_event", on_motion)
     fig.canvas.mpl_connect("button_press_event", on_click)
 
-    plt.tight_layout()    
+    plt.tight_layout()
+
+    logging.info("[Client] Chart UI ready. Awaiting user interaction")
     pie_chart_data = {}
     plt.show()
+    logging.info("[Client] Chart closed by user")
     print("🤖 (Bot) : Chart Closed\n")
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
