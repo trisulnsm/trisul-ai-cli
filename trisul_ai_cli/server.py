@@ -9,12 +9,21 @@ import chromadb
 from google.protobuf.json_format import MessageToDict
 import logging
 from pathlib import Path
-from datetime import datetime
-
-
+from datetime import datetime, timedelta, timezone
+import random
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import inch
+from reportlab.lib.utils import ImageReader
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, Image
+from reportlab.lib.styles import getSampleStyleSheet
+import json
+import os
+import re
+import ast
 
 logging.basicConfig(
-    filename= Path(__file__).resolve().parent / "trisul_ai_cli.log",
+    filename= Path(os.getcwd()) / "trisul_ai_cli.log",
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
@@ -26,6 +35,7 @@ mcp = FastMCP(name="trisul-mcp-server")
 # helper function
 def normalize_context(ctx: str) -> str:
     try:
+        ctx = ctx.lower()
         logging.info(f"[normalize_context] Normalizing context: {ctx}")
         if ctx.startswith("context_"):
             ctx = ctx.split("_", 1)[-1]
@@ -156,6 +166,52 @@ def countergroup_info(zmq_endpoint: str = None, context: str = "context0", get_m
     except Exception as e:
         logging.error(f"[countergroup_info] Error in countergroup_info: {str(e)}", exc_info=True)
         return {"error": str(e), "groupDetails": []}
+
+
+def epoch_to_duration(from_ts, to_ts):
+    
+    secs = int(to_ts) - int(from_ts)
+    
+    lookup = {"days": "Day", "hours": "Hr", "minutes": "Min", "seconds": "Sec"}
+    
+    secs = int(secs)
+    if secs == 0:
+        return "<1s"
+    
+    duration = ""
+    
+    # Calculate days
+    days = secs // 86400
+    if days > 0:
+        lookup["days"] = f" {lookup['days']}s " if days > 1 else f" {lookup['days']} "
+        duration += f"{days}{lookup['days']}"
+        secs = secs - days * 86400
+    
+    # Calculate hours
+    hours = secs // 3600
+    if hours > 0:
+        lookup["hours"] = f" {lookup['hours']}s " if hours > 1 else f" {lookup['hours']} "
+        duration += f"{hours}{lookup['hours']}"
+        secs = secs - hours * 3600
+    
+    # Calculate minutes
+    minutes = secs // 60
+    if minutes > 0:
+        lookup["minutes"] = f" {lookup['minutes']}s " if minutes > 1 else f" {lookup['minutes']} "
+        duration += f"{minutes}{lookup['minutes']}"
+        secs = secs - minutes * 60
+    
+    # Remaining seconds
+    if secs > 0:
+        lookup["seconds"] = f" {lookup['seconds']}s " if secs > 1 else f" {lookup['seconds']} "
+        duration += f"{secs}{lookup['seconds']}"
+    
+    starting_time = datetime.fromtimestamp(int(from_ts), timezone(timedelta(hours=5, minutes=30))).strftime("%Y-%m-%d %H:%M:%S %z IST")
+    
+    return f"Duration {duration.strip()} starting from {starting_time}"
+
+
+
 
 
 
@@ -820,7 +876,7 @@ def rag_query(question: str):
     
 
 @mcp.tool()
-def show_pie_chart(data):
+def show_pie_chart(data, save_image: bool = False):
     """
     Plots a static traffic chart (pie chart) using matplotlib based on the provided JSON-like input and show it in a new pop-up window.
     
@@ -839,19 +895,38 @@ def show_pie_chart(data):
                        'volumes': [5776124, 4733635, 1028367, 14143, 14001],
                        'colors': ['#1F77B4', '#FF7F0E', '#2CA02C', '#D62728', '#9467BD']
                     }
+        save_image (bool): set it 'True' to save the chart as an image file and don't display it in pop-up window. set it False to display the chart in pop-up window. Default is False.
 
     Returns:
         dict: Status and message about the pie chart display.
     """
     logging.info(f"[show_pie_chart] Generating the pie chart for the given data")
+    
+        
+    if isinstance(data, str):
+        data = ast.literal_eval(data)  # handles single-quoted dict strings
+    else:
+        data = dict(data)
 
-    return {"status": "success", "message" : f"The pie chart is displayed in the pop-up window, tell the user to kindly check that. then show this data in the table format and give a short summary about the data."}
+    data["volumes"] = [
+        eval(str(v)) if isinstance(v, str) and "*" in v else v
+        for v in data.get("volumes", [])
+    ]
 
+
+    
+    if(save_image):
+        file_path = f"/tmp/pie_chart_{int(datetime.now().timestamp())}_{random.randint(1000, 9999)}.png"
+        logging.info(f"[show_pie_chart] save_image is set to True, so saving the chart as an image file instead of displaying it. path: {file_path}")
+        return {"status": "success", "message" : f"The pie chart is saved as an image file successfully.", "file_path": file_path}
+    else:
+        logging.info(f"[show_pie_chart] save_image is set to False, so displaying the chart in a pop-up window.")
+        return {"status": "success", "message" : f"The pie chart is displayed in the pop-up window, tell the user to kindly check that. then show this data in the table format and give a short summary about the data.", "file_path": None}
 
 
 
 @mcp.tool()
-def show_line_chart(data):
+def show_line_chart(data, save_image: bool = False):
     """
     Plots a static traffic chart (line chart) using matplotlib based on the provided JSON-like input and show it in a new pop-up window.
     the input values should be in raw bytes format  not in mb or kb.
@@ -871,11 +946,17 @@ def show_line_chart(data):
                             ...
                         ]
                      }
+        save_image (bool): set it 'True' to save the chart as an image file and don't display it in pop-up window. set it False to display the chart in pop-up window. Default is False.
     """
     
     logging.info(f"[show_line_chart] Generating the line chart for the given data")
 
-    return {"status": "success", "message" : f"The line chart is displayed in the pop-up window, tell the user to kindly check that. then show this data in the table format and give a short summary about the data."}
+    if(save_image):
+        file_path = f"/tmp/line_chart_{int(datetime.now().timestamp())}_{random.randint(1000, 9999)}.png"
+        logging.info(f"[show_line_chart] save_image is set to True, so saving the chart as an image file instead of displaying it. path: {file_path}")
+        return {"status": "success", "message" : f"The line chart is saved as an image file successfully.", "file_path": file_path}
+    else:
+        return {"status": "success", "message" : f"The line chart is displayed in the pop-up window, tell the user to kindly check that. then show this data in the table format and give a short summary about the data.", "file_path": None}
 
 
 
@@ -1094,7 +1175,7 @@ def get_alerts_data(
 
 
 @mcp.tool()
-def get_key_session_data(
+def get_flows_or_sessions_data(
         session_group: str = "{99A78737-4B41-4387-8F31-8077DB917336}",
         key: str = None,
         source_ip: str = None,
@@ -1175,7 +1256,7 @@ def get_key_session_data(
 
     try:
         if not zmq_endpoint:
-            context = context or "context0"
+            context = normalize_context(context)
             zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{context}/run/trp_0"
 
         logging.info(f"[QuerySessions] TRP endpoint={zmq_endpoint}")
@@ -1283,9 +1364,232 @@ def get_key_session_data(
     finally:
         if zmq_context:
             zmq_context.term()
+
+
+
+
+@mcp.tool()
+def generate_trisul_report(pages, filename: str, report_title: str, from_ts, to_ts):
+    """
+    Generate a multi-page PDF report with multiple tables or  traffic charts (one per page).
+    
+    Args:
+        filename (str): Output PDF file name.
+        pages (list[dict]): Each dict = {'title': str, 'subtitle': str, 'data': list[list[str]]}
+            Each page should have a title, subtitle, and data.  Data can be either a table or a chart.
+            For table pages, 'data' is a 2D list representing rows and columns.
+            For chart pages, 'data' is a dict with 'file_path' key pointing to the chart image file.
+        report_title (str): Title of the report to be displayed in the header of all pages. The title should be short and descriptive within 2-4 words.
+        from_ts (int): Start timestamp of the report duration (epoch seconds).
+        to_ts (int): End timestamp of the report duration (epoch seconds).
+
+    Example:
+        pages = [
+            {
+                "type": "table",
+                "title": "Internal Hosts",
+                "subtitle": "Top internal hosts by total volume",
+                "data": [
+                    ["Internal Hosts", "Readable", "Flows", "Sent Bytes", "Received Bytes", "Total Bytes", "Percent"],
+                    ["10.40.16.100", "10.40.16.100", "40", "49.61 K", "334.92 K", "384.53 K", "63.5"],
+                    ["10.40.16.223", "10.40.16.223", "16", "28.98 K", "177.92 K", "206.90 K", "34.2"],
+                ]
+            },
+            {
+                "type": "chart",
+                "title": "HTTPS Traffic Chart",
+                "subtitle": "Showing HTTPS traffic trend over time",
+                "file_path": "/tmp/traffic_chart_12345.png"
+            },
+    
+        ]
+        filename = 'trisul_https_report.pdf'
+        report_title = 'HTTPS Traffic Report'
+        from_ts = 1676610900
+        to_ts = 1676614500
+    """
+    
+    styles = getSampleStyleSheet()
+    title_style = styles["Heading2"]
+    title_style.leftIndent = 0
+    title_style.spaceAfter = 10
+
+    subtitle_style = styles["Heading5"]
+    subtitle_style.leftIndent = 0
+    subtitle_style.spaceAfter = 20
+    subtitle_style.textColor = colors.HexColor("#800080")
+
+
+    filename = f"/tmp/{filename}"
+    
+    if isinstance(pages, str):
+        pages = ast.literal_eval(pages)
+    
+    pdf = SimpleDocTemplate(
+        filename,
+        pagesize=A4,
+        leftMargin=10,
+        rightMargin=15,
+        topMargin=55,
+        bottomMargin=70,
+    )
+
+    # Header/footer rendering
+    def draw_header_footer(canvas, doc):
+        width, height = A4
+
+        # Header separator
+        canvas.setStrokeColor(colors.black)
+        canvas.line(15, height - 65, width - 15, height - 65)
+        
+        logo_path = Path(__file__).resolve().parent / "assets/logo_tlhs.png"
+        
+        duration_string = epoch_to_duration(from_ts, to_ts)
+        
+        
+        # Logo
+        try:
+            canvas.drawImage(logo_path, 14, height - 63, width=69, height=49, mask='auto')
+        except:
+            pass
+
+        # Header text
+        canvas.setFillColorRGB(0, 0, 0)
+        canvas.setFont("Helvetica", 14)
+        canvas.drawRightString(width - 15, height - 28, report_title)
+        canvas.setFont("Helvetica", 10)
+        canvas.drawRightString(width - 15, height - 44, duration_string)
+        canvas.drawRightString(width - 15, height - 58, f"Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} +05:30")
+
+        # Footer line and text
+        canvas.line(15, 43, width - 15, 43)
+        canvas.setFont("Helvetica", 9)
+        canvas.setFillColor(colors.black)
+        canvas.drawString(15, 30, "ACME Inc")
+        canvas.drawCentredString(width / 2, 30, f"Page {doc.page}")
+        canvas.drawRightString(width - 15, 30, "Generated by Trisul Network Analytics (AI Edition)")
+
+    # Shared table style
+    base_table_style = TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#2880BA")),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('GRID', (0, 0), (-1, -1), 0.25, colors.lightgrey),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
+    ])
+
+    elements = []
+    for i, page in enumerate(pages):
+        page_type = page.get("type", "")
+        title = page.get("title", "")
+        subtitle = page.get("subtitle", "")
+
+        # Add titles
+        elements.append(Spacer(1, 5))
+        elements.append(Paragraph(title, title_style))
+        elements.append(Paragraph(f"<font color='#800080'>{subtitle}</font>", subtitle_style))
+        elements.append(Spacer(1, 10))
+
+        if page_type == "table":
+            data = page.get("data", [])
+            if not data:
+                elements.append(Paragraph("<i>No table data available.</i>", styles["Normal"]))
+            else:
+                table = Table(
+                    data,
+                    repeatRows=1,
+                    colWidths=[1.5*inch, 1.3*inch, 0.8*inch, 1.1*inch, 1.1*inch, 1.1*inch, 0.8*inch],
+                )
+                table.setStyle(base_table_style)
+                elements.append(table)
+
+        elif page_type == "chart":
+            MAX_WIDTH = 6.5 * inch
+            MAX_HEIGHT = 4.0 * inch
             
-            
-            
+
+            image_path = page.get("file_path")
+            if image_path:
+                try:
+                    # Read original image size
+                    img_reader = ImageReader(image_path)
+                    orig_w, orig_h = img_reader.getSize()
+
+                    # Compute scale factor while preserving aspect ratio
+                    scale_w = MAX_WIDTH / orig_w
+                    scale_h = MAX_HEIGHT / orig_h
+                    scale = min(scale_w, scale_h)
+
+                    # Apply scaled dimensions
+                    new_w = orig_w * scale
+                    new_h = orig_h * scale
+
+                    img = Image(image_path, width=new_w, height=new_h)
+                    elements.append(img)
+        
+        
+    
+                except Exception as e:
+                    elements.append(Paragraph(f"<i>Failed to load chart: {e}</i>", styles["Normal"]))
+            else:
+                elements.append(Paragraph("<i>No chart image path provided.</i>", styles["Normal"]))
+
+        # Add page break except for the last page
+        if i < len(pages) - 1:
+            elements.append(PageBreak())
+
+    pdf.build(elements, onFirstPage=draw_header_footer, onLaterPages=draw_header_footer)
+
+
+    logging.info(f"[generate_trisul_report] PDF report generated at {filename}")
+
+    return {"status": "success", "message" : f"The PDF report is generated successfully at {filename}. The report is displayed in the pop-up window, tell the user to kindly check that.", "file_path": filename}
+
+
+
+@mcp.tool()
+def manage_model_version():
+    """
+    Manage and switch between different AI model versions or LLMs for Trisul AI integrations.
+    Usage:
+        This tool allows administrators to manage and switch between different AI model versions
+        used in Trisul AI integrations. It provides functionalities to list available models,
+        set the active model version, and retrieve information about the current model in use.
+    
+    Returns:
+        str: Confirmation message about the model management action performed.
+    """
+    
+    logging.info(f"[manage_model_version] Managing AI model versions for Trisul AI integrations")
+
+    return {"status": "success", "message" : f"The AI model version has been changed successfully."}
+
+
+
+
+@mcp.tool()
+def change_api_key():
+    """
+        Change the API key used for AI model integrations in Trisul AI.
+        Usage:
+            This tool allows administrators to change the API key used for AI model integrations
+            in Trisul AI. It ensures that the new API key is securely updated and validated.
+
+        Returns:
+            str: Confirmation message about the API key change.
+    """
+    
+    logging.info(f"[change_api_key] Changing the API key for AI model integrations in Trisul AI")
+    
+    return {"status": "success", "message" : f"The API key has been changed successfully."}
+
+
+
+
+
 
 
 if __name__ == "__main__":

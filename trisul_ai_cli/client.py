@@ -18,6 +18,8 @@ import os
 import readline
 from importlib.metadata import version
 import re
+import subprocess
+import ast
 
 
 
@@ -26,30 +28,97 @@ os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 
 # Set your API key here
-def set_api_key():
-    while True:
-        api_key = input("Enter your Gemini API Key : ").strip()
-        if api_key:
-            break
-        print("API key cannot be empty. Please try again.")
-    env_path = Path(__file__).resolve().parent / ".env"
-    if not env_path.exists():
-        env_path.touch()
-    set_key(env_path, "TRISUL_GEMINI_API_KEY", api_key)
-    get_api_key()
-    print(f"API key saved Successfully in {env_path}")
+async def set_api_key():
+    try:
+        print("\033[F\033[K", end="")
+        while True:
+            api_key = input("\n🤖 (Bot) : Enter your Gemini API Key : ").strip()
+            if api_key:
+                break
+            print("\n🤖 (Bot) : API key cannot be empty. Please try again.")
+        env_path = Path(__file__).resolve().parent / ".env"
+        if not env_path.exists():
+            env_path.touch()
+        set_key(env_path, "TRISUL_GEMINI_API_KEY", api_key)
+        await get_api_key()
+        print("")
+        logging.info("[Client] API Key set successfully.")
+        
+    except KeyboardInterrupt:
+        print("\n\n🤖 (Bot) : API Key entry cancelled by user.\n")
+        logging.info("[Client] API Key entry cancelled by user.")
+        sys.exit(0)
 
 
 # Get your API key here
-def get_api_key() -> str:
-    global GEMINI_API_KEY, GEMINI_URL
+async def get_api_key() -> str:
+    global GEMINI_API_KEY, GEMINI_URL, GEMINI_MODEL
     env_path = Path(__file__).resolve().parent / ".env"
     config = dotenv_values(env_path)
     GEMINI_API_KEY = config.get("TRISUL_GEMINI_API_KEY")
-    GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     
     if not GEMINI_API_KEY:
-        set_api_key()
+        await set_api_key()
+
+
+
+def get_model_version():
+    global GEMINI_URL, GEMINI_API_KEY, GEMINI_MODEL
+    env_path = Path(__file__).resolve().parent / ".env"
+    config = dotenv_values(env_path)
+    gemini_version = config.get("TRISUL_GEMINI_MODEL")
+    if gemini_version:
+        GEMINI_MODEL = gemini_version
+        GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+
+
+
+# Change the Gemini model version
+async def set_model_version():
+    global GEMINI_URL, GEMINI_API_KEY, GEMINI_MODEL
+    
+    try:
+        model_versions = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-2.0-flash-lite"]
+        
+        print("\033[F\033[K", end="")
+        print("\n🤖 (Bot) : Select a Gemini model version from the list below: \n")
+
+        print("Available Gemini Models 📜\n---------------------------")
+        for idx, version in enumerate(model_versions, start=1):
+            print(f"{idx}) {version} {' (current version)' if version == GEMINI_MODEL else ''}")
+
+        selected_model = GEMINI_MODEL
+        while True:
+            choice = input("\n🤖 (Bot) : Enter your choice (1-5): ").strip()
+
+            if not choice.isdigit():
+                print("\n🤖 (Bot) : ❌ Invalid choice. Try again.")
+                continue
+
+            idx = int(choice)
+            if 1 <= idx <= len(model_versions):
+                selected_model = model_versions[idx - 1]
+                GEMINI_MODEL = selected_model
+                
+                env_path = Path(__file__).resolve().parent / ".env"
+                set_key(env_path, "TRISUL_GEMINI_MODEL", GEMINI_MODEL)
+                get_model_version()
+                logging.info(f"[Client] Model version changed to: {GEMINI_MODEL}")
+                break
+
+            print("\n🤖 (Bot) : ❌ Invalid choice. Try again.")
+        
+        print("")
+        return selected_model
+    
+    except KeyboardInterrupt:
+        print("\n\n🤖 (Bot) : Model Selection cancelled by user.\n")
+        logging.info("[Client] Model Selection cancelled by user.")
+        sys.exit(0)
+
+
+
 
 
 config = dotenv_values(".env")
@@ -57,12 +126,13 @@ TRISUL_GEMINI_API_KEY = config.get("TRISUL_GEMINI_API_KEY")
 
 
 logging.basicConfig(
-    filename= Path(__file__).resolve().parent / "trisul_ai_cli.log",
+    filename= Path(os.getcwd()) / "trisul_ai_cli.log",
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
 nest_asyncio.apply()
+
 
 # Global variables
 session: ClientSession = None
@@ -72,8 +142,11 @@ write = None
 
 
 
-global GEMINI_API_KEY, GEMINI_URL
+global GEMINI_API_KEY, GEMINI_URL, GEMINI_MODEL
+
 GEMINI_API_KEY = GEMINI_URL = None
+
+GEMINI_MODEL = "gemini-2.5-flash"
 
 
 memory_json_path = Path(__file__).resolve().parent / "trisul_ai_memory.json"
@@ -85,6 +158,8 @@ with open(memory_json_path, "r") as file:
 line_chart_data = {}
 
 pie_chart_data = {}
+
+report_path = None
 
 conversation_history = [
   {
@@ -172,6 +247,10 @@ conversation_history = [
                 - If the user requests **HTTPS traffic** or **HTTP traffic**, always query the **Apps counter group** to get the specific traffic data for "https" or "http" application keys.
                 - If the user requests **general web traffic**, return the **sum of HTTP and HTTPS traffic** over the given time frame.
                 - These rules override default counter group selection for these application-level queries.
+            
+            6. LLM Model Versioning and API Key Management
+                - when the user wants to change the LLM model version or API key, use the appropriate tools respectively to perform these actions.
+                - dont ask the user to enter the model version or API key directly. always use the tools to perform these actions.
         
         
 
@@ -332,6 +411,7 @@ conversation_history = [
                 Provide step-by-step guidance using Trisul UI or console commands
                 Reference official Trisul methods only
                 Do not explain or expose MCP server internals or describe internal tools/automation
+
 
 
         BYTE-TO-HUMAN CONVERSION (STRICT ZERO-ERROR MODE)
@@ -558,9 +638,26 @@ conversation_history = [
                 b) Generate table summary
                 c) Call line chart or pie chart tool with formatted data
                 d) Provide final text confirmation
-
-
         
+        
+        CRITICAL REPORT GENERATION RULES:
+            When the user requests a report:
+                1. To generate a report, ALWAYS call the report generation tool with appropriate parameters.
+                2. To add the table to the report, first fetch the data using the relevant tool, format it into a table, and then include it in the report.
+                3. To add the chart to the report, first fetch the data, then generate the chart using the chart tool, save the chart image, and then include the image in the report.
+                    - Ensure the save_image field is set to True when calling the chart tool for report inclusion.
+                4. If you are calling the show_line_chart or show_pie_chart tool for report generation, make sure to set the save_image parameter to True so that the chart image is saved and can be included in the report.
+                5. And then call the report generation tool to compile the report with the table and chart.
+                6. Always provide a short summary of based on the report data after generation. And mention the full path of the report.
+                7. If the user requests modifications to the report, follow the same process: fetch updated data, regenerate tables/charts, and update the report accordingly.
+                8. If the user did not explicitly request a report, do NOT generate one.
+                9. ** Don't ask the user for a file name ** If the user did not specify the report name , you can give a name of your choice relevant to the data being reported. And always add the timestamp to the report name to make it unique.
+                10. If the user did not specify the duration of the report, use the default duration of last 1 hour.
+                11. And don't confuse chart with the table when generating the report. generate table or chart based on the user request. If the user requested both table and chart, generate both and add it to the report.
+                12. Every data of the report must have the same time range. if the user did not specify any time range, use the default time range of last 1 hour for all data in the report.
+                13. You should pass the same time range to all the tool calls while generating the report. whenever you query any data for the report, you should use the same time range for all the tool calls and don't let the time range empty differ for any data in the report.
+
+
         RESPONSE REQUIREMENTS:
             After EVERY Tool Call
                 Generate a concise textual summary of the results
@@ -583,6 +680,14 @@ conversation_history = [
                 After receiving functionResponse, generate textual summary
                 Always produce visible text alongside function calls
                 Never skip or leave parts blank.
+            
+                When calling any MCP tool, you must provide only fully evaluated literal values.
+                Do NOT output expressions, formulas, or arithmetic operations (e.g. "147621*8"). You give only the final computed number (e.g. 1180968).
+                Compute all values yourself before constructing the tool arguments.
+                All numeric fields must be actual numbers (e.g. 1180968), not strings containing formulas.
+                All JSON arguments must be valid JSON with no Python expressions, no calculations, and no symbolic math.
+                If the user provides data containing expressions (e.g., 147621*8), you must pre-evaluate them before using them in a tool call.
+
 
             Quality Checklist
                 No empty or hidden response parts
@@ -627,7 +732,7 @@ conversation_history = [
 
             If the user asks "what tools do you have" or "what functions can you call", respond only with your **capabilities and features**, such as:
 
-                "I can analyze traffic, show trends, identify top entities, and help you understand and troubleshoot your network using Trisul’s analytics engine."
+                "I can analyze traffic, show trends, identify top entities, and help you understand and troubleshoot your network using Trisul's analytics engine."
 
             You may also describe your abilities in general terms such as:
                 - "I can retrieve and visualize traffic data for any host or application."
@@ -720,23 +825,27 @@ async def call_gemini_rest() -> Dict:
     headers = {
         "Content-Type": "application/json",
     }
-    
-    
+
+    logging.info(f"[Client] Sending request to Gemini at {GEMINI_URL.split('?')[0]}.")
+
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(GEMINI_URL, headers=headers, json=payload)
         if(resp.status_code != 200):
             logging.error(resp.json())
             logging.info(f"[Client] Full Conversation History: \n{json.dumps(conversation_history[2:], indent=2)}")
-
-            print(f"\n🤖 (Bot) : {resp.json()['error']['message']}")
+            
+            # Remove the last loading line from console 
+            sys.stdout.write("\033[F")
+            
+            # print the error message from Gemini
+            print(f"\n🤖 (Bot) : {resp.json()['error']['message']}\n\n")
             sys.exit()
-        resp.raise_for_status()
         return resp.json()
 
 
 async def process_query(query: str) -> str:
     """Process a query using Gemini REST API and MCP tools."""
-    global conversation_history, line_chart_data, pie_chart_data
+    global conversation_history, line_chart_data, pie_chart_data, report_path
     
     conversation_history.append({
         "role": "user", 
@@ -744,7 +853,7 @@ async def process_query(query: str) -> str:
     })
 
     # Keep calling Gemini until no more function calls are needed
-    max_iterations = 10  # Prevent infinite loops
+    max_iterations = 15  # Prevent infinite loops
     iteration = 0
     
     while iteration < max_iterations:
@@ -804,19 +913,48 @@ async def process_query(query: str) -> str:
             
             logging.info(f"[Client] Calling function: {function_name} with args: {function_args}")
             
-            if(function_name == "show_line_chart"):
-                line_chart_data = function_args["data"]
-            
-            if(function_name == "show_pie_chart"):
-                pie_chart_data = function_args["data"]
-
-            
             try:
                 # Call the tool on MCP server
                 result = await session.call_tool(function_name, function_args)
                 tool_result = result.content[0].text if result.content else "No result"
                 clean_result = tool_result.replace("\n", "").replace("\r", "").replace("\t", " ").replace("   ", "")
                 logging.info(f"[Client] Function result: {clean_result}")
+                
+                
+                if isinstance(clean_result, str):
+                    try:
+                        clean_result = json.loads(clean_result)
+                    except Exception:
+                        pass
+                
+                # Handle line chart display if needed
+                if(function_name == "show_line_chart"):
+                    if(clean_result['file_path']):
+                        await display_line_chart(function_args["data"], clean_result['file_path'])
+                    else:
+                        line_chart_data = function_args["data"]
+                
+                # Handle pie chart display if needed
+                if(function_name == "show_pie_chart"):
+                    if(clean_result['file_path']):
+                        await display_pie_chart(function_args["data"], clean_result['file_path'])
+                    else:
+                        pie_chart_data = function_args["data"]
+                        
+                # Handle report path if needed
+                if(function_name == "generate_trisul_report"):
+                    report_path = clean_result['file_path']
+                    
+                # Handle model version change
+                if(function_name == "manage_model_version"):
+                    new_model = await set_model_version()
+                    tool_result = {'status': 'success', 'message': f'The AI model version has been changed to {new_model}.'}
+                
+                
+                # Handle API key change
+                if(function_name == "change_api_key"):
+                    await set_api_key()
+                
                 
                 # Add function result to conversation
                 conversation_history[-1]["parts"].append({
@@ -870,19 +1008,29 @@ def bytes_to_unit(num):
         num /= 1024
     return num, 'PB'
 
-async def display_line_chart():
+async def display_line_chart(temp_line_chart_data=None, file_path=None):
     logging.info("[Client] [display_line_chart] Generating the line chart")
     global line_chart_data
-    data = line_chart_data   
+
+    line_chart_data = temp_line_chart_data if temp_line_chart_data else line_chart_data
     
+    data = line_chart_data
+    
+
     # Convert JSON string → dict if needed
     if isinstance(line_chart_data, str):
-        data = json.loads(line_chart_data)
+        try:
+            data = ast.literal_eval(line_chart_data)
+        except Exception:
+            data = json.loads(line_chart_data)
     elif isinstance(line_chart_data, dict):
         data = line_chart_data
     else:
         raise TypeError("line_chart_data must be a dict or JSON string")
-    
+
+
+
+
 
     fig, ax = plt.subplots(figsize=(12, 6))
     scatter_points = []
@@ -955,9 +1103,20 @@ async def display_line_chart():
 
     fig.canvas.mpl_connect("motion_notify_event", hover)
     plt.tight_layout()
+    
+    if(file_path):
+        plt.savefig(file_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logging.info(f"[Client] Chart saved to {file_path}")
+    else:
+        logging.info("[Client] Chart UI ready. Awaiting user interaction")
+        plt.show()
+        plt.close()
+        logging.info("[Client] Chart closed by user")
+        print("🤖 (Bot) : Chart Closed\n")
+
+        
     line_chart_data = {}
-    plt.show()
-    print("🤖 (Bot) : Chart Closed\n")
 
 
 
@@ -974,12 +1133,14 @@ def human_readable_bytes(num):
     return f"{num:.2f} PB"
 
 
-async def display_pie_chart():
+async def display_pie_chart(temp_pie_chart_data=None, file_path=None):
     logging.info("[Client] Starting pie chart render workflow")
 
     global pie_chart_data
     raw_input_type = type(pie_chart_data).__name__
     logging.debug("[Client] Inbound chart data type=%s", raw_input_type)
+
+    pie_chart_data = temp_pie_chart_data if temp_pie_chart_data else pie_chart_data
 
     chart_opts = pie_chart_data
 
@@ -1021,7 +1182,6 @@ async def display_pie_chart():
     total_volume = sum(volumes)
     if total_volume == 0:
         logging.warning("[Client] All volume values are zero. Chart aborted.")
-        print("Warning: all volume values are 0.")
         return
 
     logging.info("[Client] Rendering chart: title='%s' total_items=%d total_volume=%s",
@@ -1144,12 +1304,21 @@ async def display_pie_chart():
     fig.canvas.mpl_connect("button_press_event", on_click)
 
     plt.tight_layout()
+    
+    
+    if(file_path):
+        plt.savefig(file_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logging.info(f"[Client] Chart saved to {file_path}")
 
-    logging.info("[Client] Chart UI ready. Awaiting user interaction")
+    else:
+        logging.info("[Client] Chart UI ready. Awaiting user interaction")
+        plt.show()
+        plt.close()
+        logging.info("[Client] Chart closed by user")
+        print("🤖 (Bot) : Chart Closed\n")
+        
     pie_chart_data = {}
-    plt.show()
-    logging.info("[Client] Chart closed by user")
-    print("🤖 (Bot) : Chart Closed\n")
 
 
 
@@ -1290,7 +1459,6 @@ async def update_user_memory():
     async with httpx.AsyncClient(timeout=timeout) as client:
         logging.info("[Client] [ai_memory] Sending update request to Gemini.")
         resp = await client.post(GEMINI_URL, headers=headers, json=chat_history)
-        resp.raise_for_status()
         resp = resp.json()
         new_ai_memory = resp["candidates"][0]["content"]["parts"][0]["text"]
         new_ai_memory = json.loads(re.sub(r'```json|```', '', new_ai_memory).strip())
@@ -1313,7 +1481,7 @@ async def loading_animation(task, message):
         sys.stdout.write(f"\r✨ {message} {f'{spinner[i % len(spinner)]}  '}")
         sys.stdout.flush()
         i += 1
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.5)
     sys.stdout.write("\r" + " " * 40 + "\r")
     sys.stdout.write("\033[F")
     sys.stdout.write("\r\033[K")
@@ -1326,10 +1494,12 @@ async def cleanup():
     await exit_stack.aclose()
 
 
+
 async def main():
-    global line_chart_data, pie_chart_data
+    global line_chart_data, pie_chart_data, report_path
     await connect_to_server("trisul_ai_cli.server")
-    get_api_key()
+    await get_api_key()
+    get_model_version()
 
 
     print("\033[1;36m" + "╔══════════════════════════════════════════════════════════════╗")
@@ -1364,7 +1534,13 @@ async def main():
             
             # change the api key
             if query.lower() == "change_api_key":
-                set_api_key()
+                await set_api_key()
+                continue
+            
+            # change model version
+            if query.lower() == "change_model":
+                new_model = await set_model_version()
+                print(f"🤖 (Bot) : Model version changed to {new_model}\n")
                 continue
             
             try:
@@ -1384,6 +1560,16 @@ async def main():
                 
                 if(pie_chart_data):
                     await display_pie_chart()
+                
+                if(report_path):                    
+                    if os.name == "nt":
+                        os.startfile(report_path)
+                    elif sys.platform == "darwin":
+                        subprocess.Popen(["open", report_path])
+                    else:
+                        subprocess.Popen(["xdg-open", report_path])
+
+                    
                     
             except Exception as e:
                 logging.error(f"[Client] Error: {e}")
