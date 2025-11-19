@@ -1,3 +1,6 @@
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="google")
+
 from mcp.server.fastmcp import FastMCP
 from trisul_ai_cli import trp_pb2
 import zmq
@@ -17,9 +20,7 @@ from reportlab.lib.units import inch
 from reportlab.lib.utils import ImageReader
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, Image
 from reportlab.lib.styles import getSampleStyleSheet
-import json
 import os
-import re
 import ast
 
 logging.basicConfig(
@@ -28,6 +29,9 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
+
+global _global_zmq_context
+_global_zmq_context = zmq.Context()
 
 
 mcp = FastMCP(name="trisul-mcp-server")
@@ -70,21 +74,17 @@ def countergroup_info(zmq_endpoint: str = None, context: str = "context0", get_m
     Returns: dict: Dictionary containing counter group information.
     """
     try:
-        logging.info(f"[countergroup_info] Starting countergroup_info for zmq_endpoint: {zmq_endpoint}, get_meter_info: {get_meter_info}")
-        # context = normalize_context(context)
-        
-        # zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{context}/run/trp_0"
-            
-        logging.info(f"[countergroup_info] Connecting to ZMQ endpoint: {zmq_endpoint}")
+        logging.info(f"[countergroup_info] Connecting to zmq_endpoint: {zmq_endpoint}, get_meter_info: {get_meter_info}")        
         
         # helper with timeout
         def get_response(zmq_endpoint, req, timeout_ms=10000):
-            context_zmq = None
+            global _global_zmq_context
             socket = None
+            
             try:
                 logging.info(f"[countergroup_info] Initializing ZMQ context and socket")
-                context_zmq = zmq.Context()
-                socket = context_zmq.socket(zmq.REQ)
+                zmq_context = _global_zmq_context
+                socket = zmq_context.socket(zmq.REQ)
                 socket.setsockopt(zmq.LINGER, 0)
                 socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
                 socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
@@ -117,13 +117,7 @@ def countergroup_info(zmq_endpoint: str = None, context: str = "context0", get_m
                         logging.info("[countergroup_info] Socket closed")
                     except Exception as e:
                         logging.warning(f"Error closing socket: {str(e)}")
-                if context_zmq:
-                    try:
-                        context_zmq.term()
-                        logging.info("[countergroup_info] ZMQ context terminated")
-                    except Exception as e:
-                        logging.warning(f"[countergroup_info] Error terminating ZMQ context: {str(e)}")
-        
+
         # helper
         def unwrap_response(data):
             try:
@@ -349,7 +343,7 @@ def get_counter_group_topper(counter_group_guid: str, meter: int = 0, duration_s
     {'key': '0A.1A.0C.68', 'readable': '10.26.12.104', 'label': '10.26.12.104', 'description': '', 'metric': '227337', 'metricMax': '227337', 'metricMin': '227337', 'metricAvg': '227337'}]}
     """
     
-    zmq_context = None
+    global _global_zmq_context
     socket = None
     
     try:
@@ -360,10 +354,11 @@ def get_counter_group_topper(counter_group_guid: str, meter: int = 0, duration_s
         logging.info(f"[get_counter_group_topper] Fetching counter group topper: counter_group_guid={counter_group_guid}, meter={meter}, duration_secs={duration_secs}, max_count={max_count}, context={zmq_endpoint}")
 
         def get_response(req):
-            nonlocal zmq_context, socket
+            nonlocal socket
+            global _global_zmq_context
             try:
                 logging.info("[get_counter_group_topper] Initializing ZMQ context and socket for get_response")
-                zmq_context = zmq.Context()
+                zmq_context = _global_zmq_context
                 socket = zmq_context.socket(zmq.REQ)
                 socket.connect(zmq_endpoint)
                 logging.info("[get_counter_group_topper] Sending request")
@@ -385,12 +380,6 @@ def get_counter_group_topper(counter_group_guid: str, meter: int = 0, duration_s
                         logging.info("[get_counter_group_topper] Socket closed")
                     except Exception as e:
                         logging.warning(f"[get_counter_group_topper] Error closing socket: {str(e)}")
-                if zmq_context:
-                    try:
-                        zmq_context.term()
-                        logging.info("[get_counter_group_topper] ZMQ context terminated")
-                    except Exception as e:
-                        logging.warning(f"[get_counter_group_topper] Error terminating ZMQ context: {str(e)}")
 
         def unwrap_response(data):
             try:
@@ -480,7 +469,7 @@ def get_key_traffic_data(counter_group: str, readable: str = None, duration_secs
         }
     """
     
-    zmq_context = None
+    global _global_zmq_context
     socket = None
     
     try:        
@@ -493,11 +482,11 @@ def get_key_traffic_data(counter_group: str, readable: str = None, duration_secs
             
         #get the availble time from trp 
         def get_response(zmq_endpoint, req):
-            nonlocal zmq_context, socket
+            nonlocal socket
             try:
                 logging.info("[get_key_traffic_data] Initializing ZMQ context and socket for get_response")
                 #zmq send
-                zmq_context = zmq.Context()
+                zmq_context = _global_zmq_context
                 socket = zmq_context.socket(zmq.REQ)
                 socket.connect(zmq_endpoint)
                 logging.info(f"[get_key_traffic_data] Connected to the socket {zmq_endpoint}")
@@ -614,13 +603,6 @@ def get_key_traffic_data(counter_group: str, readable: str = None, duration_secs
                 logging.info("[get_key_traffic_data] Final socket cleanup")
             except Exception as e:
                 logging.warning(f"[get_key_traffic_data] Error in final socket cleanup: {str(e)}")
-        if zmq_context:
-            try:
-                zmq_context.term()
-                logging.info("[get_key_traffic_data] Final ZMQ context cleanup")
-            except Exception as e:
-                logging.warning(f"[get_key_traffic_data] Error in final ZMQ context cleanup: {str(e)}")
-
 
 
 
@@ -1036,7 +1018,7 @@ def get_alerts_data(
         - Absolute time window (start_ts/end_ts) overrides duration_secs if both provided.
         - Optimized for downstream dashboards, analytics engines, and correlation pipelines.
     """
-    zmq_context = None
+    global _global_zmq_context
     socket = None
 
     try:
@@ -1060,9 +1042,9 @@ def get_alerts_data(
             }.get(name, resp)
 
         def roundtrip(req):
-            nonlocal zmq_context, socket
+            nonlocal socket
             logging.info("[get_alerts_data] Opening ZMQ socket")
-            zmq_context = zmq.Context()
+            zmq_context = _global_zmq_context
             socket = zmq_context.socket(zmq.REQ)
             socket.connect(zmq_endpoint)
             logging.info("[get_alerts_data] Sending request to TRP")
@@ -1164,13 +1146,6 @@ def get_alerts_data(
                 logging.info("[get_alerts_data] Socket closed")
             except Exception:
                 logging.warning("[get_alerts_data] Socket close failed")
-        if zmq_context:
-            try:
-                zmq_context.term()
-                logging.info("[get_alerts_data] ZMQ context terminated")
-            except Exception:
-                logging.warning("[get_alerts_data] ZMQ termination failed")
-
 
 
 
@@ -1251,7 +1226,7 @@ def get_flows_or_sessions_data(
         dict: Parsed sessions response as Python dict.
     """
 
-    zmq_context = None
+    global _global_zmq_context
     socket = None
 
     try:
@@ -1263,9 +1238,9 @@ def get_flows_or_sessions_data(
 
         # Helper: ZMQ send/recv
         def get_response(req):
-            nonlocal zmq_context, socket
+            nonlocal socket
             try:
-                zmq_context = zmq.Context()
+                zmq_context = _global_zmq_context
                 socket = zmq_context.socket(zmq.REQ)
                 socket.connect(zmq_endpoint)
                 socket.send(req.SerializeToString())
@@ -1360,10 +1335,6 @@ def get_flows_or_sessions_data(
     except Exception as e:
         logging.error(f"[QuerySessions] Exception: {e}")
         return {"error": str(e)}
-
-    finally:
-        if zmq_context:
-            zmq_context.term()
 
 
 
