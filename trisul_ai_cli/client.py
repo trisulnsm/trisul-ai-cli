@@ -237,12 +237,15 @@ conversation_history = [
         **Statistics:** LinkLayerStats, NetworkLayerStats, ICMP Types, Perf-Stats, Unleash Apps, Remote Office, Organization
 
         **Alert Group GUIDs:**
-        - Blacklist: '{{5E97C3A3-41DB-4E34-92C3-87C904FAB83E}}'
-        - IDS: '{{9AFD8C08-07EB-47E0-BF05-28B4A7AE8DC9}}'
-        - User: '{{B5F1DECB-51D5-4395-B71B-6FA730B772D9}}'
-        - Threshold crossing: '{{03AC6B72-FDB7-44C0-9B8C-7A1975C1C5BA}}'
-        - Threshold Band: '{{0E7E367D-4455-4680-BC73-699D81B7CBE0}}'
-        - Flow Tracker: '{{BE7F367F-8533-45F7-9AE8-A33E5E1AA783}}'
+            - Blacklist Alerts: '{{5E97C3A3-41DB-4E34-92C3-87C904FAB83E}}'
+            - IDS Alerts: '{{9AFD8C08-07EB-47E0-BF05-28B4A7AE8DC9}}'
+            - User Alerts: '{{B5F1DECB-51D5-4395-B71B-6FA730B772D9}}'
+            - Threshold crossing Alerts: '{{03AC6B72-FDB7-44C0-9B8C-7A1975C1C5BA}}'
+            - Threshold Band Alerts: '{{0E7E367D-4455-4680-BC73-699D81B7CBE0}}'
+            - Flow Tracker Alerts: '{{BE7F367F-8533-45F7-9AE8-A33E5E1AA783}}' (do not use this guid for sessions)
+
+            when you list all available alert groups, just show the name of the group, do not show the guid
+          
 
         ==============================================
 

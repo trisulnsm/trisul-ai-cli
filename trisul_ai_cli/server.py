@@ -38,7 +38,7 @@ _global_zmq_context = zmq.Context()
 
 mcp = FastMCP(name="trisul-mcp-server")
 
-# helper functions
+# Helper functions
 
 def normalize_context(ctx: str) -> str:
     try:
@@ -78,64 +78,6 @@ def countergroup_info(zmq_endpoint: str = None, context: str = "context0", get_m
     try:
         logging.info(f"[countergroup_info] Connecting to zmq_endpoint: {zmq_endpoint}, get_meter_info: {get_meter_info}")        
         
-        # helper with timeout
-        def get_response(zmq_endpoint, req, timeout_ms=10000):
-            global _global_zmq_context
-            socket = None
-            
-            try:
-                logging.info(f"[countergroup_info] Initializing ZMQ context and socket")
-                zmq_context = _global_zmq_context
-                socket = zmq_context.socket(zmq.REQ)
-                socket.setsockopt(zmq.LINGER, 0)
-                socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
-                socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
-                
-                socket.connect(zmq_endpoint)
-                logging.info("[countergroup_info] Connected, sending request...")
-                socket.send(req.SerializeToString())
-                logging.info("[countergroup_info] Request sent, waiting for response...")
-                
-                data = socket.recv()
-                logging.info(f"[countergroup_info] Response received, size: {len(data)} bytes")
-                resp = unwrap_response(data)
-                return resp
-            except zmq.Again:
-                error_msg = f"[countergroup_info] ZMQ timeout after {timeout_ms}ms - no response from {zmq_endpoint}"
-                logging.error(error_msg)
-                return {"error": error_msg}
-            except zmq.ZMQError as e:
-                error_msg = f"[countergroup_info] ZMQ error: {str(e)}"
-                logging.error(error_msg)
-                return {"error": error_msg}
-            except Exception as e:
-                error_msg = f"[countergroup_info] Unexpected error in get_response: {str(e)}"
-                logging.error(error_msg)
-                return {"error": error_msg}
-            finally:
-                if socket:
-                    try:
-                        socket.close()
-                        logging.info("[countergroup_info] Socket closed")
-                    except Exception as e:
-                        logging.warning(f"Error closing socket: {str(e)}")
-
-        # helper
-        def unwrap_response(data):
-            try:
-                logging.info("[countergroup_info] Unwrapping response")
-                resp = trp_pb2.Message()
-                resp.ParseFromString(data)
-                for x in resp.DESCRIPTOR.enum_types:
-                    name = x.values_by_number.get(int(resp.trp_command)).name
-                logging.info(f"[countergroup_info] Response command: {name}")
-                return {
-                    'COUNTER_GROUP_INFO_RESPONSE': resp.counter_group_info_response
-                }.get(name, resp)
-            except Exception as e:
-                logging.error(f"[countergroup_info] Error unwrapping response: {str(e)}")
-                raise
-        
         # to retrieve all counter groups send an empty COUNTER_GROUP_INFO_REQUEST
         try:
             logging.info("[countergroup_info] Building COUNTER_GROUP_INFO_REQUEST")
@@ -149,12 +91,6 @@ def countergroup_info(zmq_endpoint: str = None, context: str = "context0", get_m
         logging.info("[countergroup_info] Sending COUNTER_GROUP_INFO_REQUEST...")
         resp = get_response(zmq_endpoint, req)
         
-        # Check if an error occurred and return immediately
-        if isinstance(resp, dict) and "error" in resp:
-            logging.error(f"[countergroup_info] Aborting due to error: {resp['error']}")
-            return resp
-
-
         result = MessageToDict(resp)
         logging.info(f"[countergroup_info] Received response with {len(result.get('groupDetails', []))} groups")
         return result
@@ -208,6 +144,77 @@ def epoch_to_duration(from_ts, to_ts):
 
 
 
+
+# TRP Helper functions
+
+_RESPONSE_FIELD_MAP = {
+    'COUNTER_GROUP_INFO_RESPONSE': 'counter_group_info_response',
+    'TIMESLICES_RESPONSE': 'time_slices_response',
+    'COUNTER_GROUP_TOPPER_RESPONSE': 'counter_group_topper_response',
+    'COUNTER_ITEM_RESPONSE': 'counter_item_response',
+    'QUERY_ALERTS_RESPONSE': 'query_alerts_response',
+    'QUERY_SESSIONS_RESPONSE': 'query_sessions_response',
+}
+
+def unwrap_response(data):
+    try:
+        logging.info("[unwrap_response] Unwrapping response")
+        resp = trp_pb2.Message()
+        resp.ParseFromString(data)
+        
+        command_name = None
+        for x in resp.DESCRIPTOR.enum_types:
+            val = x.values_by_number.get(int(resp.trp_command))
+            if val:
+                command_name = val.name
+                break
+        
+        logging.info(f"[unwrap_response] Response command: {command_name}")
+        
+        field_name = _RESPONSE_FIELD_MAP.get(command_name)
+        if field_name and resp.HasField(field_name):
+            return getattr(resp, field_name)
+        
+        return resp
+    except Exception as e:
+        logging.error(f"[unwrap_response] Error unwrapping response: {str(e)}")
+        raise
+
+
+def get_response(zmq_endpoint, req, timeout_ms=10000):
+    socket = None
+    try:
+        logging.info(f"[get_response] Connecting to {zmq_endpoint}")
+        zmq_context = _global_zmq_context
+        socket = zmq_context.socket(zmq.REQ)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+        
+        socket.connect(zmq_endpoint)
+        socket.send(req.SerializeToString())
+        
+        data = socket.recv()
+        logging.info(f"[get_response] Received {len(data)} bytes")
+        return unwrap_response(data)
+    except zmq.Again:
+        error_msg = f"[get_response] ZMQ timeout after {timeout_ms}ms - no response from {zmq_endpoint}"
+        logging.error(error_msg)
+        raise Exception(error_msg)
+    except zmq.ZMQError as e:
+        error_msg = f"[get_response] ZMQ error: {str(e)}"
+        logging.error(error_msg)
+        raise Exception(error_msg)
+    except Exception as e:
+        error_msg = f"[get_response] Error: {str(e)}"
+        logging.error(error_msg)
+        raise
+    finally:
+        if socket:
+            try:
+                socket.close()
+            except Exception as e:
+                logging.warning(f"Error closing socket: {str(e)}")
 
 
 
@@ -359,56 +366,12 @@ def get_counter_group_topper(counter_group_guid: str, meter: int = 0, duration_s
         
         logging.info(f"[get_counter_group_topper] Fetching counter group topper: counter_group_guid={counter_group_guid}, meter={meter}, duration_secs={duration_secs}, max_count={max_count}, context={zmq_endpoint}")
 
-        def get_response(req):
-            nonlocal socket
-            global _global_zmq_context
-            try:
-                logging.info("[get_counter_group_topper] Initializing ZMQ context and socket for get_response")
-                zmq_context = _global_zmq_context
-                socket = zmq_context.socket(zmq.REQ)
-                socket.connect(zmq_endpoint)
-                logging.info("[get_counter_group_topper] Sending request")
-                socket.send(req.SerializeToString())
-                logging.info("[get_counter_group_topper] Waiting for response")
-                data = socket.recv()
-                logging.info(f"[get_counter_group_topper] Received response, size: {len(data)} bytes")
-                return unwrap_response(data)
-            except zmq.ZMQError as e:
-                logging.error(f"[get_counter_group_topper] ZMQ error in get_response: {str(e)}")
-                raise
-            except Exception as e:
-                logging.error(f"[get_counter_group_topper] Error in get_response: {str(e)}")
-                raise
-            finally:
-                if socket:
-                    try:
-                        socket.close()
-                        logging.info("[get_counter_group_topper] Socket closed")
-                    except Exception as e:
-                        logging.warning(f"[get_counter_group_topper] Error closing socket: {str(e)}")
-
-        def unwrap_response(data):
-            try:
-                logging.info("[get_counter_group_topper] Unwrapping response")
-                resp = trp_pb2.Message()
-                resp.ParseFromString(data)
-                for x in resp.DESCRIPTOR.enum_types:
-                    name = x.values_by_number.get(int(resp.trp_command)).name
-                logging.info(f"[get_counter_group_topper] Response command: {name}")
-                return {
-                    'TIMESLICES_RESPONSE': resp.time_slices_response,
-                    'COUNTER_GROUP_TOPPER_RESPONSE': resp.counter_group_topper_response
-                }.get(name, resp)
-            except Exception as e:
-                logging.error(f"[get_counter_group_topper] Error unwrapping response: {str(e)}")
-                raise
-
         # Step 1: Get available timeslices
         logging.info("[get_counter_group_topper] Step 1: Getting available timeslices")
         req = trp_pb2.Message()
         req.trp_command = req.TIMESLICES_REQUEST
         req.time_slices_request.get_total_window = True
-        resp = get_response(req)
+        resp = get_response(zmq_endpoint, req)
         logging.info("[get_counter_group_topper] Timeslices received")
 
         # Step 2: Build topper request
@@ -430,7 +393,7 @@ def get_counter_group_topper(counter_group_guid: str, meter: int = 0, duration_s
 
         # Step 4: Get topper response
         logging.info("[get_counter_group_topper] Step 4: Getting topper response")
-        resp = get_response(req)
+        resp = get_response(zmq_endpoint, req)
         logging.info("[get_counter_group_topper] Successfully retrieved counter group topper")
 
         # Step 5: Return JSON-serializable dict
@@ -485,54 +448,6 @@ def get_key_traffic_data(counter_group: str, readable: str = None, duration_secs
  
         logging.info(f"[get_key_traffic_data] Fetching key traffic: counter_group={counter_group}, readable={readable}, duration_secs={duration_secs}, start_ts={start_ts}, end_ts={end_ts}, zmq_endpoint={zmq_endpoint}")
                         
-            
-        #get the availble time from trp 
-        def get_response(zmq_endpoint, req):
-            nonlocal socket
-            try:
-                logging.info("[get_key_traffic_data] Initializing ZMQ context and socket for get_response")
-                #zmq send
-                zmq_context = _global_zmq_context
-                socket = zmq_context.socket(zmq.REQ)
-                socket.connect(zmq_endpoint)
-                logging.info(f"[get_key_traffic_data] Connected to the socket {zmq_endpoint}")
-                socket.send(req.SerializeToString())
-                logging.info("[get_key_traffic_data] Request sent to socket")
-
-                #zmq receive
-                data = socket.recv()
-                logging.info(f"[get_key_traffic_data] Received data from the socket, size: {len(data)} bytes")
-                resp = unwrap_response(data)
-                return resp
-            except zmq.ZMQError as e:
-                logging.error(f"[get_key_traffic_data] ZMQ error in get_response: {str(e)}")
-                raise
-            except Exception as e:
-                logging.error(f"[get_key_traffic_data] Error in get_response: {str(e)}")
-                raise
-            finally:
-                if socket:
-                    try:
-                        socket.close()
-                        logging.info("[get_key_traffic_data] Socket closed")
-                    except Exception as e:
-                        logging.warning(f"[get_key_traffic_data] Error closing socket: {str(e)}")
-
-        def unwrap_response(data):
-            try:
-                logging.info("[get_key_traffic_data] Unwrapping response data")
-                resp = trp_pb2.Message()
-                resp.ParseFromString(data)
-                for x in resp.DESCRIPTOR.enum_types:
-                    name = x.values_by_number.get(int(resp.trp_command)).name
-                logging.info(f"[get_key_traffic_data] Response command type: {name}")
-                return {
-                    'TIMESLICES_RESPONSE': resp.time_slices_response,
-                    'COUNTER_ITEM_RESPONSE': resp.counter_item_response
-                }.get(name, resp)
-            except Exception as e:
-                logging.error(f"[get_key_traffic_data] Error unwrapping response: {str(e)}")
-                raise
 
         #Construct time request
         try:
@@ -687,8 +602,7 @@ def get_alerts_data(
         - Absolute time window (start_ts/end_ts) overrides duration_secs if both provided.
         - Optimized for downstream dashboards, analytics engines, and correlation pipelines.
     """
-    global _global_zmq_context
-    socket = None
+
 
     try:
         logging.info(f"[get_alerts_data] Start | alert_group={alert_group} duration_secs={duration_secs} start_ts={start_ts} end_ts={end_ts}")
@@ -698,37 +612,13 @@ def get_alerts_data(
             zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{ctx}/run/trp_0"
         logging.info(f"[get_alerts_data] ZMQ endpoint: {zmq_endpoint}")
 
-        def unwrap_response(data):
-            logging.info(f"[get_alerts_data] Unwrapping response ({len(data)} bytes)")
-            resp = trp_pb2.Message()
-            resp.ParseFromString(data)
-            for x in resp.DESCRIPTOR.enum_types:
-                name = x.values_by_number.get(int(resp.trp_command)).name
-            logging.info(f"[get_alerts_data] Response type: {name}")
-            return {
-                'TIMESLICES_RESPONSE': resp.time_slices_response,
-                'QUERY_ALERTS_RESPONSE': resp.query_alerts_response
-            }.get(name, resp)
-
-        def roundtrip(req):
-            nonlocal socket
-            logging.info("[get_alerts_data] Opening ZMQ socket")
-            zmq_context = _global_zmq_context
-            socket = zmq_context.socket(zmq.REQ)
-            socket.connect(zmq_endpoint)
-            logging.info("[get_alerts_data] Sending request to TRP")
-            socket.send(req.SerializeToString())
-            data = socket.recv()
-            logging.info("[get_alerts_data] Response received from TRP")
-            socket.close()
-            socket = None
-            return unwrap_response(data)
 
         logging.info("[get_alerts_data] Requesting TIMESLICES window")
         req = trp_pb2.Message()
         req.trp_command = req.TIMESLICES_REQUEST
         req.time_slices_request.get_total_window = True
-        tint_resp = roundtrip(req)
+        req.time_slices_request.get_total_window = True
+        tint_resp = get_response(zmq_endpoint, req)
 
         tm = trp_pb2.TimeInterval()
         tm.MergeFrom(tint_resp.total_window)
@@ -798,23 +688,13 @@ def get_alerts_data(
             logging.info(f"[get_alerts_data] ip_pair count={len(pairs)}")
 
         logging.info("[get_alerts_data] Executing QUERY_ALERTS_REQUEST")
-        resp = roundtrip(req)
-        result = MessageToDict(resp)
-
-        logging.info("[get_alerts_data] Completed successfully")
-        return json_to_toon(result)
+        resp = get_response(zmq_endpoint, req)
+        
+        return json_to_toon(MessageToDict(resp))
 
     except Exception as e:
         logging.error(f"[get_alerts_data] Error: {str(e)}", exc_info=True)
         return json_to_toon({"error": str(e)})
-
-    finally:
-        if socket:
-            try:
-                socket.close()
-                logging.info("[get_alerts_data] Socket closed")
-            except Exception:
-                logging.warning("[get_alerts_data] Socket close failed")
 
 
 
@@ -895,46 +775,19 @@ def get_flows_or_sessions_data(
         dict: Parsed sessions response as Python dict.
     """
 
-    global _global_zmq_context
-    socket = None
-
     try:
         if not zmq_endpoint:
             context = normalize_context(context)
             zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{context}/run/trp_0"
 
         logging.info(f"[QuerySessions] TRP endpoint={zmq_endpoint}")
-
-        # Helper: ZMQ send/recv
-        def get_response(req):
-            nonlocal socket
-            try:
-                zmq_context = _global_zmq_context
-                socket = zmq_context.socket(zmq.REQ)
-                socket.connect(zmq_endpoint)
-                socket.send(req.SerializeToString())
-                data = socket.recv()
-                return unwrap_response(data)
-            finally:
-                if socket:
-                    socket.close()
-
-        # Helper: Parse TRP response
-        def unwrap_response(data):
-            resp = trp_pb2.Message()
-            resp.ParseFromString(data)
-            for x in resp.DESCRIPTOR.enum_types:
-                name = x.values_by_number.get(int(resp.trp_command)).name
-            return {
-                'TIMESLICES_RESPONSE': resp.time_slices_response,
-                'QUERY_SESSIONS_RESPONSE': resp.query_sessions_response
-            }.get(name, resp)
             
         # Step 1: Pull Time Window
         req = trp_pb2.Message()
         req.trp_command = req.TIMESLICES_REQUEST
         req.time_slices_request.get_total_window = True
-        tint_resp = get_response(req)
+        req.time_slices_request.get_total_window = True
+        tint_resp = get_response(zmq_endpoint, req)
 
         tm = trp_pb2.TimeInterval()
         tm.MergeFrom(tint_resp.total_window)
@@ -949,10 +802,6 @@ def get_flows_or_sessions_data(
         
         getattr(tm, 'from').tv_sec = start_ts
         getattr(tm, 'to').tv_sec = end_ts
-
-            
-            
-            
 
         # Step 2: Build QuerySessionsRequest
         req = trp_pb2.Message()
@@ -992,7 +841,7 @@ def get_flows_or_sessions_data(
 
         logging.info(f"[QuerySessions] Executing QuerySessions with provided filters")
         
-        resp = MessageToDict(get_response(req))
+        resp = MessageToDict(get_response(zmq_endpoint, req))
         
         resp["sessions"][:] = [
             s for s in resp.get("sessions", [])
@@ -1270,6 +1119,63 @@ def rag_query(question: str):
 # UI related tools
 
 @mcp.tool()
+def show_line_chart(data, save_image: bool = False):
+    """
+    Plots a static traffic chart (line chart) using matplotlib based on the provided JSON-like input and show it in a new pop-up window.
+    the input values should be in raw bytes format  not in mb or kb.
+    the time stamps should be in epoc seconds format as integer not in the string date time format like this '2025-10-16 01:00:00'.
+    It does not need any context name or the zmq_endpoint.
+    It can be used to display the traffic data for any key like IP address, protocol, port etc over a time period.
+    
+    Args:
+        data (dict): Line Chart configuration and series data.
+                     Example format:
+                     {
+                        "title": "Network Traffic Over 24 Hours", "x_label": "Time", "y_label": "Traffic",
+                        "keys": [
+                            {
+                                "timestamps": [1718714100, 1718714160], "legend_label": "Upload", "color": "red", "values": [32432, 37293]
+                            },
+                            ...
+                        ]
+                     }
+        save_image (bool): set it 'True' to save the chart as an image file and don't display it in pop-up window. set it False to display the chart in pop-up window. Default is False.
+    """
+    
+    logging.info(f"[show_line_chart] Generating the line chart for the given data")
+    
+        
+    # Validate the input data
+    if isinstance(data, str):
+        try:
+            data = ast.literal_eval(data)
+        except Exception:
+            try:
+                data = json.loads(data)
+            except Exception:
+                logging.error("[show_line_chart] Invalid line chart data format. Expected dict or JSON string.")
+                return {"status": "error", "message" : "Invalid line chart data format from LLM", "message_to_llm" : "Call this mcp tool (show_line_chart) again with the valid line chart data format. don't retry this more than 3 times in a row", "file_path": None}
+    else:
+        data = dict(data)
+        
+    # Check if the length of timestamps and values are same
+    for series in data.get("keys", []):
+        if(len(series["timestamps"]) != len(series["values"])):
+            logging.error("[show_line_chart] Invalid line chart data format. The length of timestamps and values should be same.")
+            return {"status": "error", "message" : "Invalid line chart data format from LLM, the length of timestamps and values should be same", "message_to_llm" : "Call this mcp tool (show_line_chart) again with the valid line chart data format. don't retry this more than 3 times in a row", "file_path": None}
+
+
+    # Save the chart as an image file if save_image is True
+    if(save_image):
+        file_path = f"/tmp/line_chart_{int(datetime.now().timestamp())}_{random.randint(1000, 9999)}.png"
+        logging.info(f"[show_line_chart] save_image is set to True, so saving the chart as an image file instead of displaying it. path: {file_path}")
+        return {"status": "success", "message" : f"The line chart is saved as an image file successfully.", "file_path": file_path}
+    else:
+        return {"status": "success", "message" : f"The line chart is displayed in the pop-up window, tell the user to kindly check that. then show this data in the table format and give a short summary about the data.", "file_path": None}
+
+
+
+@mcp.tool()
 def show_pie_chart(data, save_image: bool = False):
     """
     Plots a static traffic chart (pie chart) using matplotlib based on the provided JSON-like input and show it in a new pop-up window.
@@ -1325,55 +1231,6 @@ def show_pie_chart(data, save_image: bool = False):
     else:
         logging.info(f"[show_pie_chart] save_image is set to False, so displaying the chart in a pop-up window.")
         return {"status": "success", "message" : f"The pie chart is displayed in the pop-up window, tell the user to kindly check that. then show this data in the table format and give a short summary about the data.", "file_path": None}
-
-
-
-@mcp.tool()
-def show_line_chart(data, save_image: bool = False):
-    """
-    Plots a static traffic chart (line chart) using matplotlib based on the provided JSON-like input and show it in a new pop-up window.
-    the input values should be in raw bytes format  not in mb or kb.
-    the time stamps should be in epoc seconds format as integer not in the string date time format like this '2025-10-16 01:00:00'.
-    It does not need any context name or the zmq_endpoint.
-    It can be used to display the traffic data for any key like IP address, protocol, port etc over a time period.
-    
-    Args:
-        data (dict): Line Chart configuration and series data.
-                     Example format:
-                     {
-                        "title": "Network Traffic Over 24 Hours", "x_label": "Time", "y_label": "Traffic",
-                        "keys": [
-                            {
-                                "timestamps": [1718714100, 1718714160], "legend_label": "Upload", "color": "red", "values": [32432, 37293]
-                            },
-                            ...
-                        ]
-                     }
-        save_image (bool): set it 'True' to save the chart as an image file and don't display it in pop-up window. set it False to display the chart in pop-up window. Default is False.
-    """
-    
-    logging.info(f"[show_line_chart] Generating the line chart for the given data")
-    
-        
-    # Validate the input data
-    if isinstance(data, str):
-        try:
-            data = ast.literal_eval(data)
-        except Exception:
-            try:
-                data = json.loads(data)
-            except Exception:
-                logging.error("[show_line_chart] Invalid line chart data format. Expected dict or JSON string.")
-                return {"status": "error", "message" : "Invalid line chart data format from LLM", "message_to_llm" : "Call this mcp tool (show_line_chart) again with the valid line chart data format. don't retry this more than 3 times in a row", "file_path": None}
-    else:
-        data = dict(data)
-
-    if(save_image):
-        file_path = f"/tmp/line_chart_{int(datetime.now().timestamp())}_{random.randint(1000, 9999)}.png"
-        logging.info(f"[show_line_chart] save_image is set to True, so saving the chart as an image file instead of displaying it. path: {file_path}")
-        return {"status": "success", "message" : f"The line chart is saved as an image file successfully.", "file_path": file_path}
-    else:
-        return {"status": "success", "message" : f"The line chart is displayed in the pop-up window, tell the user to kindly check that. then show this data in the table format and give a short summary about the data.", "file_path": None}
 
 
 
