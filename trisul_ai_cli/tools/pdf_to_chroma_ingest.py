@@ -5,8 +5,9 @@ import chromadb
 from pypdf import PdfReader
 import tiktoken
 from google.api_core.exceptions import ResourceExhausted
+import os
 
-genai.configure(api_key="AIzaSyCxAHmb84D_py7cN_b0IAYx-VnRjEyZ1I0")
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 embedding_model = "models/gemini-embedding-001"
 
 
