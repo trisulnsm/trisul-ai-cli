@@ -22,6 +22,8 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet
 import os
 import ast
+from trisul_ai_cli.tools.json_to_toon_converter import json_to_toon
+
 
 logging.basicConfig(
     filename= Path(os.getcwd()) / "trisul_ai_cli.log",
@@ -36,7 +38,8 @@ _global_zmq_context = zmq.Context()
 
 mcp = FastMCP(name="trisul-mcp-server")
 
-# helper function
+# helper functions
+
 def normalize_context(ctx: str) -> str:
     try:
         ctx = ctx.lower()
@@ -54,7 +57,6 @@ def normalize_context(ctx: str) -> str:
         return "context0"  # Default fallback
 
 
-# helper function
 def countergroup_info(zmq_endpoint: str = None, context: str = "context0", get_meter_info: bool = False):
     """Fetch all counter groups information from Trisul via ZMQ for a given zmq_endpoint.
     and it will also fetch meters info for each counter group so that we can determine what each meter means and its index.
@@ -209,6 +211,10 @@ def epoch_to_duration(from_ts, to_ts):
 
 
 
+
+
+# TRP tools
+
 @mcp.tool()
 def list_all_available_counter_groups(context: str = "context0", zmq_endpoint: str = None):
     """List all available counter groups from Trisul via ZMQ for a given context or the zmq_endpoint.
@@ -236,7 +242,7 @@ def list_all_available_counter_groups(context: str = "context0", zmq_endpoint: s
         
         if "error" in all_cgs:
             logging.error(f"[list_all_available_counter_groups] Error from countergroup_info: {all_cgs['error']}")
-            return {"error": all_cgs["error"], "groupDetails": []}
+            return json_to_toon({"error": all_cgs["error"], "groupDetails": []})
         
         group_details = all_cgs.get("groupDetails", [])
         logging.info(f"[list_all_available_counter_groups] Processing {len(group_details)} counter groups")
@@ -250,11 +256,11 @@ def list_all_available_counter_groups(context: str = "context0", zmq_endpoint: s
                 continue
         
         logging.info(f"[list_all_available_counter_groups] Retrieved {len(simplified_groups)} counter groups")
-        return {"groupDetails": simplified_groups}
+        return json_to_toon({"groupDetails": simplified_groups})
         
     except Exception as e:
         logging.error(f"[list_all_available_counter_groups] Error in list_all_available_counter_groups: {str(e)}", exc_info=True)
-        return {"error": str(e), "groupDetails": []}
+        return json_to_toon({"error": str(e), "groupDetails": []})
 
 
 
@@ -291,7 +297,7 @@ def get_cginfo_from_countergroup_name(countergroup_name: str, context: str = "co
         
         if "error" in all_cgs:
             logging.error(f"[get_cginfo_from_countergroup_name] Error from countergroup_info: {all_cgs['error']}")
-            return {"name": countergroup_name, "guid": f"Error: {all_cgs['error']}"}
+            return json_to_toon({"name": countergroup_name, "guid": f"Error: {all_cgs['error']}"})
         
         group_details = all_cgs.get("groupDetails", [])
         logging.info(f"[get_cginfo_from_countergroup_name] Retrieved {len(group_details)} counter groups")
@@ -308,22 +314,22 @@ def get_cginfo_from_countergroup_name(countergroup_name: str, context: str = "co
                 normalized_group_name = group_name.lower().replace(" ", "")
                 if normalized_group_name == normalized_search_name:
                     logging.info(f"[get_cginfo_from_countergroup_name] Found matching counter group: {group_name}")
-                    return group  # return full raw group dict
+                    return json_to_toon(group)  # return full raw group dict
             except Exception as e:
                 logging.warning(f"[get_cginfo_from_countergroup_name] Error processing group: {str(e)}, skipping")
                 continue
         
         # If not found
         logging.warning(f"[get_cginfo_from_countergroup_name] Counter group '{countergroup_name}' not found. Available groups: {group_names}")
-        return {
+        return json_to_toon({
             "name": countergroup_name,
             "guid": "Not Found",
             "available_groups": group_names
-        }
+        })
             
     except Exception as e:
         logging.error(f"[get_cginfo_from_countergroup_name] Error in get_cginfo_from_countergroup_name: {str(e)}", exc_info=True)
-        return {"name": countergroup_name, "guid": f"Error: {str(e)}"}
+        return json_to_toon({"name": countergroup_name, "guid": f"Error: {str(e)}"})
     
 
 
@@ -428,11 +434,11 @@ def get_counter_group_topper(counter_group_guid: str, meter: int = 0, duration_s
         logging.info("[get_counter_group_topper] Successfully retrieved counter group topper")
 
         # Step 5: Return JSON-serializable dict
-        return MessageToDict(resp)
+        return json_to_toon(MessageToDict(resp))
     
     except Exception as e:
         logging.error(f"[get_counter_group_topper] Error in get_counter_group_topper: {str(e)}", exc_info=True)
-        return {"error": str(e)}
+        return json_to_toon({"error": str(e)})
 
 
 
@@ -587,15 +593,15 @@ def get_key_traffic_data(counter_group: str, readable: str = None, duration_secs
         result = MessageToDict(resp)
         logging.info(f"[get_key_traffic_data] Response converted to dict, keys: {result.keys()}")
         
-        return result
+        return json_to_toon(result)
     
         
     except zmq.ZMQError as e:
         logging.error(f"[get_key_traffic_data] ZMQ error in key_traffic: {str(e)}", exc_info=True)
-        return {"error": f"ZMQ error: {str(e)}"}
+        return json_to_toon({"error": f"ZMQ error: {str(e)}"})
     except Exception as e:
         logging.error(f"[get_key_traffic_data] Error in key_traffic: {str(e)}", exc_info=True)
-        return {"error": str(e)}
+        return json_to_toon({"error": str(e)})
     finally:
         if socket:
             try:
@@ -605,6 +611,407 @@ def get_key_traffic_data(counter_group: str, readable: str = None, duration_secs
                 logging.warning(f"[get_key_traffic_data] Error in final socket cleanup: {str(e)}")
 
 
+
+@mcp.tool()
+def get_alerts_data(
+    alert_group: str,
+    duration_secs: int = 3600,
+    start_ts: int = None,
+    end_ts: int = None,
+    context: str = "context0",
+    zmq_endpoint: str = None,
+    maxitems: int = 100,
+    group_by_fieldname: str = None,
+    resolve_keys: bool = True,
+    approx_count_only: bool = False,
+    source_ip: str = None,
+    destination_ip: str = None,
+    source_port: str = None,
+    destination_port: str = None,
+    any_ip: str = None,
+    any_port: str = None,
+    ip_pair: list = None,
+    sigid: str = None,
+    classification: str = None,
+    priority: str = None,
+    aux_message1: str = None,
+    aux_message2: str = None,
+    message_regex: str = None,
+    idlist: list = None
+):
+    """
+    Retrieve alert telemetry from Trisul using QUERY_ALERTS_REQUEST.
+
+    This MCP tool acts as an alert intelligence fetcher that surfaces curated alert
+    records for a specified Alert Group. It supports flexible temporal scoping, granular
+    field-level filtering, grouping, and regex-based matching to enable downstream
+    enrichment, correlation, or analytics workloads.
+
+    **Mandatory Requirement:**
+        - `alert_group` must be a valid Trisul Alert Group GUID.
+          The function will not operate if a non-GUID or malformed value is supplied.
+
+    Parameters:
+        alert_group (str): REQUIRED. Trisul Alert Group GUID. Must be a valid GUID string.
+        duration_secs (int): Relative time window in seconds. Ignored if start_ts and end_ts are provided.
+        start_ts (int): Start of absolute time window (epoch seconds). Must be paired with end_ts.
+        end_ts (int): End of absolute time window (epoch seconds). Must be paired with start_ts.
+        context (str): Trisul context identifier. Defaults to "context0".
+        zmq_endpoint (str): Custom TRP ZMQ endpoint. Auto-computed if omitted.
+        maxitems (int): Hard ceiling on number of alert records returned.
+        group_by_fieldname (str): Field to group output by (e.g. "sigid", "source_ip").
+        resolve_keys (bool): Resolve internal keys into readable fields.
+        approx_count_only (bool): Return approximate counts only, without full alert details.
+
+        # Filters (always use readable values, not internal key format)
+        source_ip (str): Filter by source IP.
+        destination_ip (str): Filter by destination IP.
+        source_port (str): Filter by source port.
+        destination_port (str): Filter by destination port.
+        any_ip (str): Match either source or destination IP.
+        any_port (str): Match either source or destination port.
+        ip_pair (list): One or multiple [src_ip, dst_ip] filter pairs.
+        sigid (str): Filter by signature ID.
+        classification (str): Filter by alert classification.
+        priority (str): Filter by alert priority.
+        aux_message1 (str): Text match against dispatch message field 1.
+        aux_message2 (str): Text match against dispatch message field 2.
+        message_regex (str): Regex match on alert message payload.
+        idlist (list): Retrieve specific alerts by ID.
+
+    Returns:
+        dict: Parsed Trisul alert response, including raw or grouped alert intelligence payload.
+
+    Usage Notes:
+        - Always provide a valid GUID for `alert_group` to avoid request rejection.
+        - Absolute time window (start_ts/end_ts) overrides duration_secs if both provided.
+        - Optimized for downstream dashboards, analytics engines, and correlation pipelines.
+    """
+    global _global_zmq_context
+    socket = None
+
+    try:
+        logging.info(f"[get_alerts_data] Start | alert_group={alert_group} duration_secs={duration_secs} start_ts={start_ts} end_ts={end_ts}")
+
+        if not zmq_endpoint:
+            ctx = normalize_context(context)
+            zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{ctx}/run/trp_0"
+        logging.info(f"[get_alerts_data] ZMQ endpoint: {zmq_endpoint}")
+
+        def unwrap_response(data):
+            logging.info(f"[get_alerts_data] Unwrapping response ({len(data)} bytes)")
+            resp = trp_pb2.Message()
+            resp.ParseFromString(data)
+            for x in resp.DESCRIPTOR.enum_types:
+                name = x.values_by_number.get(int(resp.trp_command)).name
+            logging.info(f"[get_alerts_data] Response type: {name}")
+            return {
+                'TIMESLICES_RESPONSE': resp.time_slices_response,
+                'QUERY_ALERTS_RESPONSE': resp.query_alerts_response
+            }.get(name, resp)
+
+        def roundtrip(req):
+            nonlocal socket
+            logging.info("[get_alerts_data] Opening ZMQ socket")
+            zmq_context = _global_zmq_context
+            socket = zmq_context.socket(zmq.REQ)
+            socket.connect(zmq_endpoint)
+            logging.info("[get_alerts_data] Sending request to TRP")
+            socket.send(req.SerializeToString())
+            data = socket.recv()
+            logging.info("[get_alerts_data] Response received from TRP")
+            socket.close()
+            socket = None
+            return unwrap_response(data)
+
+        logging.info("[get_alerts_data] Requesting TIMESLICES window")
+        req = trp_pb2.Message()
+        req.trp_command = req.TIMESLICES_REQUEST
+        req.time_slices_request.get_total_window = True
+        tint_resp = roundtrip(req)
+
+        tm = trp_pb2.TimeInterval()
+        tm.MergeFrom(tint_resp.total_window)
+        getattr(tm, 'from').tv_sec = tm.to.tv_sec - duration_secs
+
+        if start_ts and end_ts:
+            getattr(tm, 'from').tv_sec = int(start_ts)
+            getattr(tm, 'to').tv_sec = int(end_ts)
+            logging.info(f"[get_alerts_data] Custom time window applied: {start_ts} to {end_ts}")
+
+        req = trp_pb2.Message()
+        req.trp_command = req.QUERY_ALERTS_REQUEST
+        q = req.query_alerts_request
+
+        q.alert_group = alert_group
+        q.time_interval.MergeFrom(tm)
+        q.maxitems = int(maxitems)
+        q.resolve_keys = bool(resolve_keys)
+        q.approx_count_only = bool(approx_count_only)
+
+        if group_by_fieldname:
+            q.group_by_fieldname = group_by_fieldname
+            logging.info(f"[get_alerts_data] Group by: {group_by_fieldname}")
+
+        def set_keyt(field, val):
+            if val is None:
+                return
+            getattr(q, field).label = str(val).lower()
+            logging.info(f"[get_alerts_data] Filter applied: {field}={val}")
+
+        set_keyt('source_ip', source_ip)
+        set_keyt('destination_ip', destination_ip)
+        set_keyt('source_port', source_port)
+        set_keyt('destination_port', destination_port)
+        set_keyt('any_ip', any_ip)
+        set_keyt('any_port', any_port)
+        set_keyt('sigid', sigid)
+        set_keyt('classification', classification)
+        set_keyt('priority', priority)
+
+        if aux_message1:
+            logging.info(f"[get_alerts_data] aux_message1={aux_message1}")
+            q.aux_message1 = aux_message1
+        if aux_message2:
+            logging.info(f"[get_alerts_data] aux_message2={aux_message2}")
+            q.aux_message2 = aux_message2
+        if message_regex:
+            logging.info(f"[get_alerts_data] message_regex={message_regex}")
+            q.message_regex = message_regex
+
+        if idlist:
+            q.idlist.extend([str(x) for x in idlist])
+            logging.info(f"[get_alerts_data] idlist count={len(idlist)}")
+
+        if ip_pair:
+            pairs = ip_pair
+            if isinstance(pairs, list) and pairs and isinstance(pairs[0], str):
+                pairs = [pairs]
+            for p in pairs:
+                if len(p) != 2:
+                    logging.warning(f"[get_alerts_data] Invalid ip_pair skipped: {p}")
+                    continue
+                kt1 = q.ip_pair.add()
+                kt1.label = str(p[0]).lower()
+                kt2 = q.ip_pair.add()
+                kt2.label = str(p[1]).lower()
+            logging.info(f"[get_alerts_data] ip_pair count={len(pairs)}")
+
+        logging.info("[get_alerts_data] Executing QUERY_ALERTS_REQUEST")
+        resp = roundtrip(req)
+        result = MessageToDict(resp)
+
+        logging.info("[get_alerts_data] Completed successfully")
+        return json_to_toon(result)
+
+    except Exception as e:
+        logging.error(f"[get_alerts_data] Error: {str(e)}", exc_info=True)
+        return json_to_toon({"error": str(e)})
+
+    finally:
+        if socket:
+            try:
+                socket.close()
+                logging.info("[get_alerts_data] Socket closed")
+            except Exception:
+                logging.warning("[get_alerts_data] Socket close failed")
+
+
+
+@mcp.tool()
+def get_flows_or_sessions_data(
+        session_group: str = "{99A78737-4B41-4387-8F31-8077DB917336}",
+        key: str = None,
+        source_ip: str = None,
+        source_port: str = None,
+        dest_ip: str = None,
+        dest_port: str = None,
+        any_ip: str = None,
+        any_port: str = None,
+        ip_pair: list = None,
+        protocol: str = None,
+        flowtag: str = None,
+        nf_routerid: str = None,
+        nf_ifindex_in: str = None,
+        nf_ifindex_out: str = None,
+        subnet_24: str = None,
+        subnet_16: str = None,
+        maxitems: int = 100,
+        volume_filter: int = 0,
+        resolve_keys: bool = True,
+        outputpath: str = None,
+        idlist: list = None,
+        any_nf_ifindex: str = None,
+        duration_secs: int = 60,
+        start_ts: int = None,
+        end_ts: int = None,
+        context: str = "context0",
+        zmq_endpoint: str = None
+    ):
+    """
+    Unified QuerySessions API pull.
+
+    Business Value:
+        Single entry point to query Trisul sessions with multi-criteria filtering.
+        All fields in QuerySessionsRequest are supported through `filters`.
+        Fields provided are implicitly AND-ed, enabling precision flow slicing.
+
+    Args:
+        session_group: Session group GUID. Default is main Flow Tracker.
+        key: Match a Trisul internal session key.
+        source_ip, dest_ip: Match flow endpoints by IP.
+        source_port, dest_port: Match L4 ports.
+        any_ip, any_port: Match either source or destination.
+        ip_pair: List of 2 IPs. Matches flows between the pair.
+        protocol: L4 protocol (6=TCP,17=UDP,1=ICMP).
+        flowtag: Match flow tag text.
+        nf_routerid: NetFlow router ID.
+        nf_ifindex_in, nf_ifindex_out: NetFlow interface filters.
+        subnet_24, subnet_16: Match flows inside subnet ranges.
+        maxitems: Max records returned. Default 200.
+        volume_filter: Only return flows > X bytes.
+        resolve_keys: Resolve keys to readable format.
+        outputpath: Write results to hub as CSV instead of returning.
+        idlist: Flow IDs to retrieve directly. Skips filters.
+        any_nf_ifindex: Match IN or OUT NF interface.
+        duration_secs: Time window if timestamps not provided.
+        start_ts, end_ts: Epoch timestamps override duration_secs.
+        context: Trisul context.
+        zmq_endpoint: Custom TRP endpoint.
+        
+        filters (dict): Maps directly to QuerySessionsRequest fields.
+                        Examples:
+                        {
+                            "any_ip": "10.1.1.1",
+                            "source_ip": "192.168.1.5",
+                            "dest_port": "443",
+                            "protocol": "6",
+                            "flowtag": "malware",
+                            "ip_pair": ["10.1.1.1","8.8.8.8"],
+                            "subnet_24": "172.16.5.0"
+                        }
+
+    Returns:
+        dict: Parsed sessions response as Python dict.
+    """
+
+    global _global_zmq_context
+    socket = None
+
+    try:
+        if not zmq_endpoint:
+            context = normalize_context(context)
+            zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{context}/run/trp_0"
+
+        logging.info(f"[QuerySessions] TRP endpoint={zmq_endpoint}")
+
+        # Helper: ZMQ send/recv
+        def get_response(req):
+            nonlocal socket
+            try:
+                zmq_context = _global_zmq_context
+                socket = zmq_context.socket(zmq.REQ)
+                socket.connect(zmq_endpoint)
+                socket.send(req.SerializeToString())
+                data = socket.recv()
+                return unwrap_response(data)
+            finally:
+                if socket:
+                    socket.close()
+
+        # Helper: Parse TRP response
+        def unwrap_response(data):
+            resp = trp_pb2.Message()
+            resp.ParseFromString(data)
+            for x in resp.DESCRIPTOR.enum_types:
+                name = x.values_by_number.get(int(resp.trp_command)).name
+            return {
+                'TIMESLICES_RESPONSE': resp.time_slices_response,
+                'QUERY_SESSIONS_RESPONSE': resp.query_sessions_response
+            }.get(name, resp)
+            
+        # Step 1: Pull Time Window
+        req = trp_pb2.Message()
+        req.trp_command = req.TIMESLICES_REQUEST
+        req.time_slices_request.get_total_window = True
+        tint_resp = get_response(req)
+
+        tm = trp_pb2.TimeInterval()
+        tm.MergeFrom(tint_resp.total_window)
+        
+        if not start_ts or not end_ts:
+            duration_secs = int(duration_secs)
+            start_ts = tm.to.tv_sec - duration_secs
+            end_ts = tm.to.tv_sec
+        
+        start_ts = int(start_ts)
+        end_ts = int(end_ts)
+        
+        getattr(tm, 'from').tv_sec = start_ts
+        getattr(tm, 'to').tv_sec = end_ts
+
+            
+            
+            
+
+        # Step 2: Build QuerySessionsRequest
+        req = trp_pb2.Message()
+        req.trp_command = req.QUERY_SESSIONS_REQUEST
+        q = req.query_sessions_request
+
+        q.session_group = session_group
+        q.time_interval.MergeFrom(tm)
+        q.maxitems = maxitems
+        q.volume_filter = volume_filter
+        q.resolve_keys = resolve_keys
+        if outputpath: q.outputpath = outputpath
+
+        if key: q.key = key
+        if source_ip: q.source_ip.label = source_ip
+        if source_port: q.source_port.label = source_port
+        if dest_ip: q.dest_ip.label = dest_ip
+        if dest_port: q.dest_port.label = dest_port
+        if any_ip: q.any_ip.label = any_ip
+        if any_port: q.any_port.label = any_port
+        if protocol: q.protocol.label = protocol
+        if flowtag: q.flowtag = flowtag
+        if nf_routerid: q.nf_routerid.label = nf_routerid
+        if nf_ifindex_in: q.nf_ifindex_in.label = nf_ifindex_in
+        if nf_ifindex_out: q.nf_ifindex_out.label = nf_ifindex_out
+        if subnet_24: q.subnet_24 = subnet_24
+        if subnet_16: q.subnet_16 = subnet_16
+        if any_nf_ifindex: q.any_nf_ifindex.label = any_nf_ifindex
+
+        if ip_pair and len(ip_pair) == 2:
+            p1 = q.ip_pair.add(); p1.label = ip_pair[0]
+            p2 = q.ip_pair.add(); p2.label = ip_pair[1]
+
+        if idlist:
+            for fid in idlist:
+                q.idlist.append(fid)
+
+        logging.info(f"[QuerySessions] Executing QuerySessions with provided filters")
+        
+        resp = MessageToDict(get_response(req))
+        
+        resp["sessions"][:] = [
+            s for s in resp.get("sessions", [])
+            if int(s["timeInterval"]["from"]["tvSec"]) <= end_ts and int(s["timeInterval"]["to"]["tvSec"]) >= start_ts
+        ][-maxitems:]
+        
+        logging.info(resp)
+        
+        return json_to_toon(resp)
+        
+    except Exception as e:
+        logging.error(f"[QuerySessions] Exception: {e}")
+        return json_to_toon({"error": str(e)})
+
+
+
+
+
+# Non TRP tools
 
 @mcp.tool()
 def create_crosskey_counter_group( context: str = "context0", name: str = None, description: str = "No description", toppers_interval: int = 300, bucket_size: int = 60, track_hi_water: int = 500, track_lo_water: int = 100, tail_prune_factor: int = None, last_topper_bucket_ts: str = None, row_status: str = "Active", cardinality_estimate_bits: int = None, topper_traffic_only: bool = None, enable_slice_keys: int = 1, resolver_counter_guid: str = None, cross_guid1: str = None, cross_guid2: str = None, cross_guid3: str = None, balance_depth : int = None):
@@ -854,8 +1261,13 @@ def rag_query(question: str):
     except Exception as e:
         logging.error(f"[rag_query] Unexpected error in rag_query: {str(e)}", exc_info=True)
         return f"Error: An unexpected error occurred - {str(e)}"
-    
-    
+
+
+
+
+
+
+# UI related tools
 
 @mcp.tool()
 def show_pie_chart(data, save_image: bool = False):
@@ -884,11 +1296,20 @@ def show_pie_chart(data, save_image: bool = False):
     """
     logging.info(f"[show_pie_chart] Generating the pie chart for the given data")
     
-        
+    
+    # Validate the input data
     if isinstance(data, str):
-        data = ast.literal_eval(data)  # handles single-quoted dict strings
+        try:
+            data = ast.literal_eval(data)
+        except Exception:
+            try:
+                data = json.loads(data)
+            except Exception:
+                logging.error("[show_pie_chart] Invalid pie chart data format. Expected dict or JSON string.")
+                return {"status": "error", "message" : "Invalid pie chart data format from LLM", "message_to_llm" : "Call this mcp tool (show_pie_chart) again with the valid pie chart data format. don't retry this more than 3 times in a row", "file_path": None}
     else:
         data = dict(data)
+
 
     data["volumes"] = [
         eval(str(v)) if isinstance(v, str) and "*" in v else v
@@ -932,6 +1353,20 @@ def show_line_chart(data, save_image: bool = False):
     """
     
     logging.info(f"[show_line_chart] Generating the line chart for the given data")
+    
+        
+    # Validate the input data
+    if isinstance(data, str):
+        try:
+            data = ast.literal_eval(data)
+        except Exception:
+            try:
+                data = json.loads(data)
+            except Exception:
+                logging.error("[show_line_chart] Invalid line chart data format. Expected dict or JSON string.")
+                return {"status": "error", "message" : "Invalid line chart data format from LLM", "message_to_llm" : "Call this mcp tool (show_line_chart) again with the valid line chart data format. don't retry this more than 3 times in a row", "file_path": None}
+    else:
+        data = dict(data)
 
     if(save_image):
         file_path = f"/tmp/line_chart_{int(datetime.now().timestamp())}_{random.randint(1000, 9999)}.png"
@@ -939,403 +1374,6 @@ def show_line_chart(data, save_image: bool = False):
         return {"status": "success", "message" : f"The line chart is saved as an image file successfully.", "file_path": file_path}
     else:
         return {"status": "success", "message" : f"The line chart is displayed in the pop-up window, tell the user to kindly check that. then show this data in the table format and give a short summary about the data.", "file_path": None}
-
-
-
-
-@mcp.tool()
-def get_alerts_data(
-    alert_group: str,
-    duration_secs: int = 3600,
-    start_ts: int = None,
-    end_ts: int = None,
-    context: str = "context0",
-    zmq_endpoint: str = None,
-    maxitems: int = 100,
-    group_by_fieldname: str = None,
-    resolve_keys: bool = True,
-    approx_count_only: bool = False,
-    source_ip: str = None,
-    destination_ip: str = None,
-    source_port: str = None,
-    destination_port: str = None,
-    any_ip: str = None,
-    any_port: str = None,
-    ip_pair: list = None,
-    sigid: str = None,
-    classification: str = None,
-    priority: str = None,
-    aux_message1: str = None,
-    aux_message2: str = None,
-    message_regex: str = None,
-    idlist: list = None
-):
-    """
-    Retrieve alert telemetry from Trisul using QUERY_ALERTS_REQUEST.
-
-    This MCP tool acts as an alert intelligence fetcher that surfaces curated alert
-    records for a specified Alert Group. It supports flexible temporal scoping, granular
-    field-level filtering, grouping, and regex-based matching to enable downstream
-    enrichment, correlation, or analytics workloads.
-
-    **Mandatory Requirement:**
-        - `alert_group` must be a valid Trisul Alert Group GUID.
-          The function will not operate if a non-GUID or malformed value is supplied.
-
-    Parameters:
-        alert_group (str): REQUIRED. Trisul Alert Group GUID. Must be a valid GUID string.
-        duration_secs (int): Relative time window in seconds. Ignored if start_ts and end_ts are provided.
-        start_ts (int): Start of absolute time window (epoch seconds). Must be paired with end_ts.
-        end_ts (int): End of absolute time window (epoch seconds). Must be paired with start_ts.
-        context (str): Trisul context identifier. Defaults to "context0".
-        zmq_endpoint (str): Custom TRP ZMQ endpoint. Auto-computed if omitted.
-        maxitems (int): Hard ceiling on number of alert records returned.
-        group_by_fieldname (str): Field to group output by (e.g. "sigid", "source_ip").
-        resolve_keys (bool): Resolve internal keys into readable fields.
-        approx_count_only (bool): Return approximate counts only, without full alert details.
-
-        # Filters (always use readable values, not internal key format)
-        source_ip (str): Filter by source IP.
-        destination_ip (str): Filter by destination IP.
-        source_port (str): Filter by source port.
-        destination_port (str): Filter by destination port.
-        any_ip (str): Match either source or destination IP.
-        any_port (str): Match either source or destination port.
-        ip_pair (list): One or multiple [src_ip, dst_ip] filter pairs.
-        sigid (str): Filter by signature ID.
-        classification (str): Filter by alert classification.
-        priority (str): Filter by alert priority.
-        aux_message1 (str): Text match against dispatch message field 1.
-        aux_message2 (str): Text match against dispatch message field 2.
-        message_regex (str): Regex match on alert message payload.
-        idlist (list): Retrieve specific alerts by ID.
-
-    Returns:
-        dict: Parsed Trisul alert response, including raw or grouped alert intelligence payload.
-
-    Usage Notes:
-        - Always provide a valid GUID for `alert_group` to avoid request rejection.
-        - Absolute time window (start_ts/end_ts) overrides duration_secs if both provided.
-        - Optimized for downstream dashboards, analytics engines, and correlation pipelines.
-    """
-    global _global_zmq_context
-    socket = None
-
-    try:
-        logging.info(f"[get_alerts_data] Start | alert_group={alert_group} duration_secs={duration_secs} start_ts={start_ts} end_ts={end_ts}")
-
-        if not zmq_endpoint:
-            ctx = normalize_context(context)
-            zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{ctx}/run/trp_0"
-        logging.info(f"[get_alerts_data] ZMQ endpoint: {zmq_endpoint}")
-
-        def unwrap_response(data):
-            logging.info(f"[get_alerts_data] Unwrapping response ({len(data)} bytes)")
-            resp = trp_pb2.Message()
-            resp.ParseFromString(data)
-            for x in resp.DESCRIPTOR.enum_types:
-                name = x.values_by_number.get(int(resp.trp_command)).name
-            logging.info(f"[get_alerts_data] Response type: {name}")
-            return {
-                'TIMESLICES_RESPONSE': resp.time_slices_response,
-                'QUERY_ALERTS_RESPONSE': resp.query_alerts_response
-            }.get(name, resp)
-
-        def roundtrip(req):
-            nonlocal socket
-            logging.info("[get_alerts_data] Opening ZMQ socket")
-            zmq_context = _global_zmq_context
-            socket = zmq_context.socket(zmq.REQ)
-            socket.connect(zmq_endpoint)
-            logging.info("[get_alerts_data] Sending request to TRP")
-            socket.send(req.SerializeToString())
-            data = socket.recv()
-            logging.info("[get_alerts_data] Response received from TRP")
-            socket.close()
-            socket = None
-            return unwrap_response(data)
-
-        logging.info("[get_alerts_data] Requesting TIMESLICES window")
-        req = trp_pb2.Message()
-        req.trp_command = req.TIMESLICES_REQUEST
-        req.time_slices_request.get_total_window = True
-        tint_resp = roundtrip(req)
-
-        tm = trp_pb2.TimeInterval()
-        tm.MergeFrom(tint_resp.total_window)
-        getattr(tm, 'from').tv_sec = tm.to.tv_sec - duration_secs
-
-        if start_ts and end_ts:
-            getattr(tm, 'from').tv_sec = int(start_ts)
-            getattr(tm, 'to').tv_sec = int(end_ts)
-            logging.info(f"[get_alerts_data] Custom time window applied: {start_ts} to {end_ts}")
-
-        req = trp_pb2.Message()
-        req.trp_command = req.QUERY_ALERTS_REQUEST
-        q = req.query_alerts_request
-
-        q.alert_group = alert_group
-        q.time_interval.MergeFrom(tm)
-        q.maxitems = int(maxitems)
-        q.resolve_keys = bool(resolve_keys)
-        q.approx_count_only = bool(approx_count_only)
-
-        if group_by_fieldname:
-            q.group_by_fieldname = group_by_fieldname
-            logging.info(f"[get_alerts_data] Group by: {group_by_fieldname}")
-
-        def set_keyt(field, val):
-            if val is None:
-                return
-            getattr(q, field).label = str(val).lower()
-            logging.info(f"[get_alerts_data] Filter applied: {field}={val}")
-
-        set_keyt('source_ip', source_ip)
-        set_keyt('destination_ip', destination_ip)
-        set_keyt('source_port', source_port)
-        set_keyt('destination_port', destination_port)
-        set_keyt('any_ip', any_ip)
-        set_keyt('any_port', any_port)
-        set_keyt('sigid', sigid)
-        set_keyt('classification', classification)
-        set_keyt('priority', priority)
-
-        if aux_message1:
-            logging.info(f"[get_alerts_data] aux_message1={aux_message1}")
-            q.aux_message1 = aux_message1
-        if aux_message2:
-            logging.info(f"[get_alerts_data] aux_message2={aux_message2}")
-            q.aux_message2 = aux_message2
-        if message_regex:
-            logging.info(f"[get_alerts_data] message_regex={message_regex}")
-            q.message_regex = message_regex
-
-        if idlist:
-            q.idlist.extend([str(x) for x in idlist])
-            logging.info(f"[get_alerts_data] idlist count={len(idlist)}")
-
-        if ip_pair:
-            pairs = ip_pair
-            if isinstance(pairs, list) and pairs and isinstance(pairs[0], str):
-                pairs = [pairs]
-            for p in pairs:
-                if len(p) != 2:
-                    logging.warning(f"[get_alerts_data] Invalid ip_pair skipped: {p}")
-                    continue
-                kt1 = q.ip_pair.add()
-                kt1.label = str(p[0]).lower()
-                kt2 = q.ip_pair.add()
-                kt2.label = str(p[1]).lower()
-            logging.info(f"[get_alerts_data] ip_pair count={len(pairs)}")
-
-        logging.info("[get_alerts_data] Executing QUERY_ALERTS_REQUEST")
-        resp = roundtrip(req)
-        result = MessageToDict(resp)
-
-        logging.info("[get_alerts_data] Completed successfully")
-        return result
-
-    except Exception as e:
-        logging.error(f"[get_alerts_data] Error: {str(e)}", exc_info=True)
-        return {"error": str(e)}
-
-    finally:
-        if socket:
-            try:
-                socket.close()
-                logging.info("[get_alerts_data] Socket closed")
-            except Exception:
-                logging.warning("[get_alerts_data] Socket close failed")
-
-
-
-@mcp.tool()
-def get_flows_or_sessions_data(
-        session_group: str = "{99A78737-4B41-4387-8F31-8077DB917336}",
-        key: str = None,
-        source_ip: str = None,
-        source_port: str = None,
-        dest_ip: str = None,
-        dest_port: str = None,
-        any_ip: str = None,
-        any_port: str = None,
-        ip_pair: list = None,
-        protocol: str = None,
-        flowtag: str = None,
-        nf_routerid: str = None,
-        nf_ifindex_in: str = None,
-        nf_ifindex_out: str = None,
-        subnet_24: str = None,
-        subnet_16: str = None,
-        maxitems: int = 100,
-        volume_filter: int = 0,
-        resolve_keys: bool = True,
-        outputpath: str = None,
-        idlist: list = None,
-        any_nf_ifindex: str = None,
-        duration_secs: int = 60,
-        start_ts: int = None,
-        end_ts: int = None,
-        context: str = "context0",
-        zmq_endpoint: str = None
-    ):
-    """
-    Unified QuerySessions API pull.
-
-    Business Value:
-        Single entry point to query Trisul sessions with multi-criteria filtering.
-        All fields in QuerySessionsRequest are supported through `filters`.
-        Fields provided are implicitly AND-ed, enabling precision flow slicing.
-
-    Args:
-        session_group: Session group GUID. Default is main Flow Tracker.
-        key: Match a Trisul internal session key.
-        source_ip, dest_ip: Match flow endpoints by IP.
-        source_port, dest_port: Match L4 ports.
-        any_ip, any_port: Match either source or destination.
-        ip_pair: List of 2 IPs. Matches flows between the pair.
-        protocol: L4 protocol (6=TCP,17=UDP,1=ICMP).
-        flowtag: Match flow tag text.
-        nf_routerid: NetFlow router ID.
-        nf_ifindex_in, nf_ifindex_out: NetFlow interface filters.
-        subnet_24, subnet_16: Match flows inside subnet ranges.
-        maxitems: Max records returned. Default 200.
-        volume_filter: Only return flows > X bytes.
-        resolve_keys: Resolve keys to readable format.
-        outputpath: Write results to hub as CSV instead of returning.
-        idlist: Flow IDs to retrieve directly. Skips filters.
-        any_nf_ifindex: Match IN or OUT NF interface.
-        duration_secs: Time window if timestamps not provided.
-        start_ts, end_ts: Epoch timestamps override duration_secs.
-        context: Trisul context.
-        zmq_endpoint: Custom TRP endpoint.
-        
-        filters (dict): Maps directly to QuerySessionsRequest fields.
-                        Examples:
-                        {
-                            "any_ip": "10.1.1.1",
-                            "source_ip": "192.168.1.5",
-                            "dest_port": "443",
-                            "protocol": "6",
-                            "flowtag": "malware",
-                            "ip_pair": ["10.1.1.1","8.8.8.8"],
-                            "subnet_24": "172.16.5.0"
-                        }
-
-    Returns:
-        dict: Parsed sessions response as Python dict.
-    """
-
-    global _global_zmq_context
-    socket = None
-
-    try:
-        if not zmq_endpoint:
-            context = normalize_context(context)
-            zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{context}/run/trp_0"
-
-        logging.info(f"[QuerySessions] TRP endpoint={zmq_endpoint}")
-
-        # Helper: ZMQ send/recv
-        def get_response(req):
-            nonlocal socket
-            try:
-                zmq_context = _global_zmq_context
-                socket = zmq_context.socket(zmq.REQ)
-                socket.connect(zmq_endpoint)
-                socket.send(req.SerializeToString())
-                data = socket.recv()
-                return unwrap_response(data)
-            finally:
-                if socket:
-                    socket.close()
-
-        # Helper: Parse TRP response
-        def unwrap_response(data):
-            resp = trp_pb2.Message()
-            resp.ParseFromString(data)
-            for x in resp.DESCRIPTOR.enum_types:
-                name = x.values_by_number.get(int(resp.trp_command)).name
-            return {
-                'TIMESLICES_RESPONSE': resp.time_slices_response,
-                'QUERY_SESSIONS_RESPONSE': resp.query_sessions_response
-            }.get(name, resp)
-            
-        # Step 1: Pull Time Window
-        req = trp_pb2.Message()
-        req.trp_command = req.TIMESLICES_REQUEST
-        req.time_slices_request.get_total_window = True
-        tint_resp = get_response(req)
-
-        tm = trp_pb2.TimeInterval()
-        tm.MergeFrom(tint_resp.total_window)
-        
-        if not start_ts or not end_ts:
-            duration_secs = int(duration_secs)
-            start_ts = tm.to.tv_sec - duration_secs
-            end_ts = tm.to.tv_sec
-        
-        start_ts = int(start_ts)
-        end_ts = int(end_ts)
-        
-        getattr(tm, 'from').tv_sec = start_ts
-        getattr(tm, 'to').tv_sec = end_ts
-
-            
-            
-            
-
-        # Step 2: Build QuerySessionsRequest
-        req = trp_pb2.Message()
-        req.trp_command = req.QUERY_SESSIONS_REQUEST
-        q = req.query_sessions_request
-
-        q.session_group = session_group
-        q.time_interval.MergeFrom(tm)
-        q.maxitems = maxitems
-        q.volume_filter = volume_filter
-        q.resolve_keys = resolve_keys
-        if outputpath: q.outputpath = outputpath
-
-        if key: q.key = key
-        if source_ip: q.source_ip.label = source_ip
-        if source_port: q.source_port.label = source_port
-        if dest_ip: q.dest_ip.label = dest_ip
-        if dest_port: q.dest_port.label = dest_port
-        if any_ip: q.any_ip.label = any_ip
-        if any_port: q.any_port.label = any_port
-        if protocol: q.protocol.label = protocol
-        if flowtag: q.flowtag = flowtag
-        if nf_routerid: q.nf_routerid.label = nf_routerid
-        if nf_ifindex_in: q.nf_ifindex_in.label = nf_ifindex_in
-        if nf_ifindex_out: q.nf_ifindex_out.label = nf_ifindex_out
-        if subnet_24: q.subnet_24 = subnet_24
-        if subnet_16: q.subnet_16 = subnet_16
-        if any_nf_ifindex: q.any_nf_ifindex.label = any_nf_ifindex
-
-        if ip_pair and len(ip_pair) == 2:
-            p1 = q.ip_pair.add(); p1.label = ip_pair[0]
-            p2 = q.ip_pair.add(); p2.label = ip_pair[1]
-
-        if idlist:
-            for fid in idlist:
-                q.idlist.append(fid)
-
-        logging.info(f"[QuerySessions] Executing QuerySessions with provided filters")
-        
-        resp = MessageToDict(get_response(req))
-        
-        resp["sessions"][:] = [
-            s for s in resp.get("sessions", [])
-            if int(s["timeInterval"]["from"]["tvSec"]) <= end_ts and int(s["timeInterval"]["to"]["tvSec"]) >= start_ts
-        ][-maxitems:]
-        
-        return resp
-        
-    except Exception as e:
-        logging.error(f"[QuerySessions] Exception: {e}")
-        return {"error": str(e)}
-
 
 
 
@@ -1380,6 +1418,22 @@ def generate_trisul_report(pages, filename: str, report_title: str, from_ts, to_
         to_ts = 1676614500
     """
     
+    
+    
+    # Validate the input data
+    if isinstance(pages, str):
+        try:
+            pages = ast.literal_eval(pages)
+        except Exception:
+            try:
+                pages = json.loads(pages)
+            except Exception:
+                logging.error("[generate_trisul_report] Invalid pages data format from LLM.")
+                return {"status": "error", "message" : "Invalid pages data format from LLM", "message_to_llm" : "Call this mcp tool (generate_trisul_report) again with the valid pages data format", "file_path": None}
+    else:
+        pages = list(pages)
+
+    
     styles = getSampleStyleSheet()
     title_style = styles["Heading2"]
     title_style.leftIndent = 0
@@ -1392,9 +1446,6 @@ def generate_trisul_report(pages, filename: str, report_title: str, from_ts, to_
 
 
     filename = f"/tmp/{filename}"
-    
-    if isinstance(pages, str):
-        pages = ast.literal_eval(pages)
     
     pdf = SimpleDocTemplate(
         filename,
@@ -1521,8 +1572,13 @@ def generate_trisul_report(pages, filename: str, report_title: str, from_ts, to_
 
 
 
+
+
+
+# AI Config tools
+
 @mcp.tool()
-def manage_model_version():
+def manage_ai_model_version():
     """
     Manage and switch between different AI model versions or LLMs for Trisul AI integrations.
     Usage:
@@ -1534,10 +1590,9 @@ def manage_model_version():
         str: Confirmation message about the model management action performed.
     """
     
-    logging.info(f"[manage_model_version] Managing AI model versions for Trisul AI integrations")
+    logging.info(f"[manage_ai_model_version] Managing AI model versions for Trisul AI integrations")
 
     return {"status": "success", "message" : f"The AI model version has been changed successfully."}
-
 
 
 
