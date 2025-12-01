@@ -1,4 +1,3 @@
-# index_pdf.py
 import time
 import google.generativeai as genai
 import chromadb
@@ -44,7 +43,7 @@ def chunk_text(text, max_tokens=500):
 
 def index_pdf(pdf_path: str, collection_name="pdf_docs"):
     # Persistent Chroma
-    chroma_client = chromadb.PersistentClient(path="./chroma_store")
+    chroma_client = chromadb.PersistentClient(path="/tmp/chroma_store")
     collection = chroma_client.get_or_create_collection(collection_name)
 
     # Load + chunk
