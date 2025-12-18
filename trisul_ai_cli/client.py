@@ -1,10 +1,12 @@
+import warnings
+warnings.filterwarnings("ignore",category=FutureWarning,module="google.api_core")
+
 import asyncio
 import json
 from contextlib import AsyncExitStack
 from typing import Any, Dict, List
 import nest_asyncio
 import sys
-import httpx
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 import logging
@@ -16,6 +18,10 @@ from importlib.metadata import version
 import re
 import subprocess
 from trisul_ai_cli.tools.utils import TrisulAIUtils
+from trisul_ai_cli.llm_factory import LLMFactory
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
+import json
+import stdiomask
 
 
 
@@ -32,6 +38,9 @@ class TrisulAIClient:
             level=logging.INFO,
             format="%(asctime)s - %(levelname)s - %(message)s"
         )
+        
+        
+        # Initialize utils
         self.utils = TrisulAIUtils(logging=logging)
         
         # Initialize MCP session
@@ -41,12 +50,10 @@ class TrisulAIClient:
         self.write = None
         
         # Initialize Global variables
-        self.GEMINI_MODEL = "gemini-2.5-flash"
-        self.GEMINI_API_KEY = None
-        self.GEMINI_URL = None
-        self.existing_ai_memory = []
         self.root_dir = Path(__file__).resolve().parent
         self.env_path = self.root_dir / ".env"
+        self.llm_factory = LLMFactory(env_path=self.env_path, logging=logging)
+        self.existing_ai_memory = []
         self.memory_json_path = self.root_dir / "trisul_ai_memory.json"
         with open(self.memory_json_path, "r") as file:
             self.existing_ai_memory = json.load(file)
@@ -65,33 +72,42 @@ class TrisulAIClient:
         )
     
         self.conversation_history = [
-            {
-                "role": "user",
-                "parts": [
-                    {
-                        "text": main_system_prompt
-                    }
-                ]
-            }
+            SystemMessage(content=main_system_prompt)
         ]
 
 
 
     # Set your API key here
-    def set_api_key(self):
+    def set_api_key(self, provider_type: str = "llm"):
         try:
             print("\033[F\033[K", end="")
+            
+            if provider_type == "llm":
+                provider = self.llm_factory.get_current_provider()
+            elif provider_type == "embedding":
+                provider = self.llm_factory.get_current_embedding_provider()
+                if not provider:
+                    print("\n🤖 (Bot) : No embedding provider set. Please select an embedding model first.")
+                    return
+            else:
+                logging.error(f"[Client] Invalid provider type: {provider_type}")
+                return
+
             while True:
-                api_key = input("\n🤖 (Bot) : Enter your Gemini API Key : ").strip()
+                api_key = stdiomask.getpass(f"\n🤖 (Bot) : Enter your {provider.capitalize()} API Key ({provider_type}): ").strip()
                 if api_key:
                     break
-                print("\n🤖 (Bot) : API key cannot be empty. Please try again.")
+            
             if not self.env_path.exists():
                 self.env_path.touch()
-            set_key(self.env_path, "TRISUL_GEMINI_API_KEY", api_key)
-            self.get_api_key()
+            
+            if provider_type == "llm":
+                self.llm_factory.set_api_key(api_key)
+            else:
+                self.llm_factory.set_api_key_for_provider(provider, api_key)
+                
             print("")
-            logging.info("[Client] API Key set successfully.")
+            logging.info(f"[Client] API Key set successfully for {provider} ({provider_type}).")
             
         except KeyboardInterrupt:
             print("\n\n🤖 (Bot) : API Key entry cancelled by user.\n")
@@ -101,63 +117,148 @@ class TrisulAIClient:
 
     # Get your API key here
     def get_api_key(self) -> str:
-        config = dotenv_values(self.env_path)
-        self.GEMINI_API_KEY = config.get("TRISUL_GEMINI_API_KEY")
-        self.GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{self.GEMINI_MODEL}:generateContent?key={self.GEMINI_API_KEY}"
-        
-        if not self.GEMINI_API_KEY:
-            self.set_api_key()
-
-
-    # Get your model version here
-    def get_model_version(self):
-        config = dotenv_values(self.env_path)
-        gemini_version = config.get("TRISUL_GEMINI_MODEL")
-        if gemini_version:
-            self.GEMINI_MODEL = gemini_version
-            self.GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{self.GEMINI_MODEL}:generateContent?key={self.GEMINI_API_KEY}"
+        api_key = self.llm_factory.get_current_api_key()
+        if not api_key:
+            # If the model is not configured in the environment, force model selection.
+            if not self.llm_factory.config.get("TRISUL_AI_MODEL"):
+                print("\n🎉 Welcome to Trisul AI CLI — turn raw network data into answers using plain English.\n")
+                self.set_llm_model()
+            else:
+                self.set_api_key()
 
 
 
-    # Change the Gemini model version
-    def set_model_version(self):        
+    # Change the LLM model version
+    def set_llm_model(self):
         try:
-            model_versions = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-2.0-flash-lite"]
-            
-            print("\033[F\033[K", end="")
-            print("\n🤖 (Bot) : Select a Gemini model version from the list below: \n")
+            # Retrieve the full mapping of providers to models
+            all_models = self.llm_factory.get_all_models()
+            # Flatten into a list of (provider, model) tuples for display
+            flat_list = []
+            for provider, models_dict in all_models.items():
+                for model in models_dict.get("llm", []):
+                    flat_list.append((provider, model))
 
-            print("Available Gemini Models 📜\n---------------------------")
-            for idx, version in enumerate(model_versions, start=1):
-                print(f"{idx}) {version} {' (current version)' if version == self.GEMINI_MODEL else ''}")
+            current_provider = self.llm_factory.get_current_provider()
+            current_model = self.llm_factory.get_current_model()
 
-            selected_model = self.GEMINI_MODEL
+            # Display the list with indices
+            print("\n🤖 (Bot) : Select an LLM model from the list below (provider:model): \n")
+            for idx, (prov, mdl) in enumerate(flat_list, start=1):
+                current_marker = ''
+                if prov == current_provider and mdl == current_model:
+                    current_marker = ' (current)'
+                print(f"{idx}) {prov}:{mdl}{current_marker}")
+
+            selected_index = None
             while True:
-                choice = input("\n🤖 (Bot) : Enter your choice (1-5): ").strip()
-
+                choice = input(f"\n🤖 (Bot) : Enter your choice (1-{len(flat_list)}): ").strip()
                 if not choice.isdigit():
-                    print("\n🤖 (Bot) : ❌ Invalid choice. Try again.")
+                    print("\n🤖 (Bot) : ❌ Invalid choice. Please enter a number.")
                     continue
-
                 idx = int(choice)
-                if 1 <= idx <= len(model_versions):
-                    selected_model = model_versions[idx - 1]
-                    self.GEMINI_MODEL = selected_model
-                    
-                    set_key(self.env_path, "TRISUL_GEMINI_MODEL", self.GEMINI_MODEL)
-                    self.get_model_version()
-                    logging.info(f"[Client] Model version changed to: {self.GEMINI_MODEL}")
+                if 1 <= idx <= len(flat_list):
+                    selected_index = idx - 1
                     break
+                else:
+                    print("\n🤖 (Bot) : ❌ Choice out of range. Try again.")
 
-                print("\n🤖 (Bot) : ❌ Invalid choice. Try again.")
+            selected_provider, selected_model = flat_list[selected_index]
+            # Use the new factory method to set both provider and model
+            embedding_set = self.llm_factory.set_model_by_name(selected_model)
+            logging.info(f"[Client] Model set to {selected_model} with provider {selected_provider}")
             
-            print("")
+            # Ensure API key for the selected provider is set
+            if not self.llm_factory.get_current_api_key():
+                print(f"\n🤖 (Bot) : API Key for {selected_provider} is missing.")
+                self.set_api_key(provider_type="llm")
+            
+            # Handle Embedding Model Notification
+            if not embedding_set:
+                # Check if we have a valid embedding model set
+                if not self.llm_factory.get_current_embedding_provider():
+                     print(f"\n🤖 (Bot) : Note: No embedding model is currently set. You may want to run 'change_embedding_model'.")
+            else:
+                 print(f"\n🤖 (Bot) : Embedding model automatically updated to match {selected_provider}.")
+
+            # Ensure API key for embedding provider is set if we have one
+            emb_provider = self.llm_factory.get_current_embedding_provider()
+            if emb_provider and not self.llm_factory.get_current_embedding_api_key():
+                print(f"\n🤖 (Bot) : API Key for embedding provider '{emb_provider}' is missing.")
+                self.set_api_key(provider_type="embedding")
+
             return selected_model
-        
         except KeyboardInterrupt:
-            print("\n\n🤖 (Bot) : Model Selection cancelled by user.\n")
+            print("\n\n🤖 (Bot) : Model Selection cancelled by user.")
             logging.info("[Client] Model Selection cancelled by user.")
             sys.exit(0)
+
+    # Change the Embedding model version
+    def set_embedding_model(self):
+        try:
+            embedding_models = self.llm_factory.get_all_embedding_models()
+            
+            current_emb_model = self.llm_factory.embedding_model
+            
+            print("\n🤖 (Bot) : Select an Embedding model from the list below (provider:model): \n")
+            for idx, (prov, mdl) in enumerate(embedding_models, start=1):
+                current_marker = ''
+                if mdl == current_emb_model:
+                    current_marker = ' (current)'
+                print(f"{idx}) {prov}:{mdl}{current_marker}")
+            
+            selected_emb_index = None
+            while True:
+                choice = input(f"\n🤖 (Bot) : Enter your choice (1-{len(embedding_models)}): ").strip()
+                if not choice.isdigit():
+                    print("\n🤖 (Bot) : ❌ Invalid choice. Please enter a number.")
+                    continue
+                idx = int(choice)
+                if 1 <= idx <= len(embedding_models):
+                    selected_emb_index = idx - 1
+                    break
+                else:
+                    print("\n🤖 (Bot) : ❌ Choice out of range. Try again.")
+            
+            emb_prov, emb_model = embedding_models[selected_emb_index]
+            self.llm_factory.set_embedding_model(emb_model)
+            print(f"🤖 (Bot) : Embedding model set to {emb_model} ({emb_prov})")
+
+            # Ensure API key for embedding provider is set
+            if not self.llm_factory.get_current_embedding_api_key():
+                print(f"\n🤖 (Bot) : API Key for embedding provider '{emb_prov}' is missing.")
+                self.set_api_key(provider_type="embedding")
+                
+            return emb_model
+
+        except KeyboardInterrupt:
+            print("\n\n🤖 (Bot) : Embedding Model Selection cancelled by user.")
+            logging.info("[Client] Embedding Model Selection cancelled by user.")
+            sys.exit(0)
+
+    def get_current_model_status(self) -> dict:
+        env_file = Path(self.env_path)
+        if not env_file.exists():
+            raise FileNotFoundError(f"{self.env_path} not found")
+
+        result = {}
+
+        with env_file.open("r") as f:
+            for line in f:
+                line = line.strip()
+
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                value = value.strip().strip("'").strip('"')
+
+                if "API_KEY" in key:
+                    result[key] = "*****"
+                else:
+                    result[key] = value
+
+        return result
 
 
 
@@ -180,157 +281,62 @@ class TrisulAIClient:
         tools_result = await self.session.list_tools()
         tool_list = []
         for tool in tools_result.tools:
-            # Convert MCP tool schema to Gemini function declaration format
+            # Convert to OpenAI function format which is widely supported by LangChain bind_tools
             tool_list.append({
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": tool.inputSchema,
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.inputSchema,
+                }
             })
-
         return tool_list
 
 
-
-    async def call_gemini_rest(self) -> Dict:
-        """Send a query to Gemini REST API with tools."""
-        tools = await self.get_mcp_tools()
+    def extract_message(self, e):
+        s = str(e)
+        m = re.search(r'message["\']?\s*[:=]\s*["\']?([^,"\}\]]+)', s)
+        if m:
+            return m.group(1).strip()
         
-        # Build conversation contents
-
-        # Convert MCP tools to Gemini function declarations
-        function_declarations = []
-        for tool in tools:
-            function_declarations.append({
-                "name": tool["name"],
-                "description": tool["description"],
-                "parameters": tool["parameters"]
-            })
-
-        payload = {
-            "contents": self.conversation_history,
-            "tools": [{"functionDeclarations": function_declarations}] if function_declarations else [],
-            "toolConfig": {
-                "functionCallingConfig": {
-                    "mode": "AUTO"
-                }
-            }
-        }
-
-        # Use only URL parameter authentication (remove Authorization header)
-        headers = {
-            "Content-Type": "application/json",
-        }
-
-        logging.info(f"[Client] Sending request to Gemini at {self.GEMINI_URL.split('?')[0]}.")
-
-        max_retries = 5
-        retry_count = 0
-        base_delay = 2  # Start with 2 seconds
-        
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            while retry_count < max_retries:
-                resp = await client.post(self.GEMINI_URL, headers=headers, json=payload)
-                
-                # Handle model overload (503) - retry with exponential backoff
-                if resp.status_code == 503:
-                    retry_count += 1
-                    if retry_count < max_retries:
-                        delay = base_delay * (2 ** (retry_count - 1))  # Exponential backoff: 2, 4, 8, 16 seconds
-                        logging.warning(f"[Client] Model overloaded (503). Retry {retry_count}/{max_retries} after {delay}s...")
-                        await asyncio.sleep(delay)
-                        continue
-                    else:
-                        # Max retries reached
-                        logging.error(f"[Client] Model overloaded after {max_retries} attempts. Giving up.")
-                        logging.error(resp.json())
-                        sys.stdout.write("\033[F")
-                        print(f"\n🤖 (Bot) : Model is overloaded. Please try again later.\n\n")
-                        sys.exit()
-                
-                # Handle other errors
-                if resp.status_code != 200:
-                    logging.error(resp.json())
-                    logging.info(f"[Client] Full Conversation History: \n{json.dumps(self.conversation_history[2:], indent=2)}")
-                    
-                    # Remove the last loading line from console 
-                    sys.stdout.write("\033[F")
-                    
-                    # print the error message from Gemini
-                    print(f"\n🤖 (Bot) : {resp.json()['error']['message']}\n\n")
-                    sys.exit()
-                
-                # Success - break out of retry loop
-                break
-                
-            return resp.json()
+        return s
 
 
 
     async def process_query(self, query: str) -> str:
-        """Process a query using Gemini REST API and MCP tools."""
+        """Process a query using LangChain and MCP tools."""
         
-        self.conversation_history.append({
-            "role": "user", 
-            "parts": [{"text": query}]
-        })
+        self.conversation_history.append(HumanMessage(content=query))
 
-        # Keep calling Gemini until no more function calls are needed
+        llm = self.llm_factory.get_llm()
+        if not llm:
+             return "Error: API Key not set or LLM not initialized."
+
+        tools = await self.get_mcp_tools()
+        llm_with_tools = llm.bind_tools(tools)
+
         iteration = 0
         
         while iteration < self.max_iterations:
             iteration += 1
             
-            # Call Gemini
-            gemini_response = await self.call_gemini_rest()
+            try:
+                response = await llm_with_tools.ainvoke(self.conversation_history)
+            except Exception as e:
+                logging.error(f"[Client] LLM Error: {e}")
+                msg = self.extract_message(str(e))
+                return f"Error communicating with LLM: {msg}"
             
-            if not gemini_response.get("candidates"):
-                return "No response from Gemini"
-                        
-            candidate = gemini_response["candidates"][0]
-            content = candidate.get("content", {})
-            parts = content.get("parts", [])
+            self.conversation_history.append(response)
             
+            if not response.tool_calls:
+                return response.content
             
-            if not parts:
-                logging.warning("[Client] Empty model response detected")
-                # Force Gemini to continue
-                self.conversation_history.append({
-                    "role": "user",
-                    "parts": [{
-                        "text": "Please provide a summary of the data and complete the chart generation or call the next tool to continue if requested."
-                    }]
-                })
-                continue 
-            
-            
-            # Add Gemini's response to conversation history
-            self.conversation_history.append({
-                "role": "model",
-                "parts": parts
-            })
-            
-            # Check if Gemini wants to call any functions
-            function_calls = [part for part in parts if "functionCall" in part]
-            
-            if not function_calls:
-                # No more function calls - return the text response
-                text_parts = [part["text"] for part in parts if "text" in part]
-                final_text = " ".join(text_parts) if text_parts else "No text response\n"
-                logging.info(f"[Client] Final response after {iteration} iterations:")
-                return final_text
-
-            
-            self.conversation_history.append({
-                "role": "function",
-                "parts": []
-            })
-            
-            
-            # Process each function call in this response
-            for func_call_part in function_calls:
-                func_call = func_call_part["functionCall"]
-                function_name = func_call["name"]
-                function_args = func_call.get("args", {})
+            # Process tool calls
+            for tool_call in response.tool_calls:
+                function_name = tool_call["name"]
+                function_args = tool_call["args"]
+                tool_call_id = tool_call["id"]
                 
                 logging.info(f"[Client] Calling function: {function_name} with args: {function_args}")
                 
@@ -341,86 +347,77 @@ class TrisulAIClient:
                     clean_result = tool_result.replace("\n", "").replace("\r", "").replace("\t", " ").replace("   ", "")
                     logging.info(f"[Client] Function result: {clean_result}")
                     
+                    # Parse JSON if possible for side effects
+                    json_result = None
+                    try:
+                        json_result = json.loads(clean_result)
+                    except Exception:
+                        pass
                     
-                    if isinstance(clean_result, str):
-                        try:
-                            clean_result = json.loads(clean_result)
-                        except Exception:
-                            pass
-                    
-                    # Handle line chart display if needed
-                    if(function_name == "show_line_chart"):
-                        if(clean_result['status'] == "success"):
-                            if(clean_result['file_path']):
-                                await self.utils.display_line_chart(function_args["data"], clean_result['file_path'])
+                    # Handle side effects
+                    if function_name == "show_line_chart":
+                        if json_result and json_result.get('status') == "success":
+                            if json_result.get('file_path'):
+                                await self.utils.display_line_chart(function_args.get("data"), json_result['file_path'])
                             else:
-                                self.line_chart_data = function_args["data"]
+                                self.line_chart_data = function_args.get("data")
                         else:
-                            logging.warning(f"[Client] [process_query] {clean_result['message']}")
-                    
-                    
-                    # Handle pie chart display if needed
-                    if(function_name == "show_pie_chart"):
-                        if(clean_result['status'] == "success"):
-                            if(clean_result['file_path']):
-                                await self.utils.display_pie_chart(function_args["data"], clean_result['file_path'])
+                            logging.warning(f"[Client] [process_query] {json_result.get('message') if json_result else tool_result}")
+
+                    if function_name == "show_pie_chart":
+                        if json_result and json_result.get('status') == "success":
+                            if json_result.get('file_path'):
+                                await self.utils.display_pie_chart(function_args.get("data"), json_result['file_path'])
                             else:
-                                self.pie_chart_data = function_args["data"]
+                                self.pie_chart_data = function_args.get("data")
                         else:
-                            logging.warning(f"[Client] [process_query] {clean_result['message']}")
-                            
-                    
-                    # Handle report path if needed
-                    if(function_name == "generate_trisul_report"):
-                        if(clean_result['status'] == "success"):
-                            self.report_path = clean_result['file_path']
+                            logging.warning(f"[Client] [process_query] {json_result.get('message') if json_result else tool_result}")
+
+                    if function_name == "generate_trisul_report":
+                        if json_result and json_result.get('status') == "success":
+                            self.report_path = json_result.get('file_path')
                         else:
-                            logging.warning(f"[Client] [process_query] {clean_result['message']}")
-                        
+                            logging.warning(f"[Client] [process_query] {json_result.get('message') if json_result else tool_result}")
 
-                    # Handle model version change
-                    if(function_name == "manage_ai_model_version"):
-                        new_model = self.set_model_version()
-                        tool_result = {'status': 'success', 'message': f'The AI model version has been changed to {new_model}.'}
+                    if function_name == "configure_llm_model":
+                        print("\033[F\033[K", end="")
+                        new_model = self.set_llm_model()
+                        tool_result = f'The LLM model version has been changed to {new_model}.'
+
+                    if function_name == "configure_embedding_model":
+                        print("\033[F\033[K", end="")
+                        new_model = self.set_embedding_model()
+                        tool_result = f'The Embedding model version has been changed to {new_model}.'
+
+                    if function_name == "configure_llm_api_key":
+                        self.set_api_key(provider_type="llm")
+                        tool_result = "LLM API Key updated."
+
+                    if function_name == "configure_embedding_api_key":
+                        self.set_api_key(provider_type="embedding")
+                        tool_result = "Embedding API Key updated."
+
+                    if function_name == "get_current_model_status":
+                        tool_result = self.get_current_model_status()
                     
-
-                    # Handle API key change
-                    if(function_name == "change_api_key"):
-                        self.set_api_key()
-
-
-
-                    # Add function result to conversation
-                    self.conversation_history[-1]["parts"].append({
-                        "functionResponse": {
-                            "name": function_name,
-                            "response": {"result": tool_result}
-                        }
-                    })
+                    # Add tool output to history
+                    self.conversation_history.append(ToolMessage(
+                        content=tool_result,
+                        tool_call_id=tool_call_id,
+                        name=function_name
+                    ))
                     
                 except Exception as e:
                     logging.error(f"[Client] Error calling function {function_name}: {e}")
-                    # Add error result to conversation
-                    self.conversation_history.append({
-                        "role": "function",
-                        "parts": [{
-                            "functionResponse": {
-                                "name": function_name,
-                                "response": {"error": str(e)}
-                            }
-                        }]
-                    })
+                    self.conversation_history.append(ToolMessage(
+                        content=f"Error: {str(e)}",
+                        tool_call_id=tool_call_id,
+                        name=function_name
+                    ))
             
-            # Continue the loop to call Gemini again with the function results
+            # Loop continues to send tool outputs back to LLM
         
-        # If we hit max iterations, return what we have
-        logging.info(f"[Client] Reached maximum iterations ({self.max_iterations}). Returning last response.")
-        if self.conversation_history and self.conversation_history[-1]["role"] == "model":
-            last_parts = self.conversation_history[-1]["parts"]
-            text_parts = [part["text"] for part in last_parts if "text" in part]
-            return " ".join(text_parts) if text_parts else "Reached max iterations without final text response"
-        
-        return "Reached max iterations without response"
+        return "Reached max iterations without final response"
 
 
 
@@ -431,13 +428,11 @@ class TrisulAIClient:
         
         filtered_conversation = []
 
-        for item in self.conversation_history:
-            role = item.get("role")
-            parts = item.get("parts", [])
-            for part in parts:
-                text = part.get("text")
-                if text and role in ["user", "model"]:
-                    filtered_conversation.append({role: text})
+        for msg in self.conversation_history:
+            if isinstance(msg, HumanMessage):
+                filtered_conversation.append({"user": msg.content})
+            elif isinstance(msg, AIMessage):
+                filtered_conversation.append({"model": msg.content})
 
 
         # Load update memory system prompt
@@ -449,33 +444,27 @@ class TrisulAIClient:
             filtered_conversation=filtered_conversation
         )
 
-        headers = {"Content-Type": "application/json"}
-        chat_history = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [
-                        {"text": update_memory_system_prompt}
-                    ]
-                }
-            ]
-        }
+        llm = self.llm_factory.get_llm()
+        if not llm:
+             logging.error("[Client] [ai_memory] LLM not initialized")
+             return
 
-        timeout = httpx.Timeout(120.0, connect=10.0)
-        
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            logging.info("[Client] [ai_memory] Sending update request to Gemini.")
-            resp = await client.post(self.GEMINI_URL, headers=headers, json=chat_history)
-            resp = resp.json()
-            new_ai_memory = resp["candidates"][0]["content"]["parts"][0]["text"]
-            new_ai_memory = json.loads(re.sub(r'```json|```', '', new_ai_memory).strip())
-            logging.info("[Client] [ai_memory] Received updated memory from Gemini")
+        try:
+            logging.info("[Client] [ai_memory] Sending update request to LLM.")
+            response = await llm.ainvoke([HumanMessage(content=update_memory_system_prompt)])
+            new_ai_memory_text = response.content
+            
+            new_ai_memory = json.loads(re.sub(r'```json|```', '', new_ai_memory_text).strip())
+            logging.info("[Client] [ai_memory] Received updated memory from LLM")
             
             
             with open(self.memory_json_path, "w") as file:
                 json.dump(new_ai_memory, file, indent=4)
             
             logging.info(f"[Client] [ai_memory] New memory updated : \n {new_ai_memory}")
+            
+        except Exception as e:
+            logging.error(f"[Client] [ai_memory] Error updating memory: {e}")
 
 
 
@@ -502,9 +491,8 @@ class TrisulAIClient:
 
 
     async def main(self):
+        # Connect to server
         await self.connect_to_server("trisul_ai_cli.server")
-        self.get_api_key()
-        self.get_model_version()
 
         print("\033[1;36m" + "╔══════════════════════════════════════════════════════════════╗")
         print("║  🚀  Trisul AI CLI - Because your network should talk back.  ║")
@@ -513,6 +501,9 @@ class TrisulAIClient:
         print("║                                                              ║")
         print(f"║  📦  Version: {version('trisul_ai_cli')}                                          ║")
         print("╚══════════════════════════════════════════════════════════════╝" + "\033[0m")
+        
+        # verify model and api key
+        self.get_api_key()
         
         try:
             while True:
@@ -536,15 +527,26 @@ class TrisulAIClient:
                     break
 
                 
-                # change the api key
-                if query.lower() == "change_api_key":
-                    self.set_api_key()
+                # change the llm api key
+                if query.lower() == "change_llm_api_key":
+                    self.set_api_key(provider_type="llm")
+                    continue
+
+                # change the embedding api key
+                if query.lower() == "change_embedding_api_key":
+                    self.set_api_key(provider_type="embedding")
                     continue
                 
-                # change model version
-                if query.lower() == "change_model":
-                    new_model = self.set_model_version()
-                    print(f"🤖 (Bot) : Model version changed to {new_model}\n")
+                # change llm model
+                if query.lower() == "change_llm_model":
+                    new_model = self.set_llm_model()
+                    print(f"🤖 (Bot) : LLM Model changed to {new_model}\n")
+                    continue
+
+                # change embedding model
+                if query.lower() == "change_embedding_model":
+                    new_model = self.set_embedding_model()
+                    print(f"🤖 (Bot) : Embedding Model changed to {new_model}\n")
                     continue
                 
                 try:
@@ -554,7 +556,7 @@ class TrisulAIClient:
                     response = await task
                     await spinner
                     
-                    logging.info(f"[Client] Full Conversation History: \n{json.dumps(self.conversation_history[2:], indent=2)}")
+                    logging.info(f"[Client] Full Conversation History: \n{self.conversation_history[1:]}")
                     logging.info(f"[Client] Response: \n{response}")
                     print(f"\n🤖 (Bot) : {response.strip()}\n")
                     
@@ -584,7 +586,7 @@ class TrisulAIClient:
                     logging.info("[Client] Exiting gracefully...")
                     await asyncio.sleep(0.5)
                     print()
-                    print(f"\n🤖 (Bot) : {e}")
+                    print(f"\n🤖 (Bot) : {self.extract_message(str(e))}")
                     print("\n👋 Exiting gracefully...")
                     sys.exit(0)
 

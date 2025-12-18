@@ -23,6 +23,11 @@ from reportlab.lib.styles import getSampleStyleSheet
 import os
 import ast
 from trisul_ai_cli.tools.json_to_toon_converter import json_to_toon
+import json
+from typing import List
+from dotenv import dotenv_values
+from pathlib import Path
+from trisul_ai_cli.llm_factory import LLMFactory
 
 
 logging.basicConfig(
@@ -545,14 +550,14 @@ def get_alerts_data(
     destination_port: str = None,
     any_ip: str = None,
     any_port: str = None,
-    ip_pair: list = None,
+    ip_pair: List[str] = None,
     sigid: str = None,
     classification: str = None,
     priority: str = None,
     aux_message1: str = None,
     aux_message2: str = None,
     message_regex: str = None,
-    idlist: list = None
+    idlist: List[str] = None
 ):
     """
     Retrieve alert telemetry from Trisul using QUERY_ALERTS_REQUEST.
@@ -708,7 +713,7 @@ def get_flows_or_sessions_data(
         dest_port: str = None,
         any_ip: str = None,
         any_port: str = None,
-        ip_pair: list = None,
+        ip_pair: List[str] = None,
         protocol: str = None,
         flowtag: str = None,
         nf_routerid: str = None,
@@ -720,7 +725,7 @@ def get_flows_or_sessions_data(
         volume_filter: int = 0,
         resolve_keys: bool = True,
         outputpath: str = None,
-        idlist: list = None,
+        idlist: List[str] = None,
         any_nf_ifindex: str = None,
         duration_secs: int = 60,
         start_ts: int = None,
@@ -1013,25 +1018,20 @@ def rag_query(question: str):
         logging.info(f"[rag_query] Starting RAG query for question: {question}")
         
         # Embed query
-        logging.info("[rag_query] Initializing Gemini API for embedding")
+        # Embed query
+        logging.info("[rag_query] Initializing Embedding Model via LLMFactory")
         try:
-            # getting the api key
-            from dotenv import dotenv_values
-            from pathlib import Path
             env_path = Path(__file__).resolve().parent / ".env"
-            config = dotenv_values(env_path)
-            GEMINI_API_KEY = config.get("TRISUL_GEMINI_API_KEY")
+            factory = LLMFactory(env_path=env_path, logging=logging)
+            embedding_model = factory.get_embedding_llm()
             
-            genai.configure(api_key=GEMINI_API_KEY)
-            logging.info("[rag_query] Gemini API configured")
-            
-            logging.info("[rag_query] Generating embedding for question")
-            resp = genai.embed_content(model="models/gemini-embedding-001", content=question)
-            q_emb = resp['embedding']
+            if not embedding_model:
+                 return "Error: Embedding model not configured or API key missing. Please configure it using the CLI."
+
+            logging.info(f"[rag_query] Generating embedding for question using {factory.embedding_model}")
+            q_emb = embedding_model.embed_query(question)
             logging.info(f"[rag_query] Embedding generated successfully, dimension: {len(q_emb)}")
-        except KeyError as e:
-            logging.error(f"[rag_query] Missing key in embedding response: {str(e)}")
-            return f"Error: Failed to generate embedding - {str(e)}"
+            
         except Exception as e:
             logging.error(f"[rag_query] Error generating embedding: {str(e)}", exc_info=True)
             return f"Error: Failed to generate embedding - {str(e)}"
@@ -1221,8 +1221,6 @@ def show_pie_chart(data, save_image: bool = False):
         eval(str(v)) if isinstance(v, str) and "*" in v else v
         for v in data.get("volumes", [])
     ]
-
-
     
     if(save_image):
         file_path = f"/tmp/pie_chart_{int(datetime.now().timestamp())}_{random.randint(1000, 9999)}.png"
@@ -1435,41 +1433,69 @@ def generate_trisul_report(pages, filename: str, report_title: str, from_ts, to_
 # AI Config tools
 
 @mcp.tool()
-def manage_ai_model_version():
+def configure_llm_model():
     """
-    Manage and switch between different AI model versions or LLMs for Trisul AI integrations.
+    Manage and switch between different LLM models for Trisul AI integrations.
     Usage:
-        This tool allows administrators to manage and switch between different AI model versions
-        used in Trisul AI integrations. It provides functionalities to list available models,
-        set the active model version, and retrieve information about the current model in use.
+        This tool allows administrators to switch the LLM model used in Trisul AI.
     
     Returns:
-        str: Confirmation message about the model management action performed.
+        str: Confirmation message.
     """
+    logging.info(f"[configure_llm_model] Managing LLM model")
+    return {"status": "success", "message" : f"The LLM model has been changed successfully."}
+
+@mcp.tool()
+def configure_embedding_model():
+    """
+    Manage and switch between different Embedding models for Trisul AI integrations.
+    Usage:
+        This tool allows administrators to switch the Embedding model used in Trisul AI.
     
-    logging.info(f"[manage_ai_model_version] Managing AI model versions for Trisul AI integrations")
+    Returns:
+        str: Confirmation message.
+    """
+    logging.info(f"[configure_embedding_model] Managing Embedding model")
+    return {"status": "success", "message" : f"The Embedding model has been changed successfully."}
 
-    return {"status": "success", "message" : f"The AI model version has been changed successfully."}
+@mcp.tool()
+def configure_llm_api_key():
+    """
+    Change the API key for the current LLM provider.
+    Usage:
+        This tool allows administrators to update the API key for the active LLM provider.
 
+    Returns:
+        str: Confirmation message.
+    """
+    logging.info(f"[configure_llm_api_key] Changing LLM API key")
+    return {"status": "success", "message" : f"The LLM API key has been changed successfully."}
+
+@mcp.tool()
+def configure_embedding_api_key():
+    """
+    Change the API key for the current Embedding provider.
+    Usage:
+        This tool allows administrators to update the API key for the active Embedding provider.
+
+    Returns:
+        str: Confirmation message.
+    """
+    logging.info(f"[configure_embedding_api_key] Changing Embedding API key")
+    return {"status": "success", "message" : f"The Embedding API key has been changed successfully."}
 
 
 @mcp.tool()
-def change_api_key():
+def get_current_model_status():
     """
-        Change the API key used for AI model integrations in Trisul AI.
-        Usage:
-            This tool allows administrators to change the API key used for AI model integrations
-            in Trisul AI. It ensures that the new API key is securely updated and validated.
-
-        Returns:
-            str: Confirmation message about the API key change.
+    Get the current model status for Trisul AI integrations.
+    Usage:
+        This tool allows administrators to get the current LLM and Embedding model status.
+    Returns:
+        str: Current model status.
     """
-    
-    logging.info(f"[change_api_key] Changing the API key for AI model integrations in Trisul AI")
-    
-    return {"status": "success", "message" : f"The API key has been changed successfully."}
-
-
+    logging.info(f"[get_current_model_status] Getting current model status")
+    return {"status": "success", "message" : f"The current model status is --- ."}
 
 
 
