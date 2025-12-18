@@ -1,7 +1,7 @@
 import argparse
 import asyncio
 import sys
-from . import client
+from .client import TrisulAIClient
 from importlib.metadata import version
 
 
@@ -43,6 +43,7 @@ def cli_main():
 
     # Default behavior (no subcommand → start chat)
     if args.command is None:
+        client = TrisulAIClient()
         asyncio.run(client.main())
         return
 
