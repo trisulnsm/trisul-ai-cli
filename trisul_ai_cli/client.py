@@ -301,6 +301,20 @@ class TrisulAIClient:
         
         return s
 
+    def extract_text_from_content(self, content):
+        if isinstance(content, str):
+            return content
+        
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, dict) and 'text' in item:
+                    text_parts.append(item['text'])
+                else:
+                    text_parts.append(str(item))
+            return '\n'.join(text_parts)
+        
+        return str(content)
 
 
     async def process_query(self, query: str) -> str:
@@ -330,7 +344,9 @@ class TrisulAIClient:
             self.conversation_history.append(response)
             
             if not response.tool_calls:
-                return response.content
+                # Handle both string and list responses
+                content = self.extract_text_from_content(response.content)
+                return content
             
             # Process tool calls
             for tool_call in response.tool_calls:
@@ -432,7 +448,9 @@ class TrisulAIClient:
             if isinstance(msg, HumanMessage):
                 filtered_conversation.append({"user": msg.content})
             elif isinstance(msg, AIMessage):
-                filtered_conversation.append({"model": msg.content})
+                # Extract text from AIMessage content
+                content = self.extract_text_from_content(msg.content)
+                filtered_conversation.append({"model": content})
 
 
         # Load update memory system prompt
@@ -452,7 +470,9 @@ class TrisulAIClient:
         try:
             logging.info("[Client] [ai_memory] Sending update request to LLM.")
             response = await llm.ainvoke([HumanMessage(content=update_memory_system_prompt)])
-            new_ai_memory_text = response.content
+            
+            # Extract text from response content
+            new_ai_memory_text = self.extract_text_from_content(response.content)
             
             new_ai_memory = json.loads(re.sub(r'```json|```', '', new_ai_memory_text).strip())
             logging.info("[Client] [ai_memory] Received updated memory from LLM")

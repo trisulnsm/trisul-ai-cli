@@ -7,6 +7,7 @@ Spec reference: https://github.com/toon-format/spec
 from __future__ import annotations
 import re
 import math
+import json
 from typing import Any, Literal
 import ast
 
