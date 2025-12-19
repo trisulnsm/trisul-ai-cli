@@ -7,7 +7,6 @@ import zmq
 import datetime
 import sqlite3
 import uuid
-import google.generativeai as genai
 import chromadb
 from google.protobuf.json_format import MessageToDict
 import logging
