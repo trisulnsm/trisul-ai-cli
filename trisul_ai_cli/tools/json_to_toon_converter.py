@@ -1,9 +1,3 @@
-"""
-Production-grade JSON to TOON (Token-Oriented Object Notation) converter.
-TOON is a compact, human-readable serialization format designed for LLM inputs.
-Spec reference: https://github.com/toon-format/spec
-"""
-
 from __future__ import annotations
 import re
 import math
@@ -35,29 +29,7 @@ def json_to_toon(
     length_marker: bool = False,
     indent_size: int = 2,
 ) -> str:
-    """
-    Convert JSON-serializable data to TOON format.
 
-    Args:
-        data: JSON-serializable Python value (dict, list, str, int, float, bool, None)
-        delimiter: Value delimiter - comma (default), tab, or pipe
-        length_marker: If True, prefix array lengths with '#' (e.g., [#3] instead of [3])
-        indent_size: Number of spaces per indentation level
-
-    Returns:
-        TOON-formatted string
-
-    Raises:
-        ValueError: If data contains circular references or unsupported types
-
-    Examples:
-        >>> json_to_toon({"name": "Alice", "age": 30})
-        'name: Alice\\nage: 30'
-
-        >>> json_to_toon([{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}])
-        '[2]{id,name}:\\n1,Alice\\n2,Bob'
-    """
-    
     
     # parse when input is a string
     data = _parse_input(data)

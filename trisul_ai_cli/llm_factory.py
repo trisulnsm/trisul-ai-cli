@@ -127,11 +127,6 @@ class LLMFactory:
 
 
     def get_all_models(self):
-        """Return a dictionary mapping each provider to its list of supported models.
-
-        This allows callers to present a unified view of all available models across
-        providers without needing to know the current provider.
-        """
         self.logging.info("[LLMFactory] Retrieving all supported models across providers")
         return self.SUPPORTED_MODELS
 
@@ -143,13 +138,6 @@ class LLMFactory:
         return models
 
     def set_model_by_name(self, model_name: str):
-        """Set both the provider and model based on a model name.
-
-        The method searches through ``SUPPORTED_MODELS`` to find which provider
-        supports the supplied ``model_name``. If found, it updates the provider
-        (persisting to ``.env``) and the model accordingly. If the model is not
-        found, a ``ValueError`` is raised.
-        """
         # Find the provider that contains the model
         provider_found = None
         for prov, models_dict in self.SUPPORTED_MODELS.items():

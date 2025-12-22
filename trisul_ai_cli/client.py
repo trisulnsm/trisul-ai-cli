@@ -79,9 +79,7 @@ class TrisulAIClient:
 
     # Set your API key here
     def set_api_key(self, provider_type: str = "llm"):
-        try:
-            print("\033[F\033[K", end="")
-            
+        try:            
             if provider_type == "llm":
                 provider = self.llm_factory.get_current_provider()
             elif provider_type == "embedding":
@@ -106,7 +104,7 @@ class TrisulAIClient:
             else:
                 self.llm_factory.set_api_key_for_provider(provider, api_key)
                 
-            print("")
+            print(f"\n🤖 (Bot) : API Key for {provider} ({provider_type}) set successfully.")
             logging.info(f"[Client] API Key set successfully for {provider} ({provider_type}).")
             
         except KeyboardInterrupt:
@@ -187,6 +185,7 @@ class TrisulAIClient:
                 print(f"\n🤖 (Bot) : API Key for embedding provider '{emb_provider}' is missing.")
                 self.set_api_key(provider_type="embedding")
 
+            print(f"\n🤖 (Bot) : LLM Model changed to {selected_model} ({selected_provider})\n")
             return selected_model
         except KeyboardInterrupt:
             print("\n\n🤖 (Bot) : Model Selection cancelled by user.")
@@ -222,7 +221,7 @@ class TrisulAIClient:
             
             emb_prov, emb_model = embedding_models[selected_emb_index]
             self.llm_factory.set_embedding_model(emb_model)
-            print(f"🤖 (Bot) : Embedding model set to {emb_model} ({emb_prov})")
+            print(f"\n🤖 (Bot) : Embedding Model changed to {emb_model} ({emb_prov})\n")
 
             # Ensure API key for embedding provider is set
             if not self.llm_factory.get_current_embedding_api_key():
@@ -406,10 +405,12 @@ class TrisulAIClient:
                         tool_result = f'The Embedding model version has been changed to {new_model}.'
 
                     if function_name == "configure_llm_api_key":
+                        print("\033[F\033[K", end="")
                         self.set_api_key(provider_type="llm")
                         tool_result = "LLM API Key updated."
 
                     if function_name == "configure_embedding_api_key":
+                        print("\033[F\033[K", end="")
                         self.set_api_key(provider_type="embedding")
                         tool_result = "Embedding API Key updated."
 
@@ -506,7 +507,12 @@ class TrisulAIClient:
 
 
     async def cleanup(self):
-        await self.exit_stack.aclose()
+        try:
+            if self.exit_stack:
+                await self.exit_stack.aclose()
+        except Exception as e:
+            logging.error(f"[Client] Error during cleanup: {e}")
+        await asyncio.sleep(0.5)
 
 
 
@@ -559,14 +565,12 @@ class TrisulAIClient:
                 
                 # change llm model
                 if query.lower() == "change_llm_model":
-                    new_model = self.set_llm_model()
-                    print(f"🤖 (Bot) : LLM Model changed to {new_model}\n")
+                    self.set_llm_model()
                     continue
 
                 # change embedding model
                 if query.lower() == "change_embedding_model":
-                    new_model = self.set_embedding_model()
-                    print(f"🤖 (Bot) : Embedding Model changed to {new_model}\n")
+                    self.set_embedding_model()
                     continue
                 
                 try:
@@ -603,17 +607,14 @@ class TrisulAIClient:
                         
                 except Exception as e:
                     logging.error(f"[Client] Error: {e}")
-                    logging.info("[Client] Exiting gracefully...")
-                    await asyncio.sleep(0.5)
-                    print()
                     print(f"\n🤖 (Bot) : {self.extract_message(str(e))}")
                     print("\n👋 Exiting gracefully...")
-                    sys.exit(0)
+                    return
 
         except KeyboardInterrupt:
             logging.info("[Client] Exiting gracefully...")
             print("\n👋 Exiting gracefully...")
-            sys.exit(0)
+            return
 
         finally:
             # Always clean up async resources

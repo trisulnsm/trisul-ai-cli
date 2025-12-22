@@ -73,9 +73,18 @@ class TrisulAIUtils:
             scatter_points.append((line, timestamps, values))
 
         # Determine global scale for axis
+        if not all_values:
+            self.logging.warning("[Utils] [display_line_chart] No data points to plot.")
+            plt.close()
+            return
+
         max_val = max(all_values)
-        scaled_val, unit = self.bytes_to_human(max_val, as_string=False)
-        scale_factor = max_val / scaled_val  # bytes per displayed unit
+        if max_val == 0:
+            scale_factor = 1
+            unit = "B"
+        else:
+            scaled_val, unit = self.bytes_to_human(max_val, as_string=False)
+            scale_factor = max_val / scaled_val  # bytes per displayed unit
 
         # Apply formatter to y-axis
         ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y / scale_factor:.2f} {unit}"))
@@ -190,6 +199,10 @@ class TrisulAIUtils:
             self.logging.warning("[Utils] [display_pie_chart] All volume values are zero. Chart aborted.")
             return
 
+        if len(labels) != len(volumes):
+            self.logging.error("[Utils] [display_pie_chart] Labels and volumes length mismatch: %d != %d", len(labels), len(volumes))
+            return
+
         self.logging.info("[Utils] [display_pie_chart] Rendering chart: title='%s' total_items=%d total_volume=%s",
                     chart_title, len(volumes), self.bytes_to_human(total_volume))
 
@@ -197,7 +210,7 @@ class TrisulAIUtils:
         wedges, texts = ax.pie(
             volumes,
             labels=labels,
-            colors=colors,
+            colors=colors if colors else None,
             startangle=90,
             labeldistance=0.7,
             wedgeprops=dict(edgecolor='none')
