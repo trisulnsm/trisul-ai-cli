@@ -13,7 +13,10 @@ import logging
 from dotenv import set_key, dotenv_values
 from pathlib import Path
 import os
-import readline
+try:
+    import readline
+except ImportError:
+    pass
 from importlib.metadata import version
 import re
 import subprocess
@@ -30,7 +33,8 @@ class TrisulAIClient:
     def __init__(self):
         # Initialize asyncio
         nest_asyncio.apply()
-        os.environ["QT_QPA_PLATFORM"] = "xcb"
+        if os.name != "nt":
+            os.environ["QT_QPA_PLATFORM"] = "xcb"
         
         # Initialize logging
         logging.basicConfig(
@@ -55,7 +59,7 @@ class TrisulAIClient:
         self.llm_factory = LLMFactory(env_path=self.env_path, logging=logging)
         self.existing_ai_memory = []
         self.memory_json_path = self.root_dir / "trisul_ai_memory.json"
-        with open(self.memory_json_path, "r") as file:
+        with open(self.memory_json_path, "r", encoding="utf-8") as file:
             self.existing_ai_memory = json.load(file)
         self.confidence_threshold = 90
         self.line_chart_data = {}
@@ -66,7 +70,7 @@ class TrisulAIClient:
         
         # Load main system prompt
         system_prompt_path = self.root_dir / "prompts/system_main.txt"
-        template = system_prompt_path.read_text()
+        template = system_prompt_path.read_text(encoding="utf-8")
         main_system_prompt = template.format(
             existing_ai_memory=self.existing_ai_memory
         )
@@ -242,7 +246,7 @@ class TrisulAIClient:
 
         result = {}
 
-        with env_file.open("r") as f:
+        with env_file.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
 
@@ -263,7 +267,7 @@ class TrisulAIClient:
 
     async def connect_to_server(self, server_module: str = "trisul_ai_cli.server"):
         server_params = StdioServerParameters(
-            command="python3",
+            command=sys.executable,
             args=["-m", server_module],
         )
 
@@ -326,6 +330,7 @@ class TrisulAIClient:
              return "Error: API Key not set or LLM not initialized."
 
         tools = await self.get_mcp_tools()
+        logging.info(f"[Client] [process_query] Tools: {tools}")
         llm_with_tools = llm.bind_tools(tools)
 
         iteration = 0
@@ -456,7 +461,7 @@ class TrisulAIClient:
 
         # Load update memory system prompt
         system_prompt_path = self.root_dir / "prompts/system_memory_update.txt"
-        template = system_prompt_path.read_text()
+        template = system_prompt_path.read_text(encoding="utf-8")
         update_memory_system_prompt = template.format(
             confidence_threshold=self.confidence_threshold,
             existing_ai_memory=self.existing_ai_memory,
@@ -479,7 +484,7 @@ class TrisulAIClient:
             logging.info("[Client] [ai_memory] Received updated memory from LLM")
             
             
-            with open(self.memory_json_path, "w") as file:
+            with open(self.memory_json_path, "w", encoding="utf-8") as file:
                 json.dump(new_ai_memory, file, indent=4)
             
             logging.info(f"[Client] [ai_memory] New memory updated : \n {new_ai_memory}")
