@@ -66,6 +66,7 @@ class TrisulAIClient:
         self.pie_chart_data = {}
         self.report_path = None
         self.max_iterations = 15
+        self.sessions = {} # session_id -> conversation_history (list of Messages)
                 
         
         # Load main system prompt
@@ -440,6 +441,173 @@ class TrisulAIClient:
             # Loop continues to send tool outputs back to LLM
         
         return "Reached max iterations without final response"
+
+
+    async def process_query_api(self, query: str, system_prompt: str = None, session_id: str = None) -> dict:
+        """Process a query for the REST API. Returns structured JSON data.
+        
+        Does NOT call any interactive/terminal methods.
+        """
+        # Retrieve or create session history
+        if session_id and session_id in self.sessions:
+            history = self.sessions[session_id]
+        else:
+            if system_prompt:
+                base_prompt = system_prompt
+            else:
+                base_prompt = self.conversation_history[0].content
+            
+            # Append API-specific instructions to omit tables in Web UI mode
+            api_instructions = (
+                "\n\n### 🌐 WEB UI / API MODE INSTRUCTIONS\n"
+                "You are currently responding to a Web UI via API. In this mode:\n"
+                "1. **OMIT ALL MARKDOWN TABLES** from your final response. The UI prefers clean summaries and charts.\n"
+                "2. Focus on providing a concise textual summary and calling the appropriate chart tools (`show_line_chart` or `show_pie_chart`).\n"
+                "3. Ensure you still perform all necessary data calculations and grounding based on tool results, but do not display the intermediate table."
+            )
+            
+            history = [SystemMessage(content=base_prompt + api_instructions)]
+            
+            if session_id:
+                self.sessions[session_id] = history
+        
+        history.append(HumanMessage(content=query))
+
+        llm = self.llm_factory.get_llm()
+        if not llm:
+            return {
+                "status": "error",
+                "message": "LLM not initialized. Please set API key via CLI first.",
+                "answer": None,
+                "tool_calls": [],
+                "chart_data": None,
+            }
+
+        tools = await self.get_mcp_tools()
+        llm_with_tools = llm.bind_tools(tools)
+
+        iteration = 0
+        collected_tool_calls = []
+        chart_data = None
+
+        while iteration < self.max_iterations:
+            iteration += 1
+
+            try:
+                response = await llm_with_tools.ainvoke(history)
+            except Exception as e:
+                logging.error(f"[Client][API] LLM Error: {e}")
+                return {
+                    "status": "error",
+                    "message": self.extract_message(str(e)),
+                    "answer": None,
+                    "tool_calls": collected_tool_calls,
+                    "chart_data": chart_data,
+                }
+
+            history.append(response)
+
+            if not response.tool_calls:
+                answer = self.extract_text_from_content(response.content)
+                return {
+                    "status": "success",
+                    "answer": answer,
+                    "tool_calls": collected_tool_calls,
+                    "chart_data": chart_data,
+                }
+
+            # Process tool calls
+            for tool_call in response.tool_calls:
+                function_name = tool_call["name"]
+                function_args = tool_call["args"]
+                tool_call_id = tool_call["id"]
+
+                # Skip interactive-only tools in API mode
+                if function_name in (
+                    "configure_llm_model",
+                    "configure_embedding_model",
+                    "configure_llm_api_key",
+                    "configure_embedding_api_key",
+                ):
+                    tool_result = "This operation is only available in the CLI interface."
+                    history.append(ToolMessage(
+                        content=tool_result,
+                        tool_call_id=tool_call_id,
+                        name=function_name
+                    ))
+                    collected_tool_calls.append({
+                        "tool": function_name,
+                        "args": function_args,
+                        "result": {"message": tool_result},
+                    })
+                    continue
+
+                logging.info(f"[Client][API] Calling tool: {function_name} with args: {function_args}")
+
+                try:
+                    result = await self.session.call_tool(function_name, function_args)
+                    tool_result_text = result.content[0].text if result.content else "No result"
+
+                    # Try to parse JSON result
+                    try:
+                        tool_result_json = json.loads(tool_result_text)
+                    except Exception:
+                        tool_result_json = tool_result_text
+
+                    # Capture chart data for API consumers
+                    if function_name in ["show_line_chart", "show_pie_chart"]:
+                        chart_type = "line" if function_name == "show_line_chart" else "pie"
+                        raw_data = function_args.get("data")
+                        
+                        # If it's a string, try to parse it as JSON
+                        if isinstance(raw_data, str):
+                            try:
+                                parsed_data = json.loads(raw_data)
+                            except Exception:
+                                parsed_data = raw_data
+                        else:
+                            parsed_data = raw_data
+                            
+                        chart_data = {"type": chart_type, "data": parsed_data}
+
+                    # Handle get_current_model_status specially
+                    if function_name == "get_current_model_status":
+                        tool_result_json = self.get_current_model_status()
+                        tool_result_text = json.dumps(tool_result_json)
+
+                    collected_tool_calls.append({
+                        "tool": function_name,
+                        "args": function_args,
+                        "result": tool_result_json,
+                    })
+
+                    history.append(ToolMessage(
+                        content=tool_result_text,
+                        tool_call_id=tool_call_id,
+                        name=function_name
+                    ))
+
+                except Exception as e:
+                    logging.error(f"[Client][API] Error calling tool {function_name}: {e}")
+                    err_msg = str(e)
+                    collected_tool_calls.append({
+                        "tool": function_name,
+                        "args": function_args,
+                        "result": {"error": err_msg},
+                    })
+                    history.append(ToolMessage(
+                        content=f"Error: {err_msg}",
+                        tool_call_id=tool_call_id,
+                        name=function_name
+                    ))
+
+        return {
+            "status": "error",
+            "message": "Reached max iterations without a final response.",
+            "answer": None,
+            "tool_calls": collected_tool_calls,
+            "chart_data": chart_data,
+        }
 
 
 
