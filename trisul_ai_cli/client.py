@@ -40,7 +40,8 @@ class TrisulAIClient:
         logging.basicConfig(
             filename= Path(os.getcwd()) / "trisul_ai_cli.log",
             level=logging.INFO,
-            format="%(asctime)s - %(levelname)s - %(message)s"
+            format="%(asctime)s - %(levelname)s - %(message)s",
+            force=True
         )
         
         
@@ -62,10 +63,11 @@ class TrisulAIClient:
         with open(self.memory_json_path, "r", encoding="utf-8") as file:
             self.existing_ai_memory = json.load(file)
         self.confidence_threshold = 90
+        self.max_iterations = 15
         self.line_chart_data = {}
         self.pie_chart_data = {}
+        self.table_data = {}
         self.report_path = None
-        self.max_iterations = 15
         self.sessions = {} # session_id -> conversation_history (list of Messages)
                 
         
@@ -394,6 +396,12 @@ class TrisulAIClient:
                         else:
                             logging.warning(f"[Client] [process_query] {json_result.get('message') if json_result else tool_result}")
 
+                    if function_name == "show_table":
+                        if json_result and json_result.get('status') == "success":
+                            self.table_data = function_args.get("data")
+                        else:
+                            logging.warning(f"[Client] [process_query] {json_result.get('message') if json_result else tool_result}")
+
                     if function_name == "generate_trisul_report":
                         if json_result and json_result.get('status') == "success":
                             self.report_path = json_result.get('file_path')
@@ -448,22 +456,33 @@ class TrisulAIClient:
         
         Does NOT call any interactive/terminal methods.
         """
+        import time
+        start_time = time.time()
+        
         # Retrieve or create session history
         if session_id and session_id in self.sessions:
+            logging.info(f"[Client][API] [Session: {session_id}] Reusing existing session history.")
             history = self.sessions[session_id]
         else:
+            logging.info(f"[Client][API] [Session: {session_id}] Starting new session.")
             if system_prompt:
                 base_prompt = system_prompt
             else:
                 base_prompt = self.conversation_history[0].content
             
-            # Append API-specific instructions to omit tables in Web UI mode
+            logging.info(f"[Client][API] [Session: {session_id}] System Prompt: {base_prompt[:100]}...")
+            
+            # Append API-specific instructions to omit tables and pop-up mentions in Web UI mode
             api_instructions = (
                 "\n\n### 🌐 WEB UI / API MODE INSTRUCTIONS\n"
                 "You are currently responding to a Web UI via API. In this mode:\n"
-                "1. **OMIT ALL MARKDOWN TABLES** from your final response. The UI prefers clean summaries and charts.\n"
-                "2. Focus on providing a concise textual summary and calling the appropriate chart tools (`show_line_chart` or `show_pie_chart`).\n"
-                "3. Ensure you still perform all necessary data calculations and grounding based on tool results, but do not display the intermediate table."
+                "1. **STRICTLY OMIT ALL MARKDOWN/ASCII TABLES** from your final response text. The UI renders structured data natively via tools. Never display a table using text/pipes.\n"
+                "2. **NO POP-UP MENTIONS**: Never mention 'pop-up windows', 'new windows', or 'checking a pop-up'. The visualizations are rendered directly inside the chat interface.\n"
+                "3. **Tool Usage**: If the user asks for a 'table', 'toppers table', or similar tabular display, you **MUST** call the `show_table` tool. For charts, use `show_line_chart` or `show_pie_chart`.\n"
+                "4. **Conciseness**: Provide a brief, friendly textual summary and let the tools handle the data visualization. Do not repeat data that is already shown in the table/chart unless for highlighting a specific point.\n"
+                "5. **Ambiguous Matches**: For queries with multiple potential matches (e.g., 'Google', 'Shell', or ambiguous interface names), you **MUST** follow the **AUTO-SELECT AND SHOW TOP MATCH** workflow. Use the topper list to identify and display the most active candidate immediately, then list the other candidates as options. **Never ask for clarification as your first response if a topper query can resolve the ambiguity.**\n"
+                "6. **STRICT GROUNDING**: You are FORBIDDEN from suggesting matches or options based on your internal knowledge. Every option you present MUST have been returned by a `search_keys` call or in existing traffic data. If a tool returns no matches, do not invent any.\n"
+                "7. Ensure you still perform all necessary data calculations and grounding based on tool results."
             )
             
             history = [SystemMessage(content=base_prompt + api_instructions)]
@@ -471,6 +490,7 @@ class TrisulAIClient:
             if session_id:
                 self.sessions[session_id] = history
         
+        logging.info(f"[Client][API] [Session: {session_id}] User Query: {query}")
         history.append(HumanMessage(content=query))
 
         llm = self.llm_factory.get_llm()
@@ -489,9 +509,11 @@ class TrisulAIClient:
         iteration = 0
         collected_tool_calls = []
         chart_data = None
+        table_data = None
 
         while iteration < self.max_iterations:
             iteration += 1
+            logging.info(f"[Client][API] [Session: {session_id}] LLM iteration {iteration}...")
 
             try:
                 response = await llm_with_tools.ainvoke(history)
@@ -503,17 +525,21 @@ class TrisulAIClient:
                     "answer": None,
                     "tool_calls": collected_tool_calls,
                     "chart_data": chart_data,
+                    "table_data": table_data,
                 }
 
             history.append(response)
 
             if not response.tool_calls:
                 answer = self.extract_text_from_content(response.content)
+                elapsed = time.time() - start_time
+                logging.info(f"[Client][API] [Session: {session_id}] Final AI Response (took {elapsed:.2f}s): {answer}")
                 return {
                     "status": "success",
                     "answer": answer,
                     "tool_calls": collected_tool_calls,
                     "chart_data": chart_data,
+                    "table_data": table_data,
                 }
 
             # Process tool calls
@@ -530,6 +556,8 @@ class TrisulAIClient:
                     "configure_embedding_api_key",
                 ):
                     tool_result = "This operation is only available in the CLI interface."
+                    logging.info(f"[Client][API] [Session: {session_id}] Tool: {function_name} | Args: {json.dumps(function_args)}")
+                    logging.info(f"[Client][API] [Session: {session_id}] Tool: {function_name} | Output: {tool_result}")
                     history.append(ToolMessage(
                         content=tool_result,
                         tool_call_id=tool_call_id,
@@ -542,11 +570,12 @@ class TrisulAIClient:
                     })
                     continue
 
-                logging.info(f"[Client][API] Calling tool: {function_name} with args: {function_args}")
+                logging.info(f"[Client][API] [Session: {session_id}] Tool: {function_name} | Args: {json.dumps(function_args)}")
 
                 try:
                     result = await self.session.call_tool(function_name, function_args)
                     tool_result_text = result.content[0].text if result.content else "No result"
+                    logging.info(f"[Client][API] [Session: {session_id}] Tool: {function_name} | Output: {tool_result_text}")
 
                     # Try to parse JSON result
                     try:
@@ -569,6 +598,19 @@ class TrisulAIClient:
                             parsed_data = raw_data
                             
                         chart_data = {"type": chart_type, "data": parsed_data}
+                        logging.info(f"[Client][API] [Session: {session_id}] Captured {chart_type} chart data.")
+
+                    # Capture table data for API consumers
+                    if function_name == "show_table":
+                        raw_data = function_args.get("data")
+                        if isinstance(raw_data, str):
+                            try:
+                                table_data = json.loads(raw_data)
+                            except Exception:
+                                table_data = raw_data
+                        else:
+                            table_data = raw_data
+                        logging.info(f"[Client][API] [Session: {session_id}] Captured table data.")
 
                     # Handle get_current_model_status specially
                     if function_name == "get_current_model_status":
@@ -607,6 +649,7 @@ class TrisulAIClient:
             "answer": None,
             "tool_calls": collected_tool_calls,
             "chart_data": chart_data,
+            "table_data": table_data,
         }
 
 
@@ -765,6 +808,9 @@ class TrisulAIClient:
                     if(self.pie_chart_data):
                         await self.utils.display_pie_chart(self.pie_chart_data)
                         self.pie_chart_data = {}
+                    
+                    if(self.table_data):
+                        self.table_data = {}
                     
                     # If a report was prepared, display it and reset the report path
                     if(self.report_path):                    

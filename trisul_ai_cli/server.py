@@ -23,7 +23,7 @@ import os
 import ast
 from trisul_ai_cli.tools.json_to_toon_converter import json_to_toon
 import json
-from typing import List
+from typing import List, Any
 from dotenv import dotenv_values
 from pathlib import Path
 from trisul_ai_cli.llm_factory import LLMFactory
@@ -32,7 +32,8 @@ from trisul_ai_cli.llm_factory import LLMFactory
 logging.basicConfig(
     filename= Path(os.getcwd()) / "trisul_ai_cli.log",
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    force=True
 )
 
 
@@ -158,6 +159,7 @@ _RESPONSE_FIELD_MAP = {
     'COUNTER_ITEM_RESPONSE': 'counter_item_response',
     'QUERY_ALERTS_RESPONSE': 'query_alerts_response',
     'QUERY_SESSIONS_RESPONSE': 'query_sessions_response',
+    'SEARCH_KEYS_RESPONSE': 'search_keys_response',
 }
 
 def unwrap_response(data):
@@ -297,6 +299,7 @@ def get_cginfo_from_countergroup_name(countergroup_name: str, context: str = "co
         }
     """
     try:
+        countergroup_name = str(countergroup_name)
         if not zmq_endpoint:
             context = normalize_context(context)
             zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{context}/run/trp_0"
@@ -364,6 +367,10 @@ def get_counter_group_topper(counter_group_guid: str, meter: int = 0, duration_s
     socket = None
     
     try:
+        counter_group_guid = str(counter_group_guid)
+        meter = int(meter)
+        duration_secs = int(duration_secs)
+        max_count = int(max_count)
         if not zmq_endpoint:
             context = normalize_context(context)
             zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{context}/run/trp_0"
@@ -410,7 +417,7 @@ def get_counter_group_topper(counter_group_guid: str, meter: int = 0, duration_s
 
 
 @mcp.tool()
-def get_key_traffic_data(counter_group: str, readable: str = None, duration_secs: int = 3600, start_ts: int = None, end_ts: int = None, context: str = "context0", zmq_endpoint: str = None):
+def get_key_traffic_data(counter_group: str, readable: Any = None, duration_secs: int = 3600, start_ts: int = None, end_ts: int = None, context: str = "context0", zmq_endpoint: str = None):
     """
     Fetch the key traffic metrics for a given counter group and readable over the last `duration_secs` seconds.
     the duration_secs can be any value other than 0.
@@ -446,6 +453,16 @@ def get_key_traffic_data(counter_group: str, readable: str = None, duration_secs
     socket = None
     
     try:        
+        counter_group = str(counter_group)
+        if readable:
+            readable = str(readable)
+        if duration_secs is not None:
+            duration_secs = int(duration_secs)
+        if start_ts is not None:
+            start_ts = int(start_ts)
+        if end_ts is not None:
+            end_ts = int(end_ts)
+        
         if not zmq_endpoint:
             context = normalize_context(context)
             zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{context}/run/trp_0"
@@ -543,19 +560,19 @@ def get_alerts_data(
     group_by_fieldname: str = None,
     resolve_keys: bool = True,
     approx_count_only: bool = False,
-    source_ip: str = None,
-    destination_ip: str = None,
-    source_port: str = None,
-    destination_port: str = None,
-    any_ip: str = None,
-    any_port: str = None,
+    source_ip: Any = None,
+    destination_ip: Any = None,
+    source_port: Any = None,
+    destination_port: Any = None,
+    any_ip: Any = None,
+    any_port: Any = None,
     ip_pair: List[str] = None,
-    sigid: str = None,
-    classification: str = None,
-    priority: str = None,
-    aux_message1: str = None,
-    aux_message2: str = None,
-    message_regex: str = None,
+    sigid: Any = None,
+    classification: Any = None,
+    priority: Any = None,
+    aux_message1: Any = None,
+    aux_message2: Any = None,
+    message_regex: Any = None,
     idlist: List[str] = None
 ):
     """
@@ -705,27 +722,27 @@ def get_alerts_data(
 @mcp.tool()
 def get_flows_or_sessions_data(
         session_group: str = "{99A78737-4B41-4387-8F31-8077DB917336}",
-        key: str = None,
-        source_ip: str = None,
-        source_port: str = None,
-        dest_ip: str = None,
-        dest_port: str = None,
-        any_ip: str = None,
-        any_port: str = None,
+        key: Any = None,
+        source_ip: Any = None,
+        source_port: Any = None,
+        dest_ip: Any = None,
+        dest_port: Any = None,
+        any_ip: Any = None,
+        any_port: Any = None,
         ip_pair: List[str] = None,
-        protocol: str = None,
-        flowtag: str = None,
-        nf_routerid: str = None,
-        nf_ifindex_in: str = None,
-        nf_ifindex_out: str = None,
-        subnet_24: str = None,
-        subnet_16: str = None,
+        protocol: Any = None,
+        flowtag: Any = None,
+        nf_routerid: Any = None,
+        nf_ifindex_in: Any = None,
+        nf_ifindex_out: Any = None,
+        subnet_24: Any = None,
+        subnet_16: Any = None,
         maxitems: int = 100,
         volume_filter: int = 0,
         resolve_keys: bool = True,
         outputpath: str = None,
         idlist: List[str] = None,
-        any_nf_ifindex: str = None,
+        any_nf_ifindex: Any = None,
         duration_secs: int = 60,
         start_ts: int = None,
         end_ts: int = None,
@@ -819,25 +836,25 @@ def get_flows_or_sessions_data(
         q.resolve_keys = resolve_keys
         if outputpath: q.outputpath = outputpath
 
-        if key: q.key = key
-        if source_ip: q.source_ip.label = source_ip
-        if source_port: q.source_port.label = source_port
-        if dest_ip: q.dest_ip.label = dest_ip
-        if dest_port: q.dest_port.label = dest_port
-        if any_ip: q.any_ip.label = any_ip
-        if any_port: q.any_port.label = any_port
-        if protocol: q.protocol.label = protocol
-        if flowtag: q.flowtag = flowtag
-        if nf_routerid: q.nf_routerid.label = nf_routerid
-        if nf_ifindex_in: q.nf_ifindex_in.label = nf_ifindex_in
-        if nf_ifindex_out: q.nf_ifindex_out.label = nf_ifindex_out
-        if subnet_24: q.subnet_24 = subnet_24
-        if subnet_16: q.subnet_16 = subnet_16
-        if any_nf_ifindex: q.any_nf_ifindex.label = any_nf_ifindex
+        if key: q.key = str(key)
+        if source_ip: q.source_ip.label = str(source_ip)
+        if source_port: q.source_port.label = str(source_port)
+        if dest_ip: q.dest_ip.label = str(dest_ip)
+        if dest_port: q.dest_port.label = str(dest_port)
+        if any_ip: q.any_ip.label = str(any_ip)
+        if any_port: q.any_port.label = str(any_port)
+        if protocol: q.protocol.label = str(protocol)
+        if flowtag: q.flowtag = str(flowtag)
+        if nf_routerid: q.nf_routerid.label = str(nf_routerid)
+        if nf_ifindex_in: q.nf_ifindex_in.label = str(nf_ifindex_in)
+        if nf_ifindex_out: q.nf_ifindex_out.label = str(nf_ifindex_out)
+        if subnet_24: q.subnet_24 = str(subnet_24)
+        if subnet_16: q.subnet_16 = str(subnet_16)
+        if any_nf_ifindex: q.any_nf_ifindex.label = str(any_nf_ifindex)
 
         if ip_pair and len(ip_pair) == 2:
-            p1 = q.ip_pair.add(); p1.label = ip_pair[0]
-            p2 = q.ip_pair.add(); p2.label = ip_pair[1]
+            p1 = q.ip_pair.add(); p1.label = str(ip_pair[0])
+            p2 = q.ip_pair.add(); p2.label = str(ip_pair[1])
 
         if idlist:
             for fid in idlist:
@@ -1118,6 +1135,40 @@ def rag_query(question: str):
 # UI related tools
 
 @mcp.tool()
+def show_table(data: dict):
+    """
+    Displays a structured table in the Chat UI. 
+    Use this tool when the user explicitly asks for a table or when presenting topper rankings in a structured format for Web UI/API consumers.
+    
+    **MANDATORY**: Whenever you use this tool, you must also provide a textual summary stating the source Counter Group name, and the Key, Label, and Readable attributes of the entity being displayed. If label and readable are same, show only one.
+    
+    Args:
+        data (dict): Table configuration and data.
+                     Example format:
+                     {
+                        "title": "Top 5 Applications",
+                        "headers": ["Application", "Total Traffic", "Flows"],
+                        "rows": [
+                            ["HTTPS", "1.52 GB", "120"],
+                            ["HTTP", "850 MB", "45"],
+                            ["DNS", "12 MB", "300"]
+                        ]
+                     }
+    """
+    logging.info(f"[show_table] Preparing table for Chat UI integration")
+    
+    # Validate the input data
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except Exception:
+            logging.error("[show_table] Invalid table data format. Expected dict or JSON string.")
+            return {"status": "error", "message" : "Invalid table data format from LLM"}
+            
+    return {"status": "success", "message": "Table data prepared for UI display."}
+
+
+@mcp.tool()
 def show_line_chart(data, save_image: bool = False):
     """
     Plots a static traffic chart (line chart) using matplotlib based on the provided JSON-like input and show it in a new pop-up window.
@@ -1125,6 +1176,8 @@ def show_line_chart(data, save_image: bool = False):
     the time stamps should be in epoc seconds format as integer not in the string date time format like this '2025-10-16 01:00:00'.
     It does not need any context name or the zmq_endpoint.
     It can be used to display the traffic data for any key like IP address, protocol, port etc over a time period.
+    
+    **MANDATORY**: Whenever you use this tool, you must also provide a textual summary stating the source Counter Group name, and the Key, Label, and Readable attributes of the entity being displayed. If label and readable are same, show only one.
     
     Args:
         data (dict): Line Chart configuration and series data.
@@ -1170,7 +1223,7 @@ def show_line_chart(data, save_image: bool = False):
         logging.info(f"[show_line_chart] save_image is set to True, so saving the chart as an image file instead of displaying it. path: {file_path}")
         return {"status": "success", "message" : f"The line chart is saved as an image file successfully.", "file_path": file_path}
     else:
-        return {"status": "success", "message" : f"The line chart is displayed in the pop-up window, tell the user to kindly check that. then show this data in the table format and give a short summary about the data.", "file_path": None}
+        return {"status": "success", "message" : "The line chart has been generated and is being displayed in the UI.", "file_path": None}
 
 
 
@@ -1183,6 +1236,8 @@ def show_pie_chart(data, save_image: bool = False):
         To display pie chart to show the topper values for any counter group and meter.
         It does not need any context name or the zmq_endpoint.
         It can be used to display the traffic distribution for any key like IP address, protocol, port etc.
+
+    **MANDATORY**: Whenever you use this tool, you must also provide a textual summary stating the source Counter Group name, and the Key, Label, and Readable attributes of the entity being displayed. If label and readable are same, show only one.
 
     Args:
         data (dict): Pie Chart configuration and series data.
@@ -1226,8 +1281,8 @@ def show_pie_chart(data, save_image: bool = False):
         logging.info(f"[show_pie_chart] save_image is set to True, so saving the chart as an image file instead of displaying it. path: {file_path}")
         return {"status": "success", "message" : f"The pie chart is saved as an image file successfully.", "file_path": file_path}
     else:
-        logging.info(f"[show_pie_chart] save_image is set to False, so displaying the chart in a pop-up window.")
-        return {"status": "success", "message" : f"The pie chart is displayed in the pop-up window, tell the user to kindly check that. then show this data in the table format and give a short summary about the data.", "file_path": None}
+        logging.info(f"[show_pie_chart] save_image is set to False, so displaying the chart in the UI.")
+        return {"status": "success", "message" : "The pie chart has been generated and is being displayed in the UI.", "file_path": None}
 
 
 
@@ -1427,6 +1482,170 @@ def generate_trisul_report(pages, filename: str, report_title: str, from_ts, to_
 
 
 
+
+
+
+@mcp.tool()
+def search_keys(
+    counter_group: str,
+    pattern: Any = None,
+    label: Any = None,
+    keys: List[str] = None,
+    maxitems: int = 100,
+    offset: int = 0,
+    get_totals: bool = False,
+    get_attributes: bool = False,
+    context: str = "context0",
+    zmq_endpoint: str = None,
+):
+    """
+    Search for a key in a counter group and its other values like description, label, and readable.
+    We can provide a partial value or exact value to search for the key if the exact value is unknown.
+    This tool returns a list of matching keys with their full details.
+
+    How to use this tool for different search scenarios:
+    
+    1. Using the 'pattern' parameter (for Partial or Regex matches):
+       - To match against 'key': Use a partial value. (e.g., pattern="42.23.3A"). NOTE: This is partial match only, no regex.
+       - To match against 'label': Supports partial and regex match (e.g., pattern="^rtb.altitude").
+       - To match against 'description': Supports partial and regex match (e.g., pattern="^test eedith*").
+
+    2. Using the 'label' parameter (for Exact matches):
+       - To match against 'key': Use the exact raw key (e.g., label="42.23.3A.53").
+       - To match against 'label': Use the exact label (e.g., label="rtb.altitude-arena.com").
+
+    Best Practices for better results:
+    - Intelligent Counter Group Selection: Intelligently select the `counter_group` GUID based on what the user is asking for:
+        * If 'link' is mentioned (e.g. 'bsnl link') → Use **FlowIntfs** (Flow Interface)
+        * If 'host', 'user', or an IP is mentioned → Use **Hosts**
+        * If it looks like an **ASN name** or number → Use **ASNumber**
+        * If it looks like a **router** or **firewall** name → Use **Flowgens**
+        * If it is a port or app name → Use **Apps**
+        * **Clarification**: If you cannot determine the group even partially, DO NOT GUESS; ask the user to specify.
+    - Case Sensitivity: Search can be case-sensitive. If searching for a name and it fails, try ALL CAPS or use a regex like '(?i)name' if supported.
+    - Separators: If a name has spaces but might use hyphens (like 'GOOGLE-PRIVATE-CLOUD'), use '.*' in the pattern (e.g., pattern="(?i)google.*cloud").
+    - Broad searching: If a specific name fails, search for the most unique single word in the name.
+    - Ambiguous Matches: If multiple keys are returned (e.g., searching for interfaces across all routers), you MUST use a `get_counter_group_topper` query on that group (max 30 items, last 30 minutes) to identify which matching value has the highest recent activity. Prioritize and show data for that specific item first, then inform the user about other candidates.
+
+    Parameters:
+        counter_group (str): REQUIRED. GUID of the counter group to search in.
+        pattern (str): Optional. Partial value or regex for matching key (partial only), label (regex), or description (regex).
+        label (str): Optional. Exact value for matching key or human-readable label.
+        keys (list[str]): Optional explicit list of raw key strings to look up directly.
+        maxitems (int): Maximum number of keys to return (Default: 100).
+        offset (int): Pagination offset — skip the first N results.
+        get_totals (bool): If True, include aggregate metric totals for each key.
+        get_attributes (bool): If True, include extended key attributes in the response.
+        context (str): Trisul context identifier (Default: "context0").
+        zmq_endpoint (str): Custom TRP ZMQ endpoint. Auto-computed if omitted.
+
+    Returns:
+        dict: SearchKeysResponse containing matching keys.
+        Example result item structure:
+            keys {
+                key: "42.23.3A.53"
+                readable: "66.35.58.83"
+                label: "rtb.altitude-arena.com"
+                description: "test eedith 123"
+            }
+
+    Example Scenarios:
+        - High-recall name match: search_keys(cg, pattern="(?i).*microsoft.*corp.*")
+        - Partial key match: search_keys(cg, pattern="42.23.3A", maxitems=20)
+        - Regex label match: search_keys(cg, pattern="^rtb.altitude", maxitems=20)
+        - Regex description match: search_keys(cg, pattern="^test eedith*", maxitems=20)
+        - Exact key match: search_keys(cg, label="42.23.3A.53")
+        - Exact label match: search_keys(cg, label="rtb.altitude-arena.com")
+    """
+    try:
+        counter_group = str(counter_group)
+        if pattern:
+            pattern = str(pattern)
+        if label:
+            label = str(label)
+        
+        maxitems = int(maxitems)
+        offset = int(offset)
+        
+        if not zmq_endpoint:
+            ctx = normalize_context(context)
+            zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{ctx}/run/trp_0"
+
+        logging.info(
+            f"[search_keys] counter_group={counter_group} pattern={pattern} "
+            f"label={label} keys={keys} maxitems={maxitems} offset={offset} "
+            f"get_totals={get_totals} get_attributes={get_attributes} endpoint={zmq_endpoint}"
+        )
+
+        req = trp_pb2.Message()
+        req.trp_command = req.SEARCH_KEYS_REQUEST
+        q = req.search_keys_request
+
+        q.counter_group = counter_group
+        q.maxitems = int(maxitems)
+        q.offset = int(offset)
+        q.get_totals = bool(get_totals)
+        q.get_attributes = bool(get_attributes)
+
+        if pattern:
+            q.pattern = pattern
+            logging.info(f"[search_keys] pattern={pattern}")
+
+        if label:
+            q.label = label
+            logging.info(f"[search_keys] label={label}")
+
+        if keys:
+            q.keys.extend([str(k) for k in keys])
+            logging.info(f"[search_keys] explicit keys count={len(keys)}")
+
+        logging.info("[search_keys] Sending SEARCH_KEYS_REQUEST")
+        resp = get_response(zmq_endpoint, req)
+        logging.info("[search_keys] Response received")
+        
+        # Post-process results for similarity if pattern was provided
+        resp_dict = MessageToDict(resp)
+        if pattern and 'keys' in resp_dict:
+            import difflib
+            search_str = pattern.lower()
+            if pattern.startswith('(?i)'):
+                search_str = pattern[4:].lower()
+            
+            scored_keys = []
+            for k in resp_dict['keys']:
+                label = k.get('label', '').lower()
+                readable = k.get('readable', '').lower()
+                key_id = k.get('key', '').lower()
+                
+                # Check label first, then readable, then key
+                score = difflib.SequenceMatcher(None, search_str, label).ratio()
+                score = max(score, difflib.SequenceMatcher(None, search_str, readable).ratio())
+                score = max(score, difflib.SequenceMatcher(None, search_str, key_id).ratio())
+                
+                # Boost exact matches
+                if search_str == label or search_str == readable or search_str == key_id:
+                    score = 1.0
+                
+                k['similarity_score'] = round(score, 3)
+                scored_keys.append((score, k))
+            
+            # Sort by score descending
+            scored_keys.sort(key=lambda x: x[0], reverse=True)
+            resp_dict['keys'] = [x[1] for x in scored_keys]
+            
+            # Add a hint for the LLM
+            if resp_dict['keys'] and resp_dict['keys'][0]['similarity_score'] >= 0.5:
+                resp_dict['suggestion'] = {
+                    "best_match": resp_dict['keys'][0],
+                    "confidence": "high" if resp_dict['keys'][0]['similarity_score'] >= 0.8 else "medium",
+                    "note": f"Key '{resp_dict['keys'][0]['label']}' is a strong match for your search."
+                }
+        
+        return json_to_toon(resp_dict)
+
+    except Exception as e:
+        logging.error(f"[search_keys] Error: {str(e)}", exc_info=True)
+        return json_to_toon({"error": str(e)})
 
 
 # AI Config tools

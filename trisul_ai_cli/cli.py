@@ -79,6 +79,16 @@ Examples:
         choices=["debug", "info", "warning", "error", "critical"],
         help="Uvicorn log level (default: info)",
     )
+    api_parser.add_argument(
+        "--ssl-keyfile",
+        default=None,
+        help="Path to the SSL key file for HTTPS mode",
+    )
+    api_parser.add_argument(
+        "--ssl-certfile",
+        default=None,
+        help="Path to the SSL certificate file for HTTPS mode",
+    )
 
     args, _ = parser.parse_known_args()
     
@@ -91,7 +101,13 @@ Examples:
     # 'api' subcommand
     if args.command == "api":
         from trisul_ai_cli.api_server import start_server
-        start_server(host=args.host, port=args.port, log_level=args.log_level)
+        start_server(
+            host=args.host, 
+            port=args.port, 
+            log_level=args.log_level,
+            ssl_keyfile=args.ssl_keyfile,
+            ssl_certfile=args.ssl_certfile
+        )
         return
 
     # Default behavior (no subcommand → start chat)

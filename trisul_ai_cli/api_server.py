@@ -25,6 +25,19 @@ import uvicorn
 
 from trisul_ai_cli.client import TrisulAIClient
 from importlib.metadata import version as pkg_version
+import os
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Logging configuration: ensure we capture logs in the same file as CLI/Server
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    filename=Path(os.getcwd()) / "trisul_ai_cli.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    force=True
+)
 
 
 # ---------------------------------------------------------------------------
@@ -95,11 +108,18 @@ class ChartData(BaseModel):
     data: Any
 
 
+class TableData(BaseModel):
+    title: Optional[str] = "Data Table"
+    headers: List[str]
+    rows: List[List[Any]]
+
+
 class QueryResponse(BaseModel):
     status: str        # "success" | "error"
     answer: Optional[str] = None   # AI text (Q&A or summary fallback)
     tool_calls: List[ToolCallRecord] = []
     chart_data: Optional[ChartData] = None
+    table_data: Optional[TableData] = None
     message: Optional[str] = None  # error message when status == "error"
     session_id: Optional[str] = None
 
@@ -122,7 +142,9 @@ async def health():
 @app.get("/api/tools", tags=["Meta"])
 async def list_tools():
     """Return all available MCP tool names and their descriptions."""
+    logging.info("[API] GET /api/tools")
     if not _client or not _client.session:
+        logging.error("[API] MCP server not connected")
         raise HTTPException(status_code=503, detail="MCP server not connected")
     try:
         tools_result = await _client.session.list_tools()
@@ -134,8 +156,10 @@ async def list_tools():
             }
             for t in tools_result.tools
         ]
+        logging.info(f"[API] Successfully retrieved {len(tools)} tools.")
         return {"status": "ok", "tools": tools}
     except Exception as e:
+        logging.error(f"[API] Error listing tools: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -152,6 +176,7 @@ async def query(req: QueryRequest):
       can render the chart directly.
     """
     if not _client or not _client.session:
+        logging.error("[API] Rejecting query: MCP server not connected")
         raise HTTPException(status_code=503, detail="MCP server not connected")
 
     logging.info(f"[API] /api/query  session={req.session_id}  query={req.query!r}")
@@ -162,6 +187,15 @@ async def query(req: QueryRequest):
             system_prompt=req.system_prompt,
             session_id=req.session_id,
         )
+        
+        # Log summary of the result
+        status = result.get("status", "error")
+        ans_len = len(result.get("answer") or "")
+        num_tools = len(result.get("tool_calls", []))
+        has_chart = "yes" if result.get("chart_data") else "no"
+        has_table = "yes" if result.get("table_data") else "no"
+        logging.info(f"[API] Query processed: status={status}, ans_len={ans_len}, tool_calls={num_tools}, chart={has_chart}, table={has_table}")
+
     except Exception as e:
         logging.error(f"[API] Unhandled error in process_query_api: {e}")
         return QueryResponse(
@@ -182,6 +216,15 @@ async def query(req: QueryRequest):
             if result.get("chart_data")
             else None
         ),
+        table_data=(
+            TableData(
+                title=result["table_data"].get("title", "Data Table") if isinstance(result["table_data"], dict) else "Data Table",
+                headers=result["table_data"].get("headers", []) if isinstance(result["table_data"], dict) else [],
+                rows=result["table_data"].get("rows", []) if isinstance(result["table_data"], dict) else []
+            )
+            if result.get("table_data")
+            else None
+        ),
         message=result.get("message"),
         session_id=req.session_id,
     )
@@ -191,15 +234,27 @@ async def query(req: QueryRequest):
 # Entry-point helper (called from cli.py)
 # ---------------------------------------------------------------------------
 
-def start_server(host: str = "0.0.0.0", port: int = 8200, log_level: str = "info"):
+def start_server(
+    host: str = "0.0.0.0", 
+    port: int = 8200, 
+    log_level: str = "info",
+    ssl_keyfile: str = None,
+    ssl_certfile: str = None
+):
     """Start the Uvicorn server. Called from the CLI `api` subcommand."""
-    print(f"\n🚀 Trisul AI REST API starting on http://{host}:{port}")
-    print(f"   Interactive docs: http://{host}:{port}/docs")
-    print(f"   Health check:     http://{host}:{port}/api/health\n")
+    protocol = "https" if ssl_keyfile and ssl_certfile else "http"
+    mode = "HTTPS" if protocol == "https" else "HTTP"
+
+    print(f"\n🚀 Trisul AI REST API starting in {mode} mode on {protocol}://{host}:{port}")
+    print(f"   Interactive docs: {protocol}://{host}:{port}/docs")
+    print(f"   Health check:     {protocol}://{host}:{port}/api/health\n")
+    
     uvicorn.run(
         "trisul_ai_cli.api_server:app",
         host=host,
         port=port,
         log_level=log_level,
         loop="asyncio",
+        ssl_keyfile=ssl_keyfile,
+        ssl_certfile=ssl_certfile,
     )
