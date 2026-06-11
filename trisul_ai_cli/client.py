@@ -68,6 +68,10 @@ class TrisulAIClient:
         self.pie_chart_data = {}
         self.table_data = {}
         self.report_path = None
+        self.verified_report_path = None
+        self.pending_report_request = False
+        self.report_data_fetched = False
+        self.report_continue_attempts = 0
         self.sessions = {} # session_id -> conversation_history (list of Messages)
                 
         
@@ -323,9 +327,189 @@ class TrisulAIClient:
         return str(content)
 
 
+    REPORT_GENERATION_TOOLS = frozenset({
+        "generate_excel_report",
+        "generate_pnb_excel_report",
+        "generate_key_monitor_excel_report",
+        "generate_trisul_report",
+    })
+    REPORT_DATA_TOOLS = frozenset({
+        "get_counter_group_topper",
+        "get_key_traffic_data",
+        "get_cginfo_from_countergroup_name",
+        "search_keys",
+        "list_all_available_counter_groups",
+    })
+    MAX_REPORT_CONTINUE_ATTEMPTS = 8
+    _REPORT_IN_PROGRESS_RE = re.compile(
+        r"stay tuned|hang tight|gathering|fetching|working on|"
+        r"i'?ll get|let me|first,? i|on it|whip up|pull the|"
+        r"now,? let|next,? i|still gathering|takes a moment",
+        re.I,
+    )
+
+    def _is_report_request(self, query):
+        q = (query or "").lower()
+        if any(token in q for token in ("excel", "xlsx", "spreadsheet")):
+            return True
+        if "report" in q and any(
+            w in q for w in ("generate", "export", "download", "create", "regenerate", "recreate", "rebuild")
+        ):
+            return True
+        if any(w in q for w in ("regenerate", "recreate", "re-run", "rerun")) and any(
+            w in q for w in ("report", "excel", "same")
+        ):
+            return True
+        return False
+
+    def _get_finish_reason(self, response):
+        meta = getattr(response, "response_metadata", None) or {}
+        return meta.get("finish_reason") or meta.get("finishReason") or ""
+
+    def _response_has_tool_issues(self, response):
+        if getattr(response, "invalid_tool_calls", None):
+            return True
+        return self._get_finish_reason(response) in (
+            "MALFORMED_FUNCTION_CALL",
+            "RECITATION",
+            "OTHER",
+        )
+
+    def _is_blank_response(self, content):
+        return not (content or "").strip()
+
+    def _should_continue_report_workflow(self, content):
+        """Return True when a report was requested but not yet written to disk."""
+        if self.verified_report_path:
+            return False
+        if not self.pending_report_request:
+            return False
+        if self._is_blank_response(content):
+            return True
+        if self.report_data_fetched:
+            return True
+        if content and self._REPORT_IN_PROGRESS_RE.search(content):
+            return True
+        return False
+
+    def _should_retry_after_no_tools(self, response, content):
+        if response.tool_calls:
+            return False
+        if self._response_has_tool_issues(response):
+            return True
+        if self._is_blank_response(content):
+            return True
+        return self._should_continue_report_workflow(content)
+
+    def _retry_message(self, response, content):
+        reason = self._get_finish_reason(response)
+        if reason == "MALFORMED_FUNCTION_CALL" or getattr(response, "invalid_tool_calls", None):
+            return (
+                "SYSTEM: Your previous tool call failed (malformed function call) and was NOT executed. "
+                "Retry immediately. Reuse the data already fetched in this conversation — do not restart from scratch. "
+                "Call generate_excel_report with valid JSON containing only: columns, rows, title, "
+                "from_ts, to_ts, filename, sheet_name. Do NOT pass zmq_endpoint to generate_excel_report. "
+                "Apply the header changes the user requested, then reply only after status success."
+            )
+        if self._is_blank_response(content):
+            return (
+                "SYSTEM: Your previous reply was empty. Continue the user's request now by calling "
+                "the required tool(s). Do not return an empty response."
+            )
+        return self._report_continue_message()
+
+    def _finalize_user_response(self, content):
+        content = (content or "").strip()
+        if self.verified_report_path and os.path.isfile(self.verified_report_path):
+            if self.verified_report_path not in content:
+                suffix = f"Excel report saved to `{self.verified_report_path}`."
+                content = f"{content}\n\n{suffix}" if content else suffix
+        if not content:
+            logging.warning("[Client] Empty final response after agent loop")
+            return (
+                "Sorry, I couldn't complete that request — the model returned an empty response. "
+                "Please try again."
+            )
+        return self._guard_report_path_claims(content)
+
+    def _report_continue_message(self):
+        return (
+            "SYSTEM: The Excel/report request is NOT complete yet. "
+            "Do NOT send progress messages like 'stay tuned' or 'hang tight'. "
+            "Immediately call the next required tool(s) in the same workflow: "
+            "fetch any remaining data, then call generate_excel_report (or the correct report tool). "
+            "Only send your final user-facing reply AFTER the report tool returns "
+            '"status": "success" with a verified file_path.'
+        )
+
+    def _parse_tool_json(self, tool_result):
+        clean = tool_result.replace("\n", "").replace("\r", "").replace("\t", " ").replace("   ", " ")
+        try:
+            return json.loads(clean), tool_result
+        except Exception:
+            return None, tool_result
+
+    def _handle_report_tool_result(self, function_name, json_result, tool_result):
+        """Verify report files exist on disk before telling the LLM generation succeeded."""
+        if function_name not in self.REPORT_GENERATION_TOOLS:
+            return tool_result, json_result
+
+        if not json_result or json_result.get("status") != "success":
+            return tool_result, json_result
+
+        file_path = json_result.get("file_path")
+        if file_path and os.path.isfile(file_path):
+            self.report_path = file_path
+            self.verified_report_path = file_path
+            logging.info(f"[Client] Verified report file on disk: {file_path}")
+            return tool_result, json_result
+
+        error_payload = {
+            "status": "error",
+            "message": (
+                f"Report file was NOT created at {file_path!r}. "
+                "Do NOT tell the user the report was generated. "
+                "You MUST call the report tool again with the assembled data."
+            ),
+            "file_path": None,
+        }
+        logging.warning(
+            f"[Client] Report tool '{function_name}' reported success but file is missing: {file_path}"
+        )
+        return json.dumps(error_payload), error_payload
+
+    def _guard_report_path_claims(self, content):
+        """Append a warning if the LLM cites a report path that was never verified."""
+        if not content:
+            return content
+
+        claimed_paths = re.findall(r'`(/tmp/[^`]+\.xlsx)`|(/tmp/\S+\.xlsx)', content)
+        flat_paths = [p for pair in claimed_paths for p in pair if p]
+        if not flat_paths:
+            return content
+
+        if self.verified_report_path and os.path.isfile(self.verified_report_path):
+            for path in flat_paths:
+                if path != self.verified_report_path and not os.path.isfile(path):
+                    content = content.replace(path, self.verified_report_path)
+            return content
+
+        logging.warning("[Client] LLM claimed Excel path without verified report tool result")
+        return (
+            f"{content.rstrip()}\n\n"
+            "Note: The file path above was not verified on disk — no Excel report was "
+            "successfully created in this request. Fetching data alone does not create a file; "
+            "the report generation step must complete successfully."
+        )
+
+
     async def process_query(self, query: str) -> str:
         """Process a query using LangChain and MCP tools."""
         
+        self.verified_report_path = None
+        self.pending_report_request = self._is_report_request(query)
+        self.report_data_fetched = False
+        self.report_continue_attempts = 0
         self.conversation_history.append(HumanMessage(content=query))
 
         llm = self.llm_factory.get_llm()
@@ -351,9 +535,22 @@ class TrisulAIClient:
             self.conversation_history.append(response)
             
             if not response.tool_calls:
-                # Handle both string and list responses
                 content = self.extract_text_from_content(response.content)
-                return content
+                if self._should_retry_after_no_tools(response, content):
+                    if self.report_continue_attempts >= self.MAX_REPORT_CONTINUE_ATTEMPTS:
+                        logging.warning("[Client] Agent loop hit max retry attempts")
+                        return self._finalize_user_response(content)
+                    self.report_continue_attempts += 1
+                    logging.info(
+                        f"[Client] Incomplete/empty LLM response — auto-retrying "
+                        f"(attempt {self.report_continue_attempts}, "
+                        f"finish_reason={self._get_finish_reason(response)!r})"
+                    )
+                    self.conversation_history.append(
+                        HumanMessage(content=self._retry_message(response, content))
+                    )
+                    continue
+                return self._finalize_user_response(content)
             
             # Process tool calls
             for tool_call in response.tool_calls:
@@ -363,19 +560,20 @@ class TrisulAIClient:
                 
                 logging.info(f"[Client] Calling function: {function_name} with args: {function_args}")
                 
+                if self.pending_report_request and function_name in self.REPORT_DATA_TOOLS:
+                    self.report_data_fetched = True
+                
                 try:
                     # Call the tool on MCP server
                     result = await self.session.call_tool(function_name, function_args)
                     tool_result = result.content[0].text if result.content else "No result"
-                    clean_result = tool_result.replace("\n", "").replace("\r", "").replace("\t", " ").replace("   ", "")
+                    json_result, tool_result = self._parse_tool_json(tool_result)
+                    clean_result = tool_result.replace("\n", "").replace("\r", "").replace("\t", " ").replace("   ", " ")
                     logging.info(f"[Client] Function result: {clean_result}")
                     
-                    # Parse JSON if possible for side effects
-                    json_result = None
-                    try:
-                        json_result = json.loads(clean_result)
-                    except Exception:
-                        pass
+                    tool_result, json_result = self._handle_report_tool_result(
+                        function_name, json_result, tool_result
+                    )
                     
                     # Handle side effects
                     if function_name == "show_line_chart":
@@ -403,9 +601,7 @@ class TrisulAIClient:
                             logging.warning(f"[Client] [process_query] {json_result.get('message') if json_result else tool_result}")
 
                     if function_name == "generate_trisul_report":
-                        if json_result and json_result.get('status') == "success":
-                            self.report_path = json_result.get('file_path')
-                        else:
+                        if not (json_result and json_result.get('status') == "success"):
                             logging.warning(f"[Client] [process_query] {json_result.get('message') if json_result else tool_result}")
 
                     if function_name == "configure_llm_model":
@@ -458,6 +654,10 @@ class TrisulAIClient:
         """
         import time
         start_time = time.time()
+        self.verified_report_path = None
+        self.pending_report_request = self._is_report_request(query)
+        self.report_data_fetched = False
+        self.report_continue_attempts = 0
         
         # Retrieve or create session history
         if session_id and session_id in self.sessions:
@@ -532,6 +732,20 @@ class TrisulAIClient:
 
             if not response.tool_calls:
                 answer = self.extract_text_from_content(response.content)
+                if self._should_retry_after_no_tools(response, answer):
+                    if self.report_continue_attempts >= self.MAX_REPORT_CONTINUE_ATTEMPTS:
+                        logging.warning("[Client][API] Agent loop hit max retry attempts")
+                        answer = self._finalize_user_response(answer)
+                    else:
+                        self.report_continue_attempts += 1
+                        logging.info(
+                            f"[Client][API] Incomplete/empty LLM response — auto-retrying "
+                            f"(attempt {self.report_continue_attempts})"
+                        )
+                        history.append(HumanMessage(content=self._retry_message(response, answer)))
+                        continue
+                else:
+                    answer = self._finalize_user_response(answer)
                 elapsed = time.time() - start_time
                 logging.info(f"[Client][API] [Session: {session_id}] Final AI Response (took {elapsed:.2f}s): {answer}")
                 return {
@@ -572,16 +786,18 @@ class TrisulAIClient:
 
                 logging.info(f"[Client][API] [Session: {session_id}] Tool: {function_name} | Args: {json.dumps(function_args)}")
 
+                if self.pending_report_request and function_name in self.REPORT_DATA_TOOLS:
+                    self.report_data_fetched = True
+
                 try:
                     result = await self.session.call_tool(function_name, function_args)
                     tool_result_text = result.content[0].text if result.content else "No result"
                     logging.info(f"[Client][API] [Session: {session_id}] Tool: {function_name} | Output: {tool_result_text}")
 
-                    # Try to parse JSON result
-                    try:
-                        tool_result_json = json.loads(tool_result_text)
-                    except Exception:
-                        tool_result_json = tool_result_text
+                    tool_result_json, tool_result_text = self._parse_tool_json(tool_result_text)
+                    tool_result_text, tool_result_json = self._handle_report_tool_result(
+                        function_name, tool_result_json, tool_result_text
+                    )
 
                     # Capture chart data for API consumers
                     if function_name in ["show_line_chart", "show_pie_chart"]:
@@ -796,7 +1012,8 @@ class TrisulAIClient:
                     response = await task
                     await spinner
                     
-                    logging.info(f"[Client] Full Conversation History: \n{self.conversation_history[1:]}")
+                    # logging.info(f"[Client] Full Conversation History: \n{self.conversation_history[1:]}")
+                    logging.info("[Client] Full Conversation History:\n%s", json.dumps([msg.model_dump() for msg in self.conversation_history[1:]], indent=2, default=str))
                     logging.info(f"[Client] Response: \n{response}")
                     print(f"\n🤖 (Bot) : {response.strip()}\n")
                     

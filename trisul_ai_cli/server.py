@@ -43,6 +43,9 @@ _global_zmq_context = zmq.Context()
 
 mcp = FastMCP(name="trisul-mcp-server")
 
+FLOWINTFS_GUID = "{C0B04CA7-95FA-44EF-8475-3835F3314761}"
+FLOWGENS_GUID = "{2314BB8E-2BCC-4B86-8AA2-677E5554C0FE}"
+
 # Helper functions
 
 def normalize_context(ctx: str) -> str:
@@ -148,6 +151,516 @@ def epoch_to_duration(from_ts, to_ts):
     return f"Duration {duration.strip()} starting from {starting_time}"
 
 
+def fmt_prefix_2(raw_value):
+    """Format volume using binary prefixes (1024-based), matching webtrisul fmt_prefix_2."""
+    units_str = [
+        (1099511627776.0, "T", "%.2f %s"),
+        (1073741824.0, "G", "%.2f %s"),
+        (1048576.0, "M", "%.2f %s"),
+        (1024.0, "K", "%.2f %s"),
+        (1, "", "%d %s"),
+        (1e-03, "m", "%.3f %s"),
+        (1e-06, "u", "%.3f %s"),
+        (1e-09, "n", "%.3f %s"),
+        (1e-12, "p", "%.3f %s"),
+    ]
+    if raw_value == 0 or raw_value is None:
+        return "0"
+    for threshold, unit, fmt in units_str:
+        if raw_value >= threshold:
+            return (fmt % (raw_value / threshold, unit)).strip()
+    return str(raw_value)
+
+
+def fmt_prefix_10(raw_value):
+    """Format bandwidth using decimal prefixes (1000-based), matching webtrisul fmt_prefix_10."""
+    units_str = [
+        (1e12, "T", "%.2f %s"),
+        (1e9, "G", "%.2f %s"),
+        (1e6, "M", "%.2f %s"),
+        (1000, "K", "%.2f %s"),
+        (1, "", "%d %s"),
+        (1e-03, "m", "%.3f %s"),
+        (1e-06, "u", "%.3f %s"),
+        (1e-09, "n", "%.3f %s"),
+        (1e-12, "p", "%.3f %s"),
+    ]
+    if raw_value == 0 or raw_value is None:
+        return "0"
+    for threshold, unit, fmt in units_str:
+        if raw_value >= threshold:
+            return (fmt % (float(raw_value) / threshold, unit)).strip()
+    return str(raw_value)
+
+
+def fmt_volume(val, units=""):
+    """Format cumulative volume totals."""
+    return fmt_prefix_2(val) + units.replace("ps", "")
+
+
+def fmt_bw(val, units="bps"):
+    """Format rate/bandwidth values."""
+    prefix = fmt_prefix_10(float(val))
+    units = units.lower()
+    if prefix == "0":
+        return f"0{units}"
+    return f"{prefix} {units}"
+
+
+def _stats_array_values(stats_array, meter_ids):
+    """Extract per-meter values from a StatsArray protobuf message."""
+    if not stats_array or not stats_array.values:
+        return [0] * len(meter_ids)
+    vals = list(stats_array.values)
+    return [int(vals[mid]) if mid < len(vals) and vals[mid] is not None else 0 for mid in meter_ids]
+
+
+def _resolve_meter_ids(counter_group_guid, meters, zmq_endpoint):
+    """Resolve meter names or numeric IDs to meter indices and metadata."""
+    cg_info = countergroup_info(zmq_endpoint, get_meter_info=True)
+    if "error" in cg_info:
+        raise ValueError(cg_info["error"])
+
+    group = None
+    for g in cg_info.get("groupDetails", []):
+        if g.get("guid", "").upper() == counter_group_guid.upper():
+            group = g
+            break
+    if not group:
+        raise ValueError(f"Counter group GUID {counter_group_guid} not found")
+
+    meter_lookup = {}
+    for m in group.get("meters", []):
+        mid = int(m.get("id", 0))
+        meter_lookup[mid] = {
+            "id": mid,
+            "name": m.get("name", ""),
+            "description": m.get("description", ""),
+            "units": m.get("units", "bps"),
+        }
+
+    resolved = []
+    for meter in meters:
+        meter_str = str(meter).strip()
+        if meter_str.isdigit():
+            mid = int(meter_str)
+            if mid not in meter_lookup:
+                raise ValueError(f"Meter ID {mid} not found in counter group {group.get('name', counter_group_guid)}")
+            resolved.append(meter_lookup[mid])
+            continue
+
+        needle = meter_str.lower().replace(" ", "")
+        match = None
+        for mid, info in meter_lookup.items():
+            candidates = [
+                info.get("description", ""),
+                info.get("name", ""),
+                str(mid),
+            ]
+            for candidate in candidates:
+                c = candidate.lower().replace(" ", "")
+                if c == needle or needle in c or c in needle:
+                    match = info
+                    break
+            if match:
+                break
+        if not match:
+            available = [f"{m['id']}:{m['description'] or m['name']}" for m in meter_lookup.values()]
+            raise ValueError(f"Meter '{meter}' not found. Available meters: {', '.join(available)}")
+        resolved.append(match)
+
+    return resolved, group
+
+
+def _get_key_meter_stats(counter_group_guid, key, meter_ids, from_ts, to_ts, zmq_endpoint, meters_info):
+    """Fetch total/min/max/avg/latest stats for a key, matching custom key monitor logic."""
+    req = trp_pb2.Message()
+    req.trp_command = req.COUNTER_ITEM_NG_REQUEST
+    ng = req.counter_item_ng_request
+    ng.counter_group = counter_group_guid
+    ng.key.label = str(key).strip().lower()
+    ng.volumes_only = 1
+    getattr(ng.time_interval, "from").tv_sec = int(from_ts)
+    ng.time_interval.to.tv_sec = int(to_ts)
+
+    resp = get_response(zmq_endpoint, req)
+    duration_secs = max(int(to_ts) - int(from_ts), 1)
+
+    if resp.HasField("rate_volumes") and resp.rate_volumes.values:
+        totals = _stats_array_values(resp.rate_volumes, meter_ids)
+    elif resp.HasField("totals") and resp.totals.values:
+        totals = _stats_array_values(resp.totals, meter_ids)
+    else:
+        totals = [0] * len(meter_ids)
+
+    maximums = _stats_array_values(resp.maximums, meter_ids) if resp.HasField("maximums") else [0] * len(meter_ids)
+    minimums = _stats_array_values(resp.minimums, meter_ids) if resp.HasField("minimums") else [0] * len(meter_ids)
+    latests = _stats_array_values(resp.latests, meter_ids) if resp.HasField("latests") else [0] * len(meter_ids)
+    samples = _stats_array_values(resp.samples, meter_ids) if resp.HasField("samples") else [1] * len(meter_ids)
+
+    averages = []
+    for i, mid in enumerate(meter_ids):
+        unit = meters_info[mid].get("units", "bps")
+        val = totals[i] or 0
+        if unit.lower().endswith("ps"):
+            averages.append(int(val / duration_secs) if duration_secs > 0 else val)
+        else:
+            samp = samples[i] or 1
+            averages.append(int(val / samp) if samp else val)
+
+    for i, mid in enumerate(meter_ids):
+        if meters_info[mid].get("units", "") == "Bps":
+            maximums[i] = (maximums[i] or 0) * 8
+            minimums[i] = (minimums[i] or 0) * 8
+            latests[i] = (latests[i] or 0) * 8
+            averages[i] = (averages[i] or 0) * 8
+
+    key_label = resp.key.label if resp.HasField("key") and resp.key.label else str(key)
+    return {
+        "key": key_label,
+        "meters": {
+            mid: {
+                "name": meters_info[mid]["description"] or meters_info[mid]["name"],
+                "units": meters_info[mid]["units"],
+                "totals": totals[i],
+                "maximums": maximums[i],
+                "minimums": minimums[i],
+                "averages": averages[i],
+                "latests": latests[i],
+            }
+            for i, mid in enumerate(meter_ids)
+        },
+    }
+
+
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _format_excel_value(value, fmt="text", fmt_args=None):
+    """Format a cell value for Excel export."""
+    fmt_args = fmt_args or {}
+    if fmt in (None, "", "text"):
+        return "" if value is None else value
+    if fmt in ("util_pct", "percent"):
+        return _fmt_util_pct(value)
+    if fmt == "number":
+        if value is None:
+            return ""
+        decimals = int(fmt_args.get("decimals", 2))
+        try:
+            return round(float(value), decimals)
+        except (TypeError, ValueError):
+            return value
+    if fmt == "volume":
+        return fmt_volume(value, fmt_args.get("units", ""))
+    if fmt in ("bandwidth", "bw"):
+        return fmt_bw(value, fmt_args.get("units", "bps"))
+    if fmt == "datetime_epoch":
+        if value is None:
+            return ""
+        try:
+            return datetime.fromtimestamp(
+                int(value),
+                _IST,
+            ).strftime(fmt_args.get("strftime", "%Y-%m-%d %H:%M:%S %z"))
+        except (TypeError, ValueError, OSError):
+            return str(value)
+    return "" if value is None else value
+
+
+def _normalize_excel_columns(columns):
+    """Normalize column definitions to a consistent list of dicts."""
+    normalized = []
+    for col in columns:
+        if isinstance(col, str):
+            normalized.append({"header": col, "key": col, "format": "text", "format_args": {}, "width": None})
+        elif isinstance(col, dict):
+            header = col.get("header") or col.get("key") or col.get("name")
+            key = col.get("key") or header
+            if not header:
+                raise ValueError("Each column must have a 'header' (or 'key').")
+            normalized.append({
+                "header": header,
+                "key": key,
+                "format": col.get("format", "text"),
+                "format_args": col.get("format_args") or {},
+                "width": col.get("width"),
+            })
+        else:
+            raise ValueError(f"Invalid column definition: {col}")
+    if not normalized:
+        raise ValueError("At least one column is required.")
+    return normalized
+
+
+def _excel_row_values(row, columns, row_is_list=False):
+    """Extract formatted cell values for one data row."""
+    values = []
+    for i, col in enumerate(columns):
+        if row_is_list:
+            raw = row[i] if i < len(row) else None
+        else:
+            raw = row.get(col["key"]) if isinstance(row, dict) else None
+        values.append(_format_excel_value(raw, col["format"], col["format_args"]))
+    return values
+
+
+def _apply_excel_column_merges(ws, data_start_row, merge_col_indexes, row_count):
+    """Vertically merge consecutive rows; empty cells continue the previous group."""
+    from openpyxl.styles import Alignment
+
+    for col_idx in merge_col_indexes:
+        group_start = None
+        for offset in range(row_count):
+            row_num = data_start_row + offset
+            cell_val = ws.cell(row=row_num, column=col_idx).value
+            if cell_val not in (None, ""):
+                if group_start is not None and row_num - group_start > 1:
+                    ws.merge_cells(
+                        start_row=group_start, start_column=col_idx,
+                        end_row=row_num - 1, end_column=col_idx,
+                    )
+                    ws.cell(row=group_start, column=col_idx).alignment = Alignment(vertical="top")
+                group_start = row_num
+        if group_start is not None:
+            end_row = data_start_row + row_count - 1
+            if end_row > group_start:
+                ws.merge_cells(
+                    start_row=group_start, start_column=col_idx,
+                    end_row=end_row, end_column=col_idx,
+                )
+                ws.cell(row=group_start, column=col_idx).alignment = Alignment(vertical="top")
+
+
+def _auto_size_excel_columns(ws, min_width=10, max_width=40, skip_columns=None):
+    """Auto-size worksheet columns based on cell content."""
+    skip_columns = skip_columns or set()
+    for col in ws.columns:
+        col_letter = col[0].column_letter
+        if col_letter in skip_columns:
+            continue
+        max_len = 0
+        for cell in col:
+            if cell.value is not None:
+                max_len = max(max_len, len(str(cell.value)))
+        ws.column_dimensions[col_letter].width = min(max(max_len + 2, min_width), max_width)
+
+
+def _build_excel_report(
+    columns,
+    rows,
+    title=None,
+    metadata=None,
+    from_ts=None,
+    to_ts=None,
+    filename=None,
+    sheet_name="Report",
+    merge_columns=None,
+    include_generated_timestamp=True,
+    header_bold=True,
+    output_dir="/tmp",
+):
+    """Write a flexible Excel report with customizable columns, rows, and formatting."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    columns = _normalize_excel_columns(columns)
+    if not rows:
+        raise ValueError("At least one data row is required.")
+
+    row_is_list = isinstance(rows[0], (list, tuple))
+
+    filepath = filename or f"excel_report_{int(datetime.now().timestamp())}.xlsx"
+    if not filepath.startswith("/"):
+        filepath = f"{output_dir.rstrip('/')}/{filepath}"
+    if not filepath.endswith(".xlsx"):
+        filepath += ".xlsx"
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = str(sheet_name)[:31]
+
+    if title:
+        ws.append([title])
+    if from_ts is not None and to_ts is not None:
+        ws.append([epoch_to_duration(from_ts, to_ts)])
+    for line in metadata or []:
+        if line is not None and str(line).strip():
+            ws.append([str(line)])
+    if include_generated_timestamp:
+        now_str = datetime.now(_IST).strftime("%Y-%m-%d %H:%M:%S %z")
+        ws.append([f"Generated at {now_str}"])
+    if title or (from_ts is not None and to_ts is not None) or metadata or include_generated_timestamp:
+        ws.append([])
+
+    header_row = ws.max_row + 1
+    headers = [col["header"] for col in columns]
+    ws.append(headers)
+    if header_bold:
+        for col_idx in range(1, len(headers) + 1):
+            ws.cell(row=header_row, column=col_idx).font = Font(bold=True)
+
+    data_start_row = header_row + 1
+    for row in rows:
+        ws.append(_excel_row_values(row, columns, row_is_list=row_is_list))
+
+    key_to_index = {col["key"]: i + 1 for i, col in enumerate(columns)}
+    merge_col_indexes = [
+        key_to_index[mk] for mk in (merge_columns or []) if mk in key_to_index
+    ]
+    if merge_col_indexes:
+        _apply_excel_column_merges(ws, data_start_row, merge_col_indexes, len(rows))
+
+    fixed_width_columns = set()
+    for i, col in enumerate(columns):
+        if col.get("width"):
+            col_letter = get_column_letter(i + 1)
+            ws.column_dimensions[col_letter].width = col["width"]
+            fixed_width_columns.add(col_letter)
+    _auto_size_excel_columns(ws, skip_columns=fixed_width_columns)
+
+    wb.save(filepath)
+    return filepath
+
+
+def _build_key_monitor_excel(
+    title,
+    from_ts,
+    to_ts,
+    rows,
+    filename,
+):
+    """Write the custom key monitor Excel report."""
+    flat_rows = []
+    for key_name, meter_rows in rows:
+        for i, meter_row in enumerate(meter_rows):
+            flat_rows.append({
+                "name": key_name if i == 0 else "",
+                "meter": meter_row["meter"],
+                "total": meter_row["total"],
+                "max": meter_row["max"],
+                "min": meter_row["min"],
+                "avg": meter_row["avg"],
+                "latest": meter_row["latest"],
+            })
+
+    return _build_excel_report(
+        columns=[
+            {"header": "Name", "key": "name"},
+            {"header": "Meter", "key": "meter"},
+            {"header": "Total", "key": "total"},
+            {"header": "Max", "key": "max"},
+            {"header": "Min", "key": "min"},
+            {"header": "Avg", "key": "avg"},
+            {"header": "Latest", "key": "latest"},
+        ],
+        rows=flat_rows,
+        title=title,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        filename=filename,
+        sheet_name="Key Monitor",
+        merge_columns=["name"],
+    )
+
+
+def _fmt_util_pct(val):
+    """Format a utilization gauge value as a percentage string."""
+    if val is None or val < 0:
+        return "-"
+    return f"{round(float(val), 2)}%"
+
+
+def _key_attrs_to_dict(keyt):
+    """Convert KeyT attributes to a name->value dict."""
+    if not keyt or not keyt.attributes:
+        return {}
+    return {a.attr_name: a.attr_value for a in keyt.attributes}
+
+
+def _is_system_key(key):
+    """Return True for Trisul aggregate/system keys that are not real entities."""
+    if not key:
+        return True
+    key = str(key)
+    return key in ("Others", "SYS:GROUP_TOTALS") or key.startswith("SYS:")
+
+
+def _is_interface_key(key):
+    """FlowIntfs keys are routerKey_ifindex (e.g. AC.1B.08.01_0000000B)."""
+    return bool(key) and not _is_system_key(key) and "_" in str(key)
+
+
+def _get_time_window(zmq_endpoint, duration_secs, start_ts=None, end_ts=None):
+    """Return (from_ts, to_ts) for a report window."""
+    req = trp_pb2.Message()
+    req.trp_command = req.TIMESLICES_REQUEST
+    req.time_slices_request.get_total_window = True
+    tint_resp = get_response(zmq_endpoint, req)
+    from_ts_val = int(start_ts) if start_ts else int(tint_resp.total_window.to.tv_sec) - int(duration_secs)
+    to_ts_val = int(end_ts) if end_ts else int(tint_resp.total_window.to.tv_sec)
+    return from_ts_val, to_ts_val
+
+
+def _fetch_flowintf_topper(zmq_endpoint, meter, max_count, from_ts, to_ts):
+    """Fetch FlowIntfs topper keys with attributes for the given window."""
+    req = trp_pb2.Message()
+    req.trp_command = req.COUNTER_GROUP_TOPPER_REQUEST
+    topper = req.counter_group_topper_request
+    topper.counter_group = FLOWINTFS_GUID
+    topper.meter = int(meter)
+    topper.maxitems = int(max_count)
+    topper.get_key_attributes = True
+    topper.inverse_key_filter = "SYS:GROUP"
+    getattr(topper.time_interval, "from").tv_sec = int(from_ts)
+    topper.time_interval.to.tv_sec = int(to_ts)
+    resp = get_response(zmq_endpoint, req)
+    keys = [k for k in resp.keys if _is_interface_key(k.key)]
+    logging.info(
+        f"[_fetch_flowintf_topper] meter={meter} raw={len(resp.keys)} "
+        f"interfaces={len(keys)}"
+    )
+    return keys
+
+
+def _fetch_router_names(router_keys, zmq_endpoint):
+    """Resolve router key -> display name from FlowGens."""
+    if not router_keys:
+        return {}
+    req = trp_pb2.Message()
+    req.trp_command = req.SEARCH_KEYS_REQUEST
+    q = req.search_keys_request
+    q.counter_group = FLOWGENS_GUID
+    q.keys.extend(list(router_keys))
+    q.maxitems = len(router_keys)
+    resp = get_response(zmq_endpoint, req)
+    lookup = {}
+    for k in resp.keys:
+        name = k.label.strip() if k.label and k.label.strip() else k.readable
+        lookup[k.key] = name
+    return lookup
+
+
+def _build_pnb_excel(title, from_ts, to_ts, rows, filename):
+    """Write the PNB interface utilization Excel report."""
+    return _build_excel_report(
+        columns=[
+            {"header": "Router IP", "key": "router_ip"},
+            {"header": "Router Name", "key": "router_name"},
+            {"header": "Interface", "key": "interface"},
+            {"header": "Interface Description", "key": "interface_description"},
+            {"header": "In Utilization", "key": "in_utilization"},
+            {"header": "Out Utilization", "key": "out_utilization"},
+            {"header": "Total Utilization", "key": "total_utilization"},
+        ],
+        rows=rows,
+        title=title,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        filename=filename,
+        sheet_name="PNB Interface Utilization",
+    )
 
 
 # TRP Helper functions
@@ -1284,6 +1797,460 @@ def show_pie_chart(data, save_image: bool = False):
         logging.info(f"[show_pie_chart] save_image is set to False, so displaying the chart in the UI.")
         return {"status": "success", "message" : "The pie chart has been generated and is being displayed in the UI.", "file_path": None}
 
+
+
+@mcp.tool()
+def generate_key_monitor_excel_report(
+    counter_group_guid: str,
+    keys: List[str],
+    meters: List[str],
+    title: str = "Key Monitor Report",
+    duration_secs: int = 86400,
+    start_ts: int = None,
+    end_ts: int = None,
+    filename: str = None,
+    context: str = "context0",
+    zmq_endpoint: str = None,
+):
+    """
+    Generate an Excel report for specific keys and meters in a counter group,
+    matching the Custom Key Monitor format in webtrisul UI.
+
+    Provide three inputs:
+      1. counter_group_guid - GUID of the counter group (e.g. FlowIntfs, Hosts, Apps)
+      2. keys - list of key labels/readable names to include (e.g. ["10.25.30.151", "cloud-Standard-PC-"])
+      3. meters - list of meter names or numeric IDs (e.g. ["Total", "Received", "Transmit"] or ["0", "1", "2"])
+
+    The report columns are: Name, Meter, Total, Max, Min, Avg, Latest — with the key name
+    shown once per group (rowspan) and one row per meter, exactly like the web UI.
+
+    Args:
+        counter_group_guid (str): Counter group GUID.
+        keys (list[str]): Keys to fetch (use readable labels, not internal hex keys).
+        meters (list[str]): Meter descriptions/names or numeric meter IDs.
+        title (str): Report title shown at the top of the Excel sheet.
+        duration_secs (int): Lookback window in seconds (default 86400 = 1 day). Ignored if start_ts/end_ts given.
+        start_ts (int): Optional absolute start epoch seconds.
+        end_ts (int): Optional absolute end epoch seconds.
+        filename (str): Output filename (saved under /tmp/). Auto-generated if omitted.
+        context (str): Trisul context (default "context0").
+        zmq_endpoint (str): Custom TRP ZMQ endpoint. Auto-computed if omitted.
+
+    Returns:
+        dict: status, message, and file_path of the generated .xlsx file.
+
+    Example:
+        generate_key_monitor_excel_report(
+            counter_group_guid="{889900CC-0063-11A5-8380-FEBDBABBDBEA}",
+            keys=["cloud-Standard-PC-", "102.104.119.80.rev."],
+            meters=["Total", "Received", "Transmit"],
+            title="demo title",
+            duration_secs=86400,
+        )
+    """
+    try:
+        counter_group_guid = str(counter_group_guid).strip()
+        if not keys:
+            return {"status": "error", "message": "At least one key is required.", "file_path": None}
+        if not meters:
+            return {"status": "error", "message": "At least one meter is required.", "file_path": None}
+
+        if not zmq_endpoint:
+            ctx = normalize_context(context)
+            zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{ctx}/run/trp_0"
+
+        logging.info(
+            f"[generate_key_monitor_excel_report] guid={counter_group_guid} "
+            f"keys={keys} meters={meters} duration_secs={duration_secs}"
+        )
+
+        req = trp_pb2.Message()
+        req.trp_command = req.TIMESLICES_REQUEST
+        req.time_slices_request.get_total_window = True
+        tint_resp = get_response(zmq_endpoint, req)
+
+        from_ts_val = int(start_ts) if start_ts else int(tint_resp.total_window.to.tv_sec) - int(duration_secs)
+        to_ts_val = int(end_ts) if end_ts else int(tint_resp.total_window.to.tv_sec)
+
+        resolved_meters, _ = _resolve_meter_ids(counter_group_guid, meters, zmq_endpoint)
+        meter_ids = [m["id"] for m in resolved_meters]
+        meters_info = {m["id"]: m for m in resolved_meters}
+
+        report_rows = []
+        for key in keys:
+            try:
+                stats = _get_key_meter_stats(
+                    counter_group_guid, key, meter_ids, from_ts_val, to_ts_val, zmq_endpoint, meters_info
+                )
+            except Exception as ex:
+                logging.warning(f"[generate_key_monitor_excel_report] Failed for key '{key}': {ex}")
+                stats = {
+                    "key": str(key),
+                    "meters": {
+                        mid: {
+                            "name": meters_info[mid]["description"] or meters_info[mid]["name"],
+                            "units": meters_info[mid]["units"],
+                            "totals": 0, "maximums": 0, "minimums": 0, "averages": 0, "latests": 0,
+                        }
+                        for mid in meter_ids
+                    },
+                }
+
+            meter_rows = []
+            sort_total = 0
+            for mid in meter_ids:
+                m = stats["meters"][mid]
+                units = m["units"]
+                if mid == meter_ids[0]:
+                    sort_total = m["totals"]
+                meter_rows.append({
+                    "meter": m["name"],
+                    "total": fmt_volume(m["totals"]),
+                    "max": fmt_bw(m["maximums"], units),
+                    "min": fmt_bw(m["minimums"], units),
+                    "avg": fmt_bw(m["averages"], units),
+                    "latest": fmt_bw(m["latests"], units),
+                })
+            report_rows.append((stats["key"], meter_rows, sort_total))
+
+        report_rows.sort(key=lambda item: item[2], reverse=True)
+        report_rows = [(key, meter_rows) for key, meter_rows, _ in report_rows]
+
+        if not filename:
+            safe_title = "".join(c if c.isalnum() or c in "-_" else "_" for c in title)[:40]
+            filename = f"key_monitor_{safe_title}_{int(datetime.now().timestamp())}.xlsx"
+
+        filepath = _build_key_monitor_excel(title, from_ts_val, to_ts_val, report_rows, filename)
+
+        logging.info(f"[generate_key_monitor_excel_report] Report saved to {filepath}")
+        return {
+            "status": "success",
+            "message": f"Excel report generated successfully at {filepath}",
+            "file_path": filepath,
+            "keys_count": len(report_rows),
+            "meters": [m["description"] or m["name"] for m in resolved_meters],
+            "duration": epoch_to_duration(from_ts_val, to_ts_val),
+        }
+
+    except Exception as e:
+        logging.error(f"[generate_key_monitor_excel_report] Error: {e}", exc_info=True)
+        return {"status": "error", "message": str(e), "file_path": None}
+
+
+@mcp.tool()
+def generate_pnb_excel_report(
+    max_count: int = 25,
+    duration_secs: int = 3600,
+    sort_meter: int = 4,
+    title: str = "PNB Interface Utilization Report",
+    filename: str = None,
+    start_ts: int = None,
+    end_ts: int = None,
+    context: str = "context0",
+    zmq_endpoint: str = None,
+):
+    """
+    Generate the PNB Excel report for top N router interfaces by utilization.
+
+    The report contains one row per interface with columns:
+    Router IP, Router Name, Interface, Interface Description,
+    In Utilization, Out Utilization, Total Utilization.
+
+    Interfaces are ranked by Total Utilization (average of In and Out utilization)
+    over the selected time window. Data is sourced from the FlowIntfs counter group.
+
+    Args:
+        max_count (int): Number of top interfaces to include (default 25).
+        duration_secs (int): Lookback window in seconds (default 3600 = 1 hour).
+            Ignored if start_ts/end_ts are provided.
+        sort_meter (int): Initial FlowIntfs meter used to fetch candidate interfaces
+            (default 4 = Recv/In Utilization).
+        title (str): Report title shown at the top of the Excel sheet.
+        filename (str): Output filename (saved under /tmp/). Auto-generated if omitted.
+        start_ts (int): Optional absolute start epoch seconds.
+        end_ts (int): Optional absolute end epoch seconds.
+        context (str): Trisul context (default "context0").
+        zmq_endpoint (str): Custom TRP ZMQ endpoint. Auto-computed if omitted.
+
+    Returns:
+        dict: status, message, file_path, and summary metadata.
+
+    Example:
+        generate_pnb_excel_report(max_count=25, duration_secs=3600)
+    """
+    try:
+        max_count = int(max_count)
+        duration_secs = int(duration_secs)
+        sort_meter = int(sort_meter)
+        if max_count <= 0:
+            return {"status": "error", "message": "max_count must be greater than 0.", "file_path": None}
+
+        if not zmq_endpoint:
+            ctx = normalize_context(context)
+            zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{ctx}/run/trp_0"
+
+        logging.info(
+            f"[generate_pnb_excel_report] max_count={max_count} duration_secs={duration_secs} "
+            f"sort_meter={sort_meter}"
+        )
+
+        from_ts_val, to_ts_val = _get_time_window(zmq_endpoint, duration_secs, start_ts, end_ts)
+        candidate_count = min(max(max_count * 3, max_count), 500)
+        topper_keys = _fetch_flowintf_topper(
+            zmq_endpoint, sort_meter, candidate_count, from_ts_val, to_ts_val
+        )
+
+        # Utilization meters may be empty; fall back to total-traffic topper for candidates.
+        if not topper_keys and sort_meter != 0:
+            logging.info(
+                "[generate_pnb_excel_report] No interfaces from util meter "
+                f"{sort_meter}; falling back to meter 0"
+            )
+            topper_keys = _fetch_flowintf_topper(
+                zmq_endpoint, 0, candidate_count, from_ts_val, to_ts_val
+            )
+
+        if not topper_keys:
+            return {
+                "status": "error",
+                "message": (
+                    "No interface data found for the selected time window. "
+                    "SYS:GROUP aggregate keys were excluded."
+                ),
+                "file_path": None,
+            }
+
+        resolved_meters, _ = _resolve_meter_ids(
+            FLOWINTFS_GUID, [4, 5], zmq_endpoint
+        )
+        meter_ids = [m["id"] for m in resolved_meters]
+        meters_info = {m["id"]: m for m in resolved_meters}
+        in_meter_id = meter_ids[0]
+        out_meter_id = meter_ids[1] if len(meter_ids) > 1 else meter_ids[0]
+
+        router_keys = {
+            keyt.key.split("_")[0]
+            for keyt in topper_keys
+            if _is_interface_key(keyt.key)
+        }
+        router_names = _fetch_router_names(router_keys, zmq_endpoint)
+
+        report_rows = []
+        for keyt in topper_keys:
+            if not _is_interface_key(keyt.key):
+                continue
+
+            router_key = keyt.key.split("_")[0]
+            readable = keyt.readable or keyt.key
+            router_ip = readable.split("_")[0] if "_" in readable else router_key
+            router_name = router_names.get(router_key, router_ip)
+
+            attrs = _key_attrs_to_dict(keyt)
+            interface = keyt.label.strip() if keyt.label and keyt.label.strip() else readable.split("_")[-1]
+            interface_description = (
+                attrs.get("snmp.ifalias")
+                or (keyt.description.strip() if keyt.description else "")
+                or "-"
+            )
+
+            lookup_key = keyt.readable or keyt.label or keyt.key
+            try:
+                stats = _get_key_meter_stats(
+                    FLOWINTFS_GUID,
+                    lookup_key,
+                    meter_ids,
+                    from_ts_val,
+                    to_ts_val,
+                    zmq_endpoint,
+                    meters_info,
+                )
+                in_util = stats["meters"][in_meter_id]["averages"]
+                out_util = stats["meters"][out_meter_id]["averages"]
+            except Exception as ex:
+                logging.warning(
+                    f"[generate_pnb_excel_report] Failed for interface '{lookup_key}': {ex}"
+                )
+                in_util = -1
+                out_util = -1
+
+            total_util = (in_util + out_util) / 2 if in_util >= 0 and out_util >= 0 else -1
+            report_rows.append({
+                "router_ip": router_ip,
+                "router_name": router_name,
+                "interface": interface,
+                "interface_description": interface_description,
+                "in_utilization": _fmt_util_pct(in_util),
+                "out_utilization": _fmt_util_pct(out_util),
+                "total_utilization": _fmt_util_pct(total_util),
+                "_sort_total_util": total_util,
+            })
+
+        report_rows.sort(key=lambda row: row["_sort_total_util"], reverse=True)
+        report_rows = report_rows[:max_count]
+        for row in report_rows:
+            row.pop("_sort_total_util", None)
+
+        if not report_rows:
+            return {
+                "status": "error",
+                "message": "No interface utilization data could be collected.",
+                "file_path": None,
+            }
+
+        if not filename:
+            safe_title = "".join(c if c.isalnum() or c in "-_" else "_" for c in title)[:40]
+            filename = f"pnb_interface_util_{safe_title}_{int(datetime.now().timestamp())}.xlsx"
+
+        filepath = _build_pnb_excel(title, from_ts_val, to_ts_val, report_rows, filename)
+
+        logging.info(f"[generate_pnb_excel_report] Report saved to {filepath}")
+        return {
+            "status": "success",
+            "message": f"PNB Excel report generated successfully at {filepath}",
+            "file_path": filepath,
+            "interfaces_count": len(report_rows),
+            "duration": epoch_to_duration(from_ts_val, to_ts_val),
+            "columns": [
+                "Router IP",
+                "Router Name",
+                "Interface",
+                "Interface Description",
+                "In Utilization",
+                "Out Utilization",
+                "Total Utilization",
+            ],
+        }
+
+    except Exception as e:
+        logging.error(f"[generate_pnb_excel_report] Error: {e}", exc_info=True)
+        return {"status": "error", "message": str(e), "file_path": None}
+
+
+@mcp.tool()
+def generate_excel_report(
+    columns: List[dict],
+    rows: List[dict],
+    title: str = None,
+    metadata: List[str] = None,
+    from_ts: int = None,
+    to_ts: int = None,
+    filename: str = None,
+    sheet_name: str = "Report",
+    merge_columns: List[str] = None,
+    include_generated_timestamp: bool = True,
+):
+    """
+    Generate a flexible Excel (.xlsx) report with custom columns, rows, and formatting.
+
+    Use this as the generic report builder for any tabular Excel export. Specialized
+    reports (key monitor, PNB, etc.) can also be built with this tool when you already
+    have the data assembled.
+
+    Args:
+        columns (list[dict]): Column definitions. Each dict has:
+            * header (str): Column header text (required)
+            * key (str): Row dict key for this column (defaults to header)
+            * format (str): Value formatter — one of:
+                "text" (default), "percent"/"util_pct", "number", "volume",
+                "bandwidth"/"bw", "datetime_epoch"
+            * format_args (dict): Formatter options, e.g. {"decimals": 2}, {"units": "bps"}
+            * width (int): Fixed column width in characters
+        rows (list[dict]): Data rows; each dict is keyed by column "key" values.
+        title (str): Optional report title shown at the top.
+        metadata (list[str]): Optional extra header lines below the title.
+        from_ts (int): Optional start epoch; adds a duration line when paired with to_ts.
+        to_ts (int): Optional end epoch; adds a duration line when paired with from_ts.
+        filename (str): Output filename (saved under /tmp/). Auto-generated if omitted.
+        sheet_name (str): Excel worksheet name (default "Report", max 31 chars).
+        merge_columns (list[str]): Column keys to vertically merge when consecutive
+            rows leave the cell empty (useful for grouped/key-monitor style reports).
+        include_generated_timestamp (bool): Add a "Generated at ..." line (default True).
+
+    Returns:
+        dict: status, message, file_path, row_count, and column headers.
+
+    Examples:
+        # Simple custom report
+        generate_excel_report(
+            title="Top Hosts",
+            columns=[
+                {"header": "Host", "key": "host"},
+                {"header": "Total Bytes", "key": "bytes", "format": "volume"},
+                {"header": "Avg Bandwidth", "key": "avg_bps", "format": "bandwidth"},
+            ],
+            rows=[
+                {"host": "10.1.1.1", "bytes": 1048576, "avg_bps": 1500000},
+                {"host": "10.1.1.2", "bytes": 524288, "avg_bps": 750000},
+            ],
+            from_ts=1718711400,
+            to_ts=1718715000,
+        )
+
+        # Pre-formatted text values (no format conversion)
+        generate_excel_report(
+            columns=[
+                {"header": "Name", "key": "name"},
+                {"header": "Status", "key": "status"},
+                {"header": "Value", "key": "value"},
+            ],
+            rows=[
+                {"name": "router-a", "status": "OK", "value": "99.5%"},
+                {"name": "router-b", "status": "WARN", "value": "82.1%"},
+            ],
+            sheet_name="Health Check",
+        )
+    """
+    try:
+        if not columns:
+            return {"status": "error", "message": "At least one column is required.", "file_path": None}
+        if not rows:
+            return {"status": "error", "message": "At least one data row is required.", "file_path": None}
+
+        normalized_columns = _normalize_excel_columns(columns)
+        logging.info(
+            f"[generate_excel_report] columns={len(normalized_columns)} rows={len(rows)} "
+            f"sheet_name={sheet_name}"
+        )
+
+        if not filename:
+            safe_title = "".join(
+                c if c.isalnum() or c in "-_" else "_"
+                for c in (title or sheet_name or "report")
+            )[:40]
+            filename = f"excel_{safe_title}_{int(datetime.now().timestamp())}.xlsx"
+
+        filepath = _build_excel_report(
+            columns=columns,
+            rows=rows,
+            title=title,
+            metadata=metadata,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            filename=filename,
+            sheet_name=sheet_name,
+            merge_columns=merge_columns,
+            include_generated_timestamp=include_generated_timestamp,
+        )
+
+        logging.info(f"[generate_excel_report] Report saved to {filepath}")
+        if not os.path.isfile(filepath):
+            return {
+                "status": "error",
+                "message": f"Excel file was not written to disk at {filepath}",
+                "file_path": None,
+            }
+        return {
+            "status": "success",
+            "message": f"Excel report generated successfully at {filepath}",
+            "file_path": filepath,
+            "row_count": len(rows),
+            "columns": [col["header"] for col in normalized_columns],
+            "duration": epoch_to_duration(from_ts, to_ts) if from_ts is not None and to_ts is not None else None,
+        }
+
+    except Exception as e:
+        logging.error(f"[generate_excel_report] Error: {e}", exc_info=True)
+        return {"status": "error", "message": str(e), "file_path": None}
 
 
 @mcp.tool()
