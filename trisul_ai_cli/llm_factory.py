@@ -21,6 +21,9 @@ class LLMFactory:
                     },
         "voyageai": {
                         "embedding": "voyage-2"
+                    },
+        "custom": {
+                        "llm": []
                     }
     }
 
@@ -34,6 +37,7 @@ class LLMFactory:
         self.provider = self.config.get("TRISUL_AI_PROVIDER", "gemini")
         self.model_name = self.config.get("TRISUL_AI_MODEL")
         self.api_key = self.config.get(f"TRISUL_{self.provider.upper()}_API_KEY")
+        self.api_base_url = self.config.get("TRISUL_CUSTOM_API_BASE_URL")
 
         # Embedding config
         self.embedding_model = self.config.get("TRISUL_EMBEDDING_MODEL")
@@ -48,15 +52,39 @@ class LLMFactory:
         
         self.embedding_api_key = self.config.get(f"TRISUL_{str(self.embedding_provider).upper()}_API_KEY") if self.embedding_provider else None
 
-        self.logging.info(f"[LLMFactory] Loaded config: provider={self.provider}, model={self.model_name}, embedding_model={self.embedding_model}, embedding_provider={self.embedding_provider}")
+        self.logging.info(
+            f"[LLMFactory] Loaded config: provider={self.provider}, model={self.model_name}, "
+            f"api_base_url={self.api_base_url}, embedding_model={self.embedding_model}, "
+            f"embedding_provider={self.embedding_provider}"
+        )
 
 
 
+
+    @staticmethod
+    def _normalize_openai_base_url(url: str) -> str:
+        url = url.rstrip("/")
+        if not url.endswith("/v1"):
+            url = f"{url}/v1"
+        return url
 
     def get_llm(self):
         self._load_config() # Reload in case it changed
         self.logging.info(f"[LLMFactory] Getting LLM for provider {self.provider} with model {self.model_name}")
         
+        if self.provider == "custom":
+            if not self.api_base_url or not self.model_name:
+                self.logging.warning(
+                    "[LLMFactory] Custom LLM requires TRISUL_CUSTOM_API_BASE_URL and TRISUL_AI_MODEL."
+                )
+                return None
+            api_key = self.api_key or "not-needed"
+            return ChatOpenAI(
+                model=self.model_name,
+                api_key=api_key,
+                base_url=self._normalize_openai_base_url(self.api_base_url),
+            )
+
         if not self.api_key:
             self.logging.warning("[LLMFactory] API key not found. Please set it using the 'set_api_key' method.")
             return None
@@ -190,3 +218,18 @@ class LLMFactory:
         set_key(self.env_path, f"TRISUL_{provider.upper()}_API_KEY", api_key)
         self.logging.info(f"[LLMFactory] API key updated for provider {provider}")
         self._load_config()
+
+    def set_custom_llm(self, base_url: str, model_name: str, api_key: str = None):
+        normalized_url = self._normalize_openai_base_url(base_url)
+        self.set_provider("custom")
+        self.set_model(model_name)
+        set_key(self.env_path, "TRISUL_CUSTOM_API_BASE_URL", normalized_url)
+        if api_key:
+            set_key(self.env_path, f"TRISUL_{self.provider.upper()}_API_KEY", api_key)
+        self.logging.info(
+            f"[LLMFactory] Custom LLM configured: model={model_name}, base_url={normalized_url}"
+        )
+        self._load_config()
+
+    def get_custom_api_base_url(self):
+        return self.api_base_url

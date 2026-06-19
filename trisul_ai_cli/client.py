@@ -4,7 +4,7 @@ warnings.filterwarnings("ignore",category=FutureWarning,module="google.api_core"
 import asyncio
 import json
 from contextlib import AsyncExitStack
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import nest_asyncio
 import sys
 from mcp import ClientSession, StdioServerParameters
@@ -69,10 +69,13 @@ class TrisulAIClient:
         self.table_data = {}
         self.report_path = None
         self.verified_report_path = None
+        self.auto_open_reports = True
         self.pending_report_request = False
         self.report_data_fetched = False
         self.report_continue_attempts = 0
         self.sessions = {} # session_id -> conversation_history (list of Messages)
+        self.zmq_endpoint: Optional[str] = None
+        self.trisul_context: str = "context0"
                 
         
         # Load main system prompt
@@ -126,6 +129,16 @@ class TrisulAIClient:
 
     # Get your API key here
     def get_api_key(self) -> str:
+        provider = self.llm_factory.get_current_provider()
+        if provider == "custom":
+            if (
+                not self.llm_factory.get_custom_api_base_url()
+                or not self.llm_factory.config.get("TRISUL_AI_MODEL")
+            ):
+                print("\n🎉 Welcome to Trisul AI CLI — turn raw network data into answers using plain English.\n")
+                self.set_custom_llm()
+            return
+
         api_key = self.llm_factory.get_current_api_key()
         if not api_key:
             # If the model is not configured in the environment, force model selection.
@@ -159,9 +172,18 @@ class TrisulAIClient:
                     current_marker = ' (current)'
                 print(f"{idx}) {prov}:{mdl}{current_marker}")
 
+            custom_option = len(flat_list) + 1
+            custom_marker = ''
+            if current_provider == "custom":
+                custom_marker = ' (current)'
+            print(
+                f"{custom_option}) custom:local "
+                f"(Ollama, LM Studio, vLLM, or any OpenAI-compatible endpoint){custom_marker}"
+            )
+
             selected_index = None
             while True:
-                choice = input(f"\n🤖 (Bot) : Enter your choice (1-{len(flat_list)}): ").strip()
+                choice = input(f"\n🤖 (Bot) : Enter your choice (1-{custom_option}): ").strip()
                 if not choice.isdigit():
                     print("\n🤖 (Bot) : ❌ Invalid choice. Please enter a number.")
                     continue
@@ -169,8 +191,9 @@ class TrisulAIClient:
                 if 1 <= idx <= len(flat_list):
                     selected_index = idx - 1
                     break
-                else:
-                    print("\n🤖 (Bot) : ❌ Choice out of range. Try again.")
+                if idx == custom_option:
+                    return self.set_custom_llm()
+                print("\n🤖 (Bot) : ❌ Choice out of range. Try again.")
 
             selected_provider, selected_model = flat_list[selected_index]
             # Use the new factory method to set both provider and model
@@ -201,6 +224,47 @@ class TrisulAIClient:
         except KeyboardInterrupt:
             print("\n\n🤖 (Bot) : Model Selection cancelled by user.")
             logging.info("[Client] Model Selection cancelled by user.")
+            sys.exit(0)
+
+    def set_custom_llm(self):
+        """Configure a local or self-hosted OpenAI-compatible LLM endpoint."""
+        try:
+            current_url = self.llm_factory.get_custom_api_base_url() or "http://localhost:11434"
+            current_model = self.llm_factory.get_current_model() or "llama3.2"
+
+            print(
+                "\n🤖 (Bot) : Configure a custom OpenAI-compatible LLM endpoint "
+                "(Ollama, LM Studio, vLLM, LocalAI, etc.)\n"
+            )
+            print("   Example base URL: http://localhost:11434  (Ollama)")
+            print("   Example model:    llama3.2\n")
+
+            base_url = input(f"API base URL [{current_url}]: ").strip() or current_url
+            model_name = input(f"Model name [{current_model}]: ").strip() or current_model
+            api_key = stdiomask.getpass(
+                "API key (press Enter to skip for local servers like Ollama): "
+            ).strip()
+
+            if not self.env_path.exists():
+                self.env_path.touch()
+
+            self.llm_factory.set_custom_llm(
+                base_url=base_url,
+                model_name=model_name,
+                api_key=api_key or "not-needed",
+            )
+
+            normalized_url = self.llm_factory.get_custom_api_base_url()
+            print(
+                f"\n🤖 (Bot) : Custom LLM configured: {model_name} @ {normalized_url}\n"
+            )
+            logging.info(
+                f"[Client] Custom LLM configured: model={model_name}, base_url={normalized_url}"
+            )
+            return model_name
+        except KeyboardInterrupt:
+            print("\n\n🤖 (Bot) : Custom LLM configuration cancelled by user.")
+            logging.info("[Client] Custom LLM configuration cancelled by user.")
             sys.exit(0)
 
     # Change the Embedding model version
@@ -291,16 +355,94 @@ class TrisulAIClient:
         tools_result = await self.session.list_tools()
         tool_list = []
         for tool in tools_result.tools:
+            schema = self._adapt_tool_schema_for_llm(dict(tool.inputSchema or {}))
             # Convert to OpenAI function format which is widely supported by LangChain bind_tools
             tool_list.append({
                 "type": "function",
                 "function": {
                     "name": tool.name,
                     "description": tool.description,
-                    "parameters": tool.inputSchema,
+                    "parameters": schema,
                 }
             })
         return tool_list
+
+    def _adapt_tool_schema_for_llm(self, schema: dict) -> dict:
+        """Gemini/LangChain reject a tool parameter literally named 'title'."""
+        props = schema.get("properties")
+        if isinstance(props, dict) and "title" in props:
+            props = dict(props)
+            props["report_title"] = props.pop("title")
+            if isinstance(props["report_title"], dict):
+                props["report_title"]["title"] = "Report Title"
+            schema = dict(schema)
+            schema["properties"] = props
+        return schema
+
+    def _parse_connect_endpoint(self, text: str) -> Optional[str]:
+        if not text:
+            return None
+        m = re.search(r"connect\s+to\s+(tcp://\S+)", text, re.I)
+        if m:
+            return m.group(1).rstrip(".,;")
+        m = re.search(r"connect\s+to\s+([\d.]+:\d+)", text, re.I)
+        if m:
+            return f"tcp://{m.group(1)}"
+        return None
+
+    def _parse_connect_context(self, text: str) -> Optional[str]:
+        if not text:
+            return None
+        m = re.search(r"connect\s+to\s+(context\S+)", text, re.I)
+        if m:
+            ctx = m.group(1).strip()
+            return ctx if ctx.startswith("context") else f"context{ctx}"
+        return None
+
+    def _update_connection_from_text(self, text: str) -> None:
+        endpoint = self._parse_connect_endpoint(text)
+        if endpoint:
+            self.zmq_endpoint = endpoint
+            logging.info(f"[Client] TRP endpoint set to {endpoint}")
+            return
+        ctx = self._parse_connect_context(text)
+        if ctx:
+            self.trisul_context = ctx
+            self.zmq_endpoint = None
+            logging.info(f"[Client] Trisul context set to {ctx}")
+
+    def _sync_connection_from_history(self) -> None:
+        for msg in reversed(self.conversation_history):
+            if isinstance(msg, HumanMessage):
+                self._update_connection_from_text(str(msg.content or ""))
+                if self.zmq_endpoint:
+                    return
+
+    def _normalize_tool_args(self, function_name: str, function_args: dict) -> dict:
+        args = dict(function_args or {})
+        if "report_title" in args and "title" not in args:
+            args["title"] = args.pop("report_title")
+        if function_name in self.TRP_ENDPOINT_TOOLS:
+            if not args.get("zmq_endpoint") and self.zmq_endpoint:
+                args["zmq_endpoint"] = self.zmq_endpoint
+            if not args.get("context") and self.trisul_context:
+                args.setdefault("context", self.trisul_context)
+        if args.get("zmq_endpoint"):
+            self.zmq_endpoint = args["zmq_endpoint"]
+        return args
+
+    def _last_tool_had_connection_error(self) -> bool:
+        for msg in reversed(self.conversation_history):
+            if isinstance(msg, ToolMessage):
+                content = str(msg.content or "").lower()
+                return (
+                    "zmq timeout" in content
+                    or "no response from ipc://" in content
+                    or '"status": "error"' in content and "zmq" in content
+                )
+            if isinstance(msg, AIMessage):
+                break
+        return False
 
 
     def extract_message(self, e):
@@ -329,7 +471,8 @@ class TrisulAIClient:
 
     REPORT_GENERATION_TOOLS = frozenset({
         "generate_excel_report",
-        "generate_pnb_excel_report",
+        "generate_dynamic_report",
+        "generate_dynamic_excel_report",
         "generate_key_monitor_excel_report",
         "generate_trisul_report",
     })
@@ -339,6 +482,17 @@ class TrisulAIClient:
         "get_cginfo_from_countergroup_name",
         "search_keys",
         "list_all_available_counter_groups",
+    })
+    TRP_ENDPOINT_TOOLS = frozenset({
+        "list_all_available_counter_groups",
+        "get_cginfo_from_countergroup_name",
+        "get_counter_group_topper",
+        "get_key_traffic_data",
+        "get_alerts_data",
+        "search_keys",
+        "generate_dynamic_report",
+        "generate_dynamic_excel_report",
+        "generate_key_monitor_excel_report",
     })
     MAX_REPORT_CONTINUE_ATTEMPTS = 8
     _REPORT_IN_PROGRESS_RE = re.compile(
@@ -350,8 +504,9 @@ class TrisulAIClient:
 
     def _is_report_request(self, query):
         q = (query or "").lower()
-        if any(token in q for token in ("excel", "xlsx", "spreadsheet")):
-            return True
+        if any(token in q for token in ("excel", "xlsx", "spreadsheet", "pdf", "report")):
+            if any(w in q for w in ("generate", "export", "download", "create", "show", "regenerate", "recreate", "rebuild", "traffic")):
+                return True
         if "report" in q and any(
             w in q for w in ("generate", "export", "download", "create", "regenerate", "recreate", "rebuild")
         ):
@@ -360,7 +515,95 @@ class TrisulAIClient:
             w in q for w in ("report", "excel", "same")
         ):
             return True
+        if any(w in q for w in ("remove", "drop", "exclude", "add", "delete")) and any(
+            w in q for w in ("column", "collumn", "header", "field")
+        ):
+            return True
         return False
+
+    def _report_query_hints(self, query: str) -> str:
+        """Derive server-side report routing hints from natural language."""
+        q = (query or "").lower()
+        hints = []
+
+        is_key_traffic = any(
+            p in q for p in (
+                "key traffic", "traffic for", "traffic of", "traffic over",
+                "traffic trend", "each minute", "per minute", "timestamp",
+                "time series", "timeseries",
+            )
+        ) or (
+            any(p in q for p in ("https", "http", "dns", "ssh"))
+            and "top" not in q
+            and "topper" not in q
+        )
+        is_topper = bool(re.search(r"\btop\s+\d+\b", q)) or "topper" in q or "top " in q
+
+        if is_key_traffic and not is_topper:
+            hints.append(
+                'REPORT ROUTE: intent="key_traffic", keys=[...], use generate_dynamic_report. '
+                "Do NOT use source=topper or max_count. One row per time bucket (COUNTER_ITEM)."
+            )
+        elif is_topper:
+            hints.append(
+                'REPORT ROUTE: intent="topper", max_count=N, use generate_dynamic_report. '
+                "Do NOT use intent=key_traffic."
+            )
+
+        if "pdf" in q:
+            hints.append('output_format="pdf" on generate_dynamic_report.')
+
+        from trisul_ai_cli.time_utils import extract_time_range_from_query
+
+        time_range = extract_time_range_from_query(query)
+        if time_range:
+            start_raw, end_raw = time_range
+            hints.append(
+                f'TIME WINDOW: pass start_time="{start_raw}" and end_time="{end_raw}" to '
+                "generate_dynamic_report exactly as written. Do NOT pass start_ts/end_ts — "
+                "the server parses IST datetimes."
+            )
+
+        if is_topper and any(
+            token in q for token in ("utilization", "util", "recv-util", "xmit-util")
+        ):
+            hints.append(
+                'FLOWINTFS UTIL: meters=["Recv-Util","Xmit-Util"], sort_meter=4 '
+                "(server infers these if omitted, but always pass for utilization reports)."
+            )
+
+        if "excel" in q or "xlsx" in q:
+            hints.append('output_format="xlsx" (default).')
+
+        is_column_edit = (
+            any(w in q for w in ("remove", "drop", "exclude", "delete", "hide"))
+            and any(w in q for w in ("column", "collumn", "field", "header"))
+        ) or (
+            any(w in q for w in ("add", "insert", "new"))
+            and any(w in q for w in ("column", "collumn", "total"))
+        ) or "sum of" in q or "sum_of" in q
+
+        is_column_order = any(
+            phrase in q
+            for phrase in ("same order", "exact order", "column order", "in this order", "order i mentioned")
+        )
+
+        if is_column_order:
+            hints.append(
+                "COLUMN ORDER: put every column in the `columns` array in the exact order requested. "
+                "For Total Utilization at a specific position, include it in `columns` with "
+                "sum_of_meters on that entry. Do NOT also pass computed_columns for the same field."
+            )
+
+        if is_column_edit:
+            hints.append(
+                "COLUMN EDIT: re-call generate_dynamic_report with the same counter_group_guid, "
+                "keys, and time window from the prior report. Use exclude_columns to drop columns "
+                "and computed_columns with sum_of_meters to add totals. "
+                "Do NOT call get_key_traffic_data or generate_excel_report with assembled rows."
+            )
+
+        return " ".join(hints)
 
     def _get_finish_reason(self, response):
         meta = getattr(response, "response_metadata", None) or {}
@@ -398,6 +641,8 @@ class TrisulAIClient:
         if self._response_has_tool_issues(response):
             return True
         if self._is_blank_response(content):
+            if self._last_tool_had_connection_error():
+                return False
             return True
         return self._should_continue_report_workflow(content)
 
@@ -407,7 +652,8 @@ class TrisulAIClient:
             return (
                 "SYSTEM: Your previous tool call failed (malformed function call) and was NOT executed. "
                 "Retry immediately. Reuse the data already fetched in this conversation — do not restart from scratch. "
-                "Call generate_excel_report with valid JSON containing only: columns, rows, title, "
+                "Call generate_dynamic_excel_report for Trisul data (do NOT pass assembled rows). "
+                "For non-Trisul tables use generate_excel_report with valid JSON: columns, rows, title, "
                 "from_ts, to_ts, filename, sheet_name. Do NOT pass zmq_endpoint to generate_excel_report. "
                 "Apply the header changes the user requested, then reply only after status success."
             )
@@ -420,6 +666,13 @@ class TrisulAIClient:
 
     def _finalize_user_response(self, content):
         content = (content or "").strip()
+        if self._is_blank_response(content) and self._last_tool_had_connection_error():
+            endpoint_hint = self.zmq_endpoint or "tcp://<host>:<port>"
+            content = (
+                "Could not reach Trisul TRP. The report/data request failed because no "
+                f"TRP endpoint responded (tried default local IPC if none was set).\n\n"
+                f"Connect first, e.g. `connect to {endpoint_hint}`, then retry the report."
+            )
         if self.verified_report_path and os.path.isfile(self.verified_report_path):
             if self.verified_report_path not in content:
                 suffix = f"Excel report saved to `{self.verified_report_path}`."
@@ -436,9 +689,11 @@ class TrisulAIClient:
         return (
             "SYSTEM: The Excel/report request is NOT complete yet. "
             "Do NOT send progress messages like 'stay tuned' or 'hang tight'. "
-            "Immediately call the next required tool(s) in the same workflow: "
-            "fetch any remaining data, then call generate_excel_report (or the correct report tool). "
-            "Only send your final user-facing reply AFTER the report tool returns "
+            "For Trisul data use generate_dynamic_report with intent=key_traffic or intent=topper. "
+            "For column changes use exclude_columns and computed_columns on generate_dynamic_report. "
+            "Do NOT assemble rows from get_counter_group_topper/get_key_traffic_data. "
+            "Do NOT use generate_excel_report for Trisul traffic. "
+            "Call the report tool immediately. Only reply to the user after "
             '"status": "success" with a verified file_path.'
         )
 
@@ -459,8 +714,37 @@ class TrisulAIClient:
 
         file_path = json_result.get("file_path")
         if file_path and os.path.isfile(file_path):
+            verification = json_result.get("verification") or {}
+            issues = verification.get("issues") or []
+            duplicate_issues = [
+                i for i in issues
+                if i.startswith("duplicate_column")
+            ]
+            if duplicate_issues:
+                error_payload = {
+                    "status": "error",
+                    "message": (
+                        "Report has duplicate columns: "
+                        f"{', '.join(duplicate_issues)}. "
+                        "Put computed fields only once — in `columns` at the desired position "
+                        "with sum_of_meters, OR in computed_columns to append at end, not both."
+                    ),
+                    "file_path": file_path,
+                    "columns": json_result.get("columns"),
+                    "verification": verification,
+                }
+                logging.warning(f"[Client] Report duplicate columns: {duplicate_issues}")
+                return json.dumps(error_payload), error_payload
+
             self.report_path = file_path
             self.verified_report_path = file_path
+            if verification and not verification.get("verified", True):
+                logging.warning(
+                    f"[Client] Report verification issues: {verification.get('issues')}"
+                )
+            data_type = json_result.get("data_type") or verification.get("data_type")
+            if data_type:
+                logging.info(f"[Client] Report data_type={data_type} verified={verification.get('verified')}")
             logging.info(f"[Client] Verified report file on disk: {file_path}")
             return tool_result, json_result
 
@@ -477,6 +761,39 @@ class TrisulAIClient:
             f"[Client] Report tool '{function_name}' reported success but file is missing: {file_path}"
         )
         return json.dumps(error_payload), error_payload
+
+    def _open_report_file(self, file_path: str) -> bool:
+        """Open a generated report with the OS default application."""
+        if not file_path or not os.path.isfile(file_path):
+            return False
+        try:
+            if os.name == "nt":
+                os.startfile(file_path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(
+                    ["open", file_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                subprocess.Popen(
+                    ["xdg-open", file_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            logging.info(f"[Client] Opened report file: {file_path}")
+            return True
+        except Exception as exc:
+            logging.warning(f"[Client] Failed to open report file {file_path}: {exc}")
+            return False
+
+    def _maybe_open_generated_report(self) -> None:
+        """Open the verified report file after a CLI query completes."""
+        if not self.auto_open_reports:
+            return
+        file_path = self.verified_report_path or self.report_path
+        if file_path and os.path.isfile(file_path):
+            self._open_report_file(file_path)
 
     def _guard_report_path_claims(self, content):
         """Append a warning if the LLM cites a report path that was never verified."""
@@ -507,10 +824,18 @@ class TrisulAIClient:
         """Process a query using LangChain and MCP tools."""
         
         self.verified_report_path = None
+        self.report_path = None
         self.pending_report_request = self._is_report_request(query)
         self.report_data_fetched = False
         self.report_continue_attempts = 0
-        self.conversation_history.append(HumanMessage(content=query))
+        user_content = query
+        if self.pending_report_request:
+            hints = self._report_query_hints(query)
+            if hints:
+                user_content = f"{query}\n\n[SYSTEM: {hints}]"
+        self.conversation_history.append(HumanMessage(content=user_content))
+        self._update_connection_from_text(query)
+        self._sync_connection_from_history()
 
         llm = self.llm_factory.get_llm()
         if not llm:
@@ -522,129 +847,139 @@ class TrisulAIClient:
 
         iteration = 0
         
-        while iteration < self.max_iterations:
-            iteration += 1
-            
-            try:
-                response = await llm_with_tools.ainvoke(self.conversation_history)
-            except Exception as e:
-                logging.error(f"[Client] LLM Error: {e}")
-                msg = self.extract_message(str(e))
-                return f"Error communicating with LLM: {msg}"
-            
-            self.conversation_history.append(response)
-            
-            if not response.tool_calls:
-                content = self.extract_text_from_content(response.content)
-                if self._should_retry_after_no_tools(response, content):
-                    if self.report_continue_attempts >= self.MAX_REPORT_CONTINUE_ATTEMPTS:
-                        logging.warning("[Client] Agent loop hit max retry attempts")
-                        return self._finalize_user_response(content)
-                    self.report_continue_attempts += 1
-                    logging.info(
-                        f"[Client] Incomplete/empty LLM response — auto-retrying "
-                        f"(attempt {self.report_continue_attempts}, "
-                        f"finish_reason={self._get_finish_reason(response)!r})"
-                    )
-                    self.conversation_history.append(
-                        HumanMessage(content=self._retry_message(response, content))
-                    )
-                    continue
-                return self._finalize_user_response(content)
-            
-            # Process tool calls
-            for tool_call in response.tool_calls:
-                function_name = tool_call["name"]
-                function_args = tool_call["args"]
-                tool_call_id = tool_call["id"]
-                
-                logging.info(f"[Client] Calling function: {function_name} with args: {function_args}")
-                
-                if self.pending_report_request and function_name in self.REPORT_DATA_TOOLS:
-                    self.report_data_fetched = True
+        try:
+            while iteration < self.max_iterations:
+                iteration += 1
                 
                 try:
-                    # Call the tool on MCP server
-                    result = await self.session.call_tool(function_name, function_args)
-                    tool_result = result.content[0].text if result.content else "No result"
-                    json_result, tool_result = self._parse_tool_json(tool_result)
-                    clean_result = tool_result.replace("\n", "").replace("\r", "").replace("\t", " ").replace("   ", " ")
-                    logging.info(f"[Client] Function result: {clean_result}")
-                    
-                    tool_result, json_result = self._handle_report_tool_result(
-                        function_name, json_result, tool_result
-                    )
-                    
-                    # Handle side effects
-                    if function_name == "show_line_chart":
-                        if json_result and json_result.get('status') == "success":
-                            if json_result.get('file_path'):
-                                await self.utils.display_line_chart(function_args.get("data"), json_result['file_path'])
-                            else:
-                                self.line_chart_data = function_args.get("data")
-                        else:
-                            logging.warning(f"[Client] [process_query] {json_result.get('message') if json_result else tool_result}")
-
-                    if function_name == "show_pie_chart":
-                        if json_result and json_result.get('status') == "success":
-                            if json_result.get('file_path'):
-                                await self.utils.display_pie_chart(function_args.get("data"), json_result['file_path'])
-                            else:
-                                self.pie_chart_data = function_args.get("data")
-                        else:
-                            logging.warning(f"[Client] [process_query] {json_result.get('message') if json_result else tool_result}")
-
-                    if function_name == "show_table":
-                        if json_result and json_result.get('status') == "success":
-                            self.table_data = function_args.get("data")
-                        else:
-                            logging.warning(f"[Client] [process_query] {json_result.get('message') if json_result else tool_result}")
-
-                    if function_name == "generate_trisul_report":
-                        if not (json_result and json_result.get('status') == "success"):
-                            logging.warning(f"[Client] [process_query] {json_result.get('message') if json_result else tool_result}")
-
-                    if function_name == "configure_llm_model":
-                        print("\033[F\033[K", end="")
-                        new_model = self.set_llm_model()
-                        tool_result = f'The LLM model version has been changed to {new_model}.'
-
-                    if function_name == "configure_embedding_model":
-                        print("\033[F\033[K", end="")
-                        new_model = self.set_embedding_model()
-                        tool_result = f'The Embedding model version has been changed to {new_model}.'
-
-                    if function_name == "configure_llm_api_key":
-                        print("\033[F\033[K", end="")
-                        self.set_api_key(provider_type="llm")
-                        tool_result = "LLM API Key updated."
-
-                    if function_name == "configure_embedding_api_key":
-                        print("\033[F\033[K", end="")
-                        self.set_api_key(provider_type="embedding")
-                        tool_result = "Embedding API Key updated."
-
-                    if function_name == "get_current_model_status":
-                        tool_result = self.get_current_model_status()
-                    
-                    # Add tool output to history
-                    self.conversation_history.append(ToolMessage(
-                        content=tool_result,
-                        tool_call_id=tool_call_id,
-                        name=function_name
-                    ))
-                    
+                    response = await llm_with_tools.ainvoke(self.conversation_history)
                 except Exception as e:
-                    logging.error(f"[Client] Error calling function {function_name}: {e}")
-                    self.conversation_history.append(ToolMessage(
-                        content=f"Error: {str(e)}",
-                        tool_call_id=tool_call_id,
-                        name=function_name
-                    ))
+                    logging.error(f"[Client] LLM Error: {e}")
+                    msg = self.extract_message(str(e))
+                    return f"Error communicating with LLM: {msg}"
+                
+                self.conversation_history.append(response)
+                
+                if not response.tool_calls:
+                    content = self.extract_text_from_content(response.content)
+                    if self._should_retry_after_no_tools(response, content):
+                        if self.report_continue_attempts >= self.MAX_REPORT_CONTINUE_ATTEMPTS:
+                            logging.warning("[Client] Agent loop hit max retry attempts")
+                            return self._finalize_user_response(content)
+                        self.report_continue_attempts += 1
+                        logging.info(
+                            f"[Client] Incomplete/empty LLM response — auto-retrying "
+                            f"(attempt {self.report_continue_attempts}, "
+                            f"finish_reason={self._get_finish_reason(response)!r})"
+                        )
+                        self.conversation_history.append(
+                            HumanMessage(content=self._retry_message(response, content))
+                        )
+                        continue
+                    return self._finalize_user_response(content)
+                
+                # Process tool calls
+                for tool_call in response.tool_calls:
+                    function_name = tool_call["name"]
+                    function_args = self._normalize_tool_args(
+                        function_name, tool_call["args"]
+                    )
+                    tool_call_id = tool_call["id"]
+                    
+                    logging.info(f"[Client] Calling function: {function_name} with args: {function_args}")
+                    
+                    if self.pending_report_request and function_name in self.REPORT_DATA_TOOLS:
+                        self.report_data_fetched = True
+                    
+                    try:
+                        # Call the tool on MCP server
+                        result = await self.session.call_tool(function_name, function_args)
+                        tool_result = result.content[0].text if result.content else "No result"
+                        json_result, tool_result = self._parse_tool_json(tool_result)
+                        clean_result = tool_result.replace("\n", "").replace("\r", "").replace("\t", " ").replace("   ", " ")
+                        logging.info(f"[Client] Function result: {clean_result}")
+                        
+                        tool_result, json_result = self._handle_report_tool_result(
+                            function_name, json_result, tool_result
+                        )
+                        
+                        # Handle side effects
+                        if function_name == "show_line_chart":
+                            if json_result and json_result.get('status') == "success":
+                                if json_result.get('file_path'):
+                                    await self.utils.display_line_chart(function_args.get("data"), json_result['file_path'])
+                                else:
+                                    self.line_chart_data = function_args.get("data")
+                            else:
+                                logging.warning(f"[Client] [process_query] {json_result.get('message') if json_result else tool_result}")
+
+                        if function_name == "show_pie_chart":
+                            if json_result and json_result.get('status') == "success":
+                                if json_result.get('file_path'):
+                                    await self.utils.display_pie_chart(function_args.get("data"), json_result['file_path'])
+                                else:
+                                    self.pie_chart_data = function_args.get("data")
+                            else:
+                                logging.warning(f"[Client] [process_query] {json_result.get('message') if json_result else tool_result}")
+
+                        if function_name == "show_table":
+                            if json_result and json_result.get('status') == "success":
+                                self.table_data = function_args.get("data")
+                            else:
+                                logging.warning(f"[Client] [process_query] {json_result.get('message') if json_result else tool_result}")
+
+                        if function_name == "generate_trisul_report":
+                            if not (json_result and json_result.get('status') == "success"):
+                                logging.warning(f"[Client] [process_query] {json_result.get('message') if json_result else tool_result}")
+
+                        if function_name == "configure_llm_model":
+                            print("\033[F\033[K", end="")
+                            new_model = self.set_llm_model()
+                            tool_result = f'The LLM model version has been changed to {new_model}.'
+
+                        if function_name == "configure_custom_llm":
+                            print("\033[F\033[K", end="")
+                            new_model = self.set_custom_llm()
+                            tool_result = f'The custom LLM has been configured to use {new_model}.'
+
+                        if function_name == "configure_embedding_model":
+                            print("\033[F\033[K", end="")
+                            new_model = self.set_embedding_model()
+                            tool_result = f'The Embedding model version has been changed to {new_model}.'
+
+                        if function_name == "configure_llm_api_key":
+                            print("\033[F\033[K", end="")
+                            self.set_api_key(provider_type="llm")
+                            tool_result = "LLM API Key updated."
+
+                        if function_name == "configure_embedding_api_key":
+                            print("\033[F\033[K", end="")
+                            self.set_api_key(provider_type="embedding")
+                            tool_result = "Embedding API Key updated."
+
+                        if function_name == "get_current_model_status":
+                            tool_result = self.get_current_model_status()
+                        
+                        # Add tool output to history
+                        self.conversation_history.append(ToolMessage(
+                            content=tool_result,
+                            tool_call_id=tool_call_id,
+                            name=function_name
+                        ))
+                        
+                    except Exception as e:
+                        logging.error(f"[Client] Error calling function {function_name}: {e}")
+                        self.conversation_history.append(ToolMessage(
+                            content=f"Error: {str(e)}",
+                            tool_call_id=tool_call_id,
+                            name=function_name
+                        ))
+                
+                # Loop continues to send tool outputs back to LLM
             
-            # Loop continues to send tool outputs back to LLM
-        
-        return "Reached max iterations without final response"
+            return "Reached max iterations without final response"
+        finally:
+            self._maybe_open_generated_report()
 
 
     async def process_query_api(self, query: str, system_prompt: str = None, session_id: str = None) -> dict:
@@ -655,11 +990,22 @@ class TrisulAIClient:
         import time
         start_time = time.time()
         self.verified_report_path = None
+        self.report_path = None
         self.pending_report_request = self._is_report_request(query)
         self.report_data_fetched = False
         self.report_continue_attempts = 0
-        
-        # Retrieve or create session history
+        prev_auto_open = self.auto_open_reports
+        self.auto_open_reports = False
+        try:
+            return await self._process_query_api_body(
+                query, system_prompt, session_id, start_time,
+            )
+        finally:
+            self.auto_open_reports = prev_auto_open
+
+    async def _process_query_api_body(
+        self, query: str, system_prompt: str, session_id: str, start_time: float,
+    ) -> dict:
         if session_id and session_id in self.sessions:
             logging.info(f"[Client][API] [Session: {session_id}] Reusing existing session history.")
             history = self.sessions[session_id]
@@ -692,6 +1038,7 @@ class TrisulAIClient:
         
         logging.info(f"[Client][API] [Session: {session_id}] User Query: {query}")
         history.append(HumanMessage(content=query))
+        self._update_connection_from_text(query)
 
         llm = self.llm_factory.get_llm()
         if not llm:
@@ -759,12 +1106,15 @@ class TrisulAIClient:
             # Process tool calls
             for tool_call in response.tool_calls:
                 function_name = tool_call["name"]
-                function_args = tool_call["args"]
+                function_args = self._normalize_tool_args(
+                    function_name, tool_call["args"]
+                )
                 tool_call_id = tool_call["id"]
 
                 # Skip interactive-only tools in API mode
                 if function_name in (
                     "configure_llm_model",
+                    "configure_custom_llm",
                     "configure_embedding_model",
                     "configure_llm_api_key",
                     "configure_embedding_api_key",
@@ -1000,6 +1350,11 @@ class TrisulAIClient:
                     self.set_llm_model()
                     continue
 
+                # configure local/custom llm
+                if query.lower() in ("change_custom_llm", "configure_custom_llm"):
+                    self.set_custom_llm()
+                    continue
+
                 # change embedding model
                 if query.lower() == "change_embedding_model":
                     self.set_embedding_model()
@@ -1029,16 +1384,6 @@ class TrisulAIClient:
                     if(self.table_data):
                         self.table_data = {}
                     
-                    # If a report was prepared, display it and reset the report path
-                    if(self.report_path):                    
-                        if os.name == "nt":
-                            os.startfile(self.report_path)
-                        elif sys.platform == "darwin":
-                            subprocess.Popen(["open", self.report_path])
-                        else:
-                            subprocess.Popen(["xdg-open", self.report_path])
-                        self.report_path = None
-
                         
                         
                 except Exception as e:

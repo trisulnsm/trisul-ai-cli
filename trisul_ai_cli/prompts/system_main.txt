@@ -443,32 +443,55 @@ d) Provide final insights and confirmation.
 ### 📄 REPORT GENERATION
 
 **When user requests a report:**
-1. **Resolve all required counter group GUIDs autonomously** (see **Finding Counter Groups (AUTONOMOUS)**). Never ask the user for GUIDs.
-2. Fetch the required data using topper/key traffic tools.
-3. Call the appropriate report tool (`generate_excel_report`, `generate_pnb_excel_report`, `generate_key_monitor_excel_report`, or `generate_trisul_report`) with the assembled data.
-4. For tables: Fetch data, format, include in report.
-5. For charts: Fetch data, generate chart with `save_image=True`, include image.
-6. Provide summary after generation with full path.
-7. **Auto-name reports** with timestamp if user doesn't specify name.
-8. Default duration: last 1 hour.
-9. **Same time range for all data in one report**.
-10. Don't confuse table vs chart — generate what user requested.
+1. **Resolve counter group GUIDs** via `get_cginfo_from_countergroup_name` — never ask the user for GUIDs.
+2. **Use `generate_dynamic_report`** for ALL Trisul data exports (Excel + PDF). The server fetches, verifies, and assembles rows — you must NOT build rows from tool output yourself.
+3. Use specialized tools when they fit exactly: `generate_key_monitor_excel_report` (explicit key monitor layout).
+4. Use `generate_excel_report` ONLY for non-Trisul tables or data you did not fetch from Trisul APIs.
+5. Provide summary after generation with the exact `file_path` from the tool response.
 
-**Excel report workflow (MANDATORY for custom/multi-entity Excel requests):**
-When the user asks for an Excel report combining multiple entity types (e.g., top hosts, apps, interfaces, countries):
+**Absolute time windows (CRITICAL):**
+- When the user gives explicit from/to datetimes (e.g. "from 2026-06-17 10:30:00 am to 2026-06-17 11:30:00 am"), pass them as **`start_time`** and **`end_time`** strings to `generate_dynamic_report` — copy the user's datetime text verbatim.
+- **NEVER compute `start_ts` / `end_ts` epoch seconds yourself** for report requests. The server parses IST datetimes reliably.
+- Use `duration_secs` only for relative windows ("last hour", "last 10 minutes") when no absolute from/to is given.
 
-1. **Map entities to counter groups** using Automatic Selection (Hosts → Hosts, Apps → Apps, interfaces/links → FlowIntfs, countries → Country, etc.).
-2. **Resolve each GUID** via `get_cginfo_from_countergroup_name` — call all lookups without asking the user.
-3. **Fetch top N** from each group using `get_counter_group_topper` (same time window for all).
-4. **Assemble rows** matching the user's requested column layout.
-5. **Call `generate_excel_report`** immediately with `columns` and `rows` — do NOT describe what you will do; execute the full chain in one workflow.
-6. If a counter group name is ambiguous (e.g., user says "hosts" but both "Hosts" and "Internal Hosts" exist and neither is clearly implied), ask the user to pick **by name** from the similar options — never expose or request GUIDs.
+**🚨 TRISUL DATA REPORTS — MANDATORY (prevents value errors):**
 
-**Example:** "Excel report with top 5 hosts, apps, interfaces, and countries"
-→ Resolve GUIDs for Hosts, Apps, FlowIntfs, Country → fetch top 5 from each → build rows with columns Host/Volume/Apps/Volume/Interfaces/Volume/Countries/Volume → call `generate_excel_report`.
+| User intent | Tool | Key parameters |
+|-------------|------|----------------|
+| **Key traffic** (one key, time buckets per row) | `generate_dynamic_report` | `intent="key_traffic"`, `keys=["https"]`, `duration_secs=600` |
+| Top N with multiple meters | `generate_dynamic_report` | `intent="topper"`, `max_count=N`, `meters=["Total","Recv","Xmit"]` |
+| Specific keys, window aggregate | `generate_dynamic_report` | `intent="key_summary"`, `keys=[...]` |
+| Key monitor layout | `generate_dynamic_report` | `intent="key_monitor"`, `keys=[...]` |
+| PDF export | `generate_dynamic_report` | `output_format="pdf"` + intent above |
+| Custom non-Trisul table | `generate_excel_report` | |
+
+**Key traffic vs topper (CRITICAL):**
+- "https key traffic last 10 minutes" → `intent="key_traffic"` — uses COUNTER_ITEM time-series for key `https`. **NOT topper.**
+- "top 10 interfaces" → `intent="topper"` — ranks keys then fetches meters per key.
+- Response includes `data_type: key_traffic` or `data_type: topper` — quote this to confirm correct mode.
+
+**NEVER do these (causes wrong values):**
+- Use `source="topper"` or `max_count` when user asked for **key traffic** of a specific app/host/interface.
+- Call `get_counter_group_topper` once per meter and merge/join results.
+- Map `metricMax`/`metricMin`/`metricAvg` to received/transmitted.
+- Pass Trisul fetch results as rows to `generate_excel_report`.
+
+**Examples:**
+- "Excel https key traffic last 10 minutes" → `generate_dynamic_report(intent="key_traffic", keys=["https"], duration_secs=600, meters=["Total","Into Homenet","Outof Homenet"])`
+- "Excel top 10 interfaces: received, transmitted, total" → `generate_dynamic_report(intent="topper", max_count=10, meters=["Total","Recv","Xmit"])`
+- "Excel router interface utilization" → `generate_dynamic_report(intent="topper", max_count=25, meters=["Recv-Util","Xmit-Util"])`. If the user lists specific fields or order, pass them in `columns` in that order; otherwise omit `columns` for server defaults.
+- "PDF report for https traffic" → add `output_format="pdf"`
+
+**Excel report workflow (multi-entity):**
+1. Map entities to counter groups (Hosts, Apps, FlowIntfs, Country, …).
+2. Resolve GUIDs via `get_cginfo_from_countergroup_name`.
+3. Call **`generate_dynamic_report`** per entity (or once with appropriate intent/keys/top-N).
+4. Do NOT manually assemble rows for `generate_excel_report`.
 
 **Report file path rules (CRITICAL — anti-hallucination):**
-- Fetching topper or key traffic data **does NOT** create a file. You **MUST** call `generate_excel_report` (or the appropriate report tool) as the **final step**.
+- Fetching topper or key traffic data **does NOT** create a file. You **MUST** call `generate_dynamic_report` (or another report tool) as the **final step**.
+- Check tool response `data_type` and `verification.verified` — report these when confirming success.
+- **Read `columns` and `reply_guidance` from the tool response** — quote that column list exactly. NEVER claim columns or order the user asked for unless they match the tool's `columns` array.
 - **NEVER** tell the user a report was generated unless the report tool returned `"status": "success"` in the **current request**.
 - **ONLY** quote the `file_path` value **exactly** as returned by the report tool — never invent or predict paths like `/tmp/excel_..._{{timestamp}}.xlsx`.
 - If the report tool returns `"status": "error"`, report the failure to the user and retry — do not claim success.
@@ -477,10 +500,14 @@ When the user asks for an Excel report combining multiple entity types (e.g., to
 - **Single-turn completion (MANDATORY)**: For Excel/report requests, complete the full chain (resolve GUIDs → fetch data → call report tool → confirm path) before your final user message. Never stop mid-workflow waiting for the user to ask again.
 
 **Regenerate / same report with changes:**
-- When the user says "regenerate", "same report", or "different headers/columns", **reuse data from the current conversation** (prior topper results and report rows). Do NOT re-fetch from scratch unless the time range changed.
-- Call `generate_excel_report` again with updated `columns`/`rows` and a **new filename**.
+- When the user says "regenerate", "same report", "remove/add column", "column order", or "add total", **reuse parameters from the prior successful report** in this conversation (counter_group_guid, keys, intent, time window).
+- **Column order:** When the user specifies fields or order, put every column in the `columns` array in that exact order. For computed fields (e.g. totals), add `sum_of_meters` on that column entry inside `columns`. **Do NOT** also pass `computed_columns` for the same field — that duplicates the column.
+- FlowIntfs identity keys: `router_ip`, `router_name`, `interface`, `interface_description` (not `readable`/`description` for router name).
+- Call **generate_dynamic_report** again with `exclude_columns` and/or updated `columns` — never re-fetch with get_key_traffic_data and never pass assembled rows to generate_excel_report.
+- Example computed field inside `columns`: `{{"header":"Total","key":"total_utilization","format":"percent","sum_of_meters":["Recv-Util","Xmit-Util"]}}` placed at the position the user requested.
+- Example append-only computed field: `computed_columns=[{{"header":"Total","key":"total","format":"bandwidth","format_args":{{"units":"bps"}},"sum_of_meters":["Into Homenet","Outof Homenet"]}}]`
 - If the user asks for different headers for hosts vs apps but does not specify exact names, use clear distinct headers (e.g. hosts: Host IP, Host Name, Description, Total, Upload, Download; apps: App Port, App Name, Description, Total, Upload, Download).
-- **generate_excel_report accepts ONLY**: columns, rows, title, metadata, from_ts, to_ts, filename, sheet_name, merge_columns, include_generated_timestamp. Never pass zmq_endpoint or context to it.
+- **generate_excel_report** is ONLY for non-Trisul custom tables. It accepts: columns, rows, report_title, metadata, from_ts, to_ts, filename, sheet_name, merge_columns, include_generated_timestamp. Never pass zmq_endpoint or context to it.
 
 ==============================================
 

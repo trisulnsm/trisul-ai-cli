@@ -10,6 +10,7 @@ import uuid
 import chromadb
 from google.protobuf.json_format import MessageToDict
 import logging
+import re
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import random
@@ -215,6 +216,10 @@ def _stats_array_values(stats_array, meter_ids):
     return [int(vals[mid]) if mid < len(vals) and vals[mid] is not None else 0 for mid in meter_ids]
 
 
+def _normalize_meter_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
 def _resolve_meter_ids(counter_group_guid, meters, zmq_endpoint):
     """Resolve meter names or numeric IDs to meter indices and metadata."""
     cg_info = countergroup_info(zmq_endpoint, get_meter_info=True)
@@ -249,7 +254,7 @@ def _resolve_meter_ids(counter_group_guid, meters, zmq_endpoint):
             resolved.append(meter_lookup[mid])
             continue
 
-        needle = meter_str.lower().replace(" ", "")
+        needle = _normalize_meter_token(meter_str)
         match = None
         for mid, info in meter_lookup.items():
             candidates = [
@@ -258,12 +263,29 @@ def _resolve_meter_ids(counter_group_guid, meters, zmq_endpoint):
                 str(mid),
             ]
             for candidate in candidates:
-                c = candidate.lower().replace(" ", "")
-                if c == needle or needle in c or c in needle:
+                if _normalize_meter_token(candidate) == needle:
                     match = info
                     break
             if match:
                 break
+
+        if not match:
+            best_len = 0
+            for mid, info in meter_lookup.items():
+                candidates = [
+                    info.get("description", ""),
+                    info.get("name", ""),
+                    str(mid),
+                ]
+                for candidate in candidates:
+                    token = _normalize_meter_token(candidate)
+                    if not token:
+                        continue
+                    if needle in token or token in needle:
+                        if len(token) > best_len:
+                            best_len = len(token)
+                            match = info
+
         if not match:
             available = [f"{m['id']}:{m['description'] or m['name']}" for m in meter_lookup.values()]
             raise ValueError(f"Meter '{meter}' not found. Available meters: {', '.join(available)}")
@@ -566,10 +588,10 @@ def _build_key_monitor_excel(
 
 
 def _fmt_util_pct(val):
-    """Format a utilization gauge value as a percentage string."""
+    """Format a utilization gauge value as a percentage string (integer, like webtrisul)."""
     if val is None or val < 0:
         return "-"
-    return f"{round(float(val), 2)}%"
+    return f"{int(round(float(val)))}%"
 
 
 def _key_attrs_to_dict(keyt):
@@ -592,12 +614,29 @@ def _is_interface_key(key):
     return bool(key) and not _is_system_key(key) and "_" in str(key)
 
 
-def _get_time_window(zmq_endpoint, duration_secs, start_ts=None, end_ts=None):
+def _get_time_window(
+    zmq_endpoint,
+    duration_secs,
+    start_ts=None,
+    end_ts=None,
+    start_time=None,
+    end_time=None,
+):
     """Return (from_ts, to_ts) for a report window."""
+    from trisul_ai_cli.time_utils import resolve_absolute_time_window
+
     req = trp_pb2.Message()
     req.trp_command = req.TIMESLICES_REQUEST
     req.time_slices_request.get_total_window = True
     tint_resp = get_response(zmq_endpoint, req)
+    abs_from, abs_to = resolve_absolute_time_window(
+        start_ts=start_ts,
+        end_ts=end_ts,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    if abs_from is not None and abs_to is not None:
+        return abs_from, abs_to
     from_ts_val = int(start_ts) if start_ts else int(tint_resp.total_window.to.tv_sec) - int(duration_secs)
     to_ts_val = int(end_ts) if end_ts else int(tint_resp.total_window.to.tv_sec)
     return from_ts_val, to_ts_val
@@ -642,25 +681,6 @@ def _fetch_router_names(router_keys, zmq_endpoint):
     return lookup
 
 
-def _build_pnb_excel(title, from_ts, to_ts, rows, filename):
-    """Write the PNB interface utilization Excel report."""
-    return _build_excel_report(
-        columns=[
-            {"header": "Router IP", "key": "router_ip"},
-            {"header": "Router Name", "key": "router_name"},
-            {"header": "Interface", "key": "interface"},
-            {"header": "Interface Description", "key": "interface_description"},
-            {"header": "In Utilization", "key": "in_utilization"},
-            {"header": "Out Utilization", "key": "out_utilization"},
-            {"header": "Total Utilization", "key": "total_utilization"},
-        ],
-        rows=rows,
-        title=title,
-        from_ts=from_ts,
-        to_ts=to_ts,
-        filename=filename,
-        sheet_name="PNB Interface Utilization",
-    )
 
 
 # TRP Helper functions
@@ -670,6 +690,7 @@ _RESPONSE_FIELD_MAP = {
     'TIMESLICES_RESPONSE': 'time_slices_response',
     'COUNTER_GROUP_TOPPER_RESPONSE': 'counter_group_topper_response',
     'COUNTER_ITEM_RESPONSE': 'counter_item_response',
+    'TOPPER_TREND_RESPONSE': 'topper_trend_response',
     'QUERY_ALERTS_RESPONSE': 'query_alerts_response',
     'QUERY_SESSIONS_RESPONSE': 'query_sessions_response',
     'SEARCH_KEYS_RESPONSE': 'search_keys_response',
@@ -997,13 +1018,14 @@ def get_key_traffic_data(counter_group: str, readable: Any = None, duration_secs
             raise
 
 
-        #construct counter item request request for internal host
+        #construct counter item NG request (multi-resolution; matches Web UI key traffic charts)
         try:
-            logging.info("[get_key_traffic_data] Constructing COUNTER_ITEM_REQUEST")
+            logging.info("[get_key_traffic_data] Constructing COUNTER_ITEM_NG_REQUEST")
             req = trp_pb2.Message()
-            req.trp_command = req.COUNTER_ITEM_REQUEST
-            req.counter_item_request.counter_group = counter_group
-            req.counter_item_request.key.label = readable.lower()
+            req.trp_command = req.COUNTER_ITEM_NG_REQUEST
+            ng = req.counter_item_ng_request
+            ng.counter_group = counter_group
+            ng.key.label = readable.lower()
             logging.info(f"[get_key_traffic_data] Counter item request configured: counter_group={counter_group}, readable={readable}")
         except Exception as e:
             logging.error(f"[get_key_traffic_data] Error constructing counter item request: {str(e)}")
@@ -1019,7 +1041,7 @@ def get_key_traffic_data(counter_group: str, readable: Any = None, duration_secs
             
             logging.info(f"[get_key_traffic_data] Default time interval: from={object.tv_sec}, to={tm.to.tv_sec}")
 
-            #assign time interval to counter group topper request
+            #assign time interval to counter item request
             if start_ts and end_ts:
                 logging.info(f"[get_key_traffic_data] Overriding time interval with start_ts={start_ts}, end_ts={end_ts}")
                 object = getattr(tm, 'from')
@@ -1030,12 +1052,12 @@ def get_key_traffic_data(counter_group: str, readable: Any = None, duration_secs
             else:
                 logging.info(f"[get_key_traffic_data] Time interval set: from={object.tv_sec}, to={tm.to.tv_sec} (duration: {duration_secs}s)")
                 
-            req.counter_item_request.time_interval.MergeFrom(tm)
+            ng.time_interval.MergeFrom(tm)
         except Exception as e:
             logging.error(f"[get_key_traffic_data] Error setting time interval: {str(e)}")
             raise
         
-        logging.info("[get_key_traffic_data] Sending COUNTER_ITEM_REQUEST")
+        logging.info("[get_key_traffic_data] Sending COUNTER_ITEM_NG_REQUEST")
         resp = get_response(zmq_endpoint, req)
         logging.info("[get_key_traffic_data] Successfully received key traffic response")
         
@@ -1938,192 +1960,192 @@ def generate_key_monitor_excel_report(
 
 
 @mcp.tool()
-def generate_pnb_excel_report(
-    max_count: int = 25,
+def generate_dynamic_report(
+    counter_group_guid: str,
+    intent: str = "auto",
+    source: str = "auto",
+    keys: List[str] = None,
+    meters: List[str] = None,
     duration_secs: int = 3600,
-    sort_meter: int = 4,
-    title: str = "PNB Interface Utilization Report",
-    filename: str = None,
     start_ts: int = None,
     end_ts: int = None,
+    start_time: str = None,
+    end_time: str = None,
+    max_count: int = None,
+    sort_meter: int = 0,
+    row_layout: str = "auto",
+    output_format: str = "xlsx",
+    columns: List[dict] = None,
+    title: str = None,
+    filename: str = None,
+    sheet_name: str = "Report",
     context: str = "context0",
     zmq_endpoint: str = None,
+    merge_columns: List[str] = None,
+    exclude_columns: List[str] = None,
+    computed_columns: List[dict] = None,
 ):
     """
-    Generate the PNB Excel report for top N router interfaces by utilization.
+    Generate Excel or PDF by fetching Trisul data server-side (no LLM row assembly).
 
-    The report contains one row per interface with columns:
-    Router IP, Router Name, Interface, Interface Description,
-    In Utilization, Out Utilization, Total Utilization.
+    **Use this for ALL Trisul reports** — key traffic, toppers, key monitor, PDF exports.
 
-    Interfaces are ranked by Total Utilization (average of In and Out utilization)
-    over the selected time window. Data is sourced from the FlowIntfs counter group.
+    **intent** (preferred — clearest routing):
+      - key_traffic: time-series rows per bucket for explicit keys (COUNTER_ITEM). Use for
+        "show https traffic last 10 minutes", "key traffic each minute with timestamp".
+      - topper: top N keys ranked by sort_meter, all meters fetched per key.
+      - key_summary: one aggregate row per key over the window.
+      - key_monitor: Key Monitor layout (meter sub-rows per key).
+      - auto: infer from keys / max_count (keys alone => key_traffic, not topper).
 
-    Args:
-        max_count (int): Number of top interfaces to include (default 25).
-        duration_secs (int): Lookback window in seconds (default 3600 = 1 hour).
-            Ignored if start_ts/end_ts are provided.
-        sort_meter (int): Initial FlowIntfs meter used to fetch candidate interfaces
-            (default 4 = Recv/In Utilization).
-        title (str): Report title shown at the top of the Excel sheet.
-        filename (str): Output filename (saved under /tmp/). Auto-generated if omitted.
-        start_ts (int): Optional absolute start epoch seconds.
-        end_ts (int): Optional absolute end epoch seconds.
-        context (str): Trisul context (default "context0").
-        zmq_endpoint (str): Custom TRP ZMQ endpoint. Auto-computed if omitted.
+    **source** (advanced override): auto | key_timeseries | topper | key_stats
 
-    Returns:
-        dict: status, message, file_path, and summary metadata.
+    **output_format**: xlsx (default) | pdf
 
-    Example:
-        generate_pnb_excel_report(max_count=25, duration_secs=3600)
+    **Time window** (absolute ranges):
+      - Prefer `start_time` / `end_time`: human-readable IST strings, e.g.
+        "2026-06-17 10:30:00 am". The server parses them — do NOT compute epoch seconds.
+      - `start_ts` / `end_ts` are optional epoch fallbacks when strings are not used.
+      - `duration_secs` applies only when no absolute window is given.
+
+    **Column customization** (regenerate / same report with changes):
+      - exclude_columns: drop auto columns by key or header (e.g. ["key"]).
+      - computed_columns: add derived columns server-side, e.g.
+        [{"header": "Total", "key": "total", "format": "bandwidth",
+          "format_args": {"units": "bps"},
+          "sum_of_meters": ["Into Homenet", "Outof Homenet"]}]
+      - columns: full override list (optional); prefer exclude_columns/computed_columns for edits.
+
+    Returns verification metadata: data_type, source, verified flag — proves key_traffic vs topper.
+
+    Examples:
+        # HTTPS key traffic, 10 min, one row per time bucket
+        generate_dynamic_report(
+            counter_group_guid="{Apps-GUID}",
+            intent="key_traffic",
+            keys=["https"],
+            meters=["Total", "Into Homenet", "Outof Homenet"],
+            duration_secs=600,
+        )
+
+        # Same report without Key column, with Total = upload + download
+        generate_dynamic_report(
+            counter_group_guid="{ASNumber-GUID}",
+            intent="key_traffic",
+            keys=["15169"],
+            duration_secs=900,
+            exclude_columns=["key"],
+            computed_columns=[{
+                "header": "Total",
+                "key": "total",
+                "format": "bandwidth",
+                "format_args": {"units": "bps"},
+                "sum_of_meters": ["Into Homenet", "Outof Homenet"],
+            }],
+        )
+
+        # Top 10 interfaces — total + recv + xmit
+        generate_dynamic_report(
+            counter_group_guid="{FlowIntfs-GUID}",
+            intent="topper",
+            max_count=10,
+            meters=["Total", "Recv", "Xmit"],
+            duration_secs=3600,
+        )
+
+        # PDF export
+        generate_dynamic_report(
+            counter_group_guid="{Apps-GUID}",
+            intent="key_traffic",
+            keys=["https"],
+            duration_secs=600,
+            output_format="pdf",
+        )
     """
-    try:
-        max_count = int(max_count)
-        duration_secs = int(duration_secs)
-        sort_meter = int(sort_meter)
-        if max_count <= 0:
-            return {"status": "error", "message": "max_count must be greater than 0.", "file_path": None}
+    from trisul_ai_cli.report_engine import run_dynamic_report
+    return run_dynamic_report(
+        counter_group_guid=counter_group_guid,
+        intent=intent,
+        source=source,
+        keys=keys,
+        meters=meters,
+        duration_secs=duration_secs,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        start_time=start_time,
+        end_time=end_time,
+        max_count=max_count,
+        sort_meter=sort_meter,
+        row_layout=row_layout,
+        output_format=output_format,
+        columns=columns,
+        title=title,
+        filename=filename,
+        sheet_name=sheet_name,
+        context=context,
+        zmq_endpoint=zmq_endpoint,
+        merge_columns=merge_columns,
+        exclude_columns=exclude_columns,
+        computed_columns=computed_columns,
+    )
 
-        if not zmq_endpoint:
-            ctx = normalize_context(context)
-            zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{ctx}/run/trp_0"
 
-        logging.info(
-            f"[generate_pnb_excel_report] max_count={max_count} duration_secs={duration_secs} "
-            f"sort_meter={sort_meter}"
-        )
+@mcp.tool()
+def generate_dynamic_excel_report(
+    counter_group_guid: str,
+    intent: str = "auto",
+    source: str = "auto",
+    keys: List[str] = None,
+    meters: List[str] = None,
+    duration_secs: int = 3600,
+    start_ts: int = None,
+    end_ts: int = None,
+    start_time: str = None,
+    end_time: str = None,
+    max_count: int = None,
+    sort_meter: int = 0,
+    row_layout: str = "auto",
+    columns: List[dict] = None,
+    title: str = None,
+    filename: str = None,
+    sheet_name: str = "Report",
+    context: str = "context0",
+    zmq_endpoint: str = None,
+    merge_columns: List[str] = None,
+    exclude_columns: List[str] = None,
+    computed_columns: List[dict] = None,
+):
+    """
+    Excel alias for generate_dynamic_report. Prefer generate_dynamic_report (supports PDF too).
 
-        from_ts_val, to_ts_val = _get_time_window(zmq_endpoint, duration_secs, start_ts, end_ts)
-        candidate_count = min(max(max_count * 3, max_count), 500)
-        topper_keys = _fetch_flowintf_topper(
-            zmq_endpoint, sort_meter, candidate_count, from_ts_val, to_ts_val
-        )
-
-        # Utilization meters may be empty; fall back to total-traffic topper for candidates.
-        if not topper_keys and sort_meter != 0:
-            logging.info(
-                "[generate_pnb_excel_report] No interfaces from util meter "
-                f"{sort_meter}; falling back to meter 0"
-            )
-            topper_keys = _fetch_flowintf_topper(
-                zmq_endpoint, 0, candidate_count, from_ts_val, to_ts_val
-            )
-
-        if not topper_keys:
-            return {
-                "status": "error",
-                "message": (
-                    "No interface data found for the selected time window. "
-                    "SYS:GROUP aggregate keys were excluded."
-                ),
-                "file_path": None,
-            }
-
-        resolved_meters, _ = _resolve_meter_ids(
-            FLOWINTFS_GUID, [4, 5], zmq_endpoint
-        )
-        meter_ids = [m["id"] for m in resolved_meters]
-        meters_info = {m["id"]: m for m in resolved_meters}
-        in_meter_id = meter_ids[0]
-        out_meter_id = meter_ids[1] if len(meter_ids) > 1 else meter_ids[0]
-
-        router_keys = {
-            keyt.key.split("_")[0]
-            for keyt in topper_keys
-            if _is_interface_key(keyt.key)
-        }
-        router_names = _fetch_router_names(router_keys, zmq_endpoint)
-
-        report_rows = []
-        for keyt in topper_keys:
-            if not _is_interface_key(keyt.key):
-                continue
-
-            router_key = keyt.key.split("_")[0]
-            readable = keyt.readable or keyt.key
-            router_ip = readable.split("_")[0] if "_" in readable else router_key
-            router_name = router_names.get(router_key, router_ip)
-
-            attrs = _key_attrs_to_dict(keyt)
-            interface = keyt.label.strip() if keyt.label and keyt.label.strip() else readable.split("_")[-1]
-            interface_description = (
-                attrs.get("snmp.ifalias")
-                or (keyt.description.strip() if keyt.description else "")
-                or "-"
-            )
-
-            lookup_key = keyt.readable or keyt.label or keyt.key
-            try:
-                stats = _get_key_meter_stats(
-                    FLOWINTFS_GUID,
-                    lookup_key,
-                    meter_ids,
-                    from_ts_val,
-                    to_ts_val,
-                    zmq_endpoint,
-                    meters_info,
-                )
-                in_util = stats["meters"][in_meter_id]["averages"]
-                out_util = stats["meters"][out_meter_id]["averages"]
-            except Exception as ex:
-                logging.warning(
-                    f"[generate_pnb_excel_report] Failed for interface '{lookup_key}': {ex}"
-                )
-                in_util = -1
-                out_util = -1
-
-            total_util = (in_util + out_util) / 2 if in_util >= 0 and out_util >= 0 else -1
-            report_rows.append({
-                "router_ip": router_ip,
-                "router_name": router_name,
-                "interface": interface,
-                "interface_description": interface_description,
-                "in_utilization": _fmt_util_pct(in_util),
-                "out_utilization": _fmt_util_pct(out_util),
-                "total_utilization": _fmt_util_pct(total_util),
-                "_sort_total_util": total_util,
-            })
-
-        report_rows.sort(key=lambda row: row["_sort_total_util"], reverse=True)
-        report_rows = report_rows[:max_count]
-        for row in report_rows:
-            row.pop("_sort_total_util", None)
-
-        if not report_rows:
-            return {
-                "status": "error",
-                "message": "No interface utilization data could be collected.",
-                "file_path": None,
-            }
-
-        if not filename:
-            safe_title = "".join(c if c.isalnum() or c in "-_" else "_" for c in title)[:40]
-            filename = f"pnb_interface_util_{safe_title}_{int(datetime.now().timestamp())}.xlsx"
-
-        filepath = _build_pnb_excel(title, from_ts_val, to_ts_val, report_rows, filename)
-
-        logging.info(f"[generate_pnb_excel_report] Report saved to {filepath}")
-        return {
-            "status": "success",
-            "message": f"PNB Excel report generated successfully at {filepath}",
-            "file_path": filepath,
-            "interfaces_count": len(report_rows),
-            "duration": epoch_to_duration(from_ts_val, to_ts_val),
-            "columns": [
-                "Router IP",
-                "Router Name",
-                "Interface",
-                "Interface Description",
-                "In Utilization",
-                "Out Utilization",
-                "Total Utilization",
-            ],
-        }
-
-    except Exception as e:
-        logging.error(f"[generate_pnb_excel_report] Error: {e}", exc_info=True)
-        return {"status": "error", "message": str(e), "file_path": None}
+    For key traffic: set intent="key_traffic" and keys=["https"] — NOT source=topper.
+    """
+    from trisul_ai_cli.report_engine import run_dynamic_report
+    return run_dynamic_report(
+        counter_group_guid=counter_group_guid,
+        intent=intent,
+        source=source,
+        keys=keys,
+        meters=meters,
+        duration_secs=duration_secs,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        start_time=start_time,
+        end_time=end_time,
+        max_count=max_count,
+        sort_meter=sort_meter,
+        row_layout=row_layout,
+        output_format="xlsx",
+        columns=columns,
+        title=title,
+        filename=filename,
+        sheet_name=sheet_name,
+        context=context,
+        zmq_endpoint=zmq_endpoint,
+        merge_columns=merge_columns,
+        exclude_columns=exclude_columns,
+        computed_columns=computed_columns,
+    )
 
 
 @mcp.tool()
@@ -2142,9 +2164,9 @@ def generate_excel_report(
     """
     Generate a flexible Excel (.xlsx) report with custom columns, rows, and formatting.
 
-    Use this as the generic report builder for any tabular Excel export. Specialized
-    reports (key monitor, PNB, etc.) can also be built with this tool when you already
-    have the data assembled.
+    Use this ONLY when you already have verified row data (e.g. non-Trisul tables).
+    For Trisul traffic/top-N/time-series reports use generate_dynamic_report —
+    do NOT assemble Trisul rows yourself from multiple tool calls.
 
     Args:
         columns (list[dict]): Column definitions. Each dict has:
@@ -2211,6 +2233,12 @@ def generate_excel_report(
             f"[generate_excel_report] columns={len(normalized_columns)} rows={len(rows)} "
             f"sheet_name={sheet_name}"
         )
+
+        from trisul_ai_cli.report_engine import detect_assembled_traffic_hallucination
+        hallucination_msg = detect_assembled_traffic_hallucination(rows, columns=columns)
+        if hallucination_msg:
+            logging.warning(f"[generate_excel_report] Rejected: {hallucination_msg}")
+            return {"status": "error", "message": hallucination_msg, "file_path": None}
 
         if not filename:
             safe_title = "".join(
@@ -2629,6 +2657,24 @@ def configure_llm_model():
     """
     logging.info(f"[configure_llm_model] Managing LLM model")
     return {"status": "success", "message" : f"The LLM model has been changed successfully."}
+
+@mcp.tool()
+def configure_custom_llm():
+    """
+    Configure a local or self-hosted OpenAI-compatible LLM endpoint.
+    Usage:
+        Switch Trisul AI to use a custom LLM such as Ollama, LM Studio, vLLM,
+        or any server that exposes an OpenAI-compatible chat completions API.
+        Requires the API base URL, model name, and optionally an API key.
+
+    Returns:
+        str: Confirmation message.
+    """
+    logging.info("[configure_custom_llm] Configuring custom LLM endpoint")
+    return {
+        "status": "success",
+        "message": "The custom LLM endpoint has been configured successfully.",
+    }
 
 @mcp.tool()
 def configure_embedding_model():
