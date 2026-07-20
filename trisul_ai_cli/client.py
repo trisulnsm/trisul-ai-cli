@@ -25,6 +25,7 @@ from trisul_ai_cli.llm_factory import LLMFactory
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 import json
 import stdiomask
+import time
 
 
 
@@ -1006,6 +1007,23 @@ class TrisulAIClient:
     async def _process_query_api_body(
         self, query: str, system_prompt: str, session_id: str, start_time: float,
     ) -> dict:
+        if query.strip().lower() in ["exit", "quit"]:
+            if session_id and session_id in self.sessions:
+                logging.info(f"[Client][API] [Session: {session_id}] Exiting and cleaning up session history.")
+                history = self.sessions.pop(session_id)
+            else:
+                logging.info(f"[Client][API] Exiting; using default history.")
+                history = self.conversation_history
+            
+            await self.update_user_memory(history=history)
+            return {
+                "status": "success",
+                "answer": "👋 Exiting gracefully... Session closed and memory updated.",
+                "tool_calls": [],
+                "chart_data": None,
+                "table_data": None,
+            }
+
         if session_id and session_id in self.sessions:
             logging.info(f"[Client][API] [Session: {session_id}] Reusing existing session history.")
             history = self.sessions[session_id]
@@ -1222,12 +1240,14 @@ class TrisulAIClient:
 
 
 
-    async def update_user_memory(self):
+    async def update_user_memory(self, history=None):
+        if history is None:
+            history = self.conversation_history
         logging.info(f"[Client] [ai_memory] Updating user memory. Existing memory: \n {self.existing_ai_memory}")
         
         filtered_conversation = []
 
-        for msg in self.conversation_history:
+        for msg in history:
             if isinstance(msg, HumanMessage):
                 filtered_conversation.append({"user": msg.content})
             elif isinstance(msg, AIMessage):
@@ -1264,6 +1284,7 @@ class TrisulAIClient:
             with open(self.memory_json_path, "w", encoding="utf-8") as file:
                 json.dump(new_ai_memory, file, indent=4)
             
+            self.existing_ai_memory = new_ai_memory
             logging.info(f"[Client] [ai_memory] New memory updated : \n {new_ai_memory}")
             
         except Exception as e:
