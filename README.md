@@ -2,7 +2,7 @@
 
 > Conversational AI for Next-Generation Network Monitoring 
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
 
 ## Overview
@@ -75,7 +75,7 @@ Trisul AI CLI combines several cutting-edge technologies:
 
 ### Prerequisites
 
-- Python 3.8 or higher
+- Python 3.10 or higher
 - Trisul Network Analytics installed and running
 - Gemini API key ([Get one here](https://aistudio.google.com/app/api-keys))
 
@@ -104,7 +104,123 @@ Trisul AI CLI combines several cutting-edge technologies:
 
 5. **Enter your Gemini API key** when prompted (stored securely in `.env`)
 
-## Usage
+Trisul AI can run in two ways:
+
+1. **CLI mode** — interactive chat in the terminal (`trisul_ai_cli`)
+2. **API mode** — REST server that the WebTrisul UI chat window talks to (`trisul_ai_cli api`)
+
+## Using Trisul AI in the WebTrisul UI (API mode)
+
+The WebTrisul chat page does not start the AI engine itself. You start the API server on the Trisul hub (or another host that can reach Trisul), then tell WebTrisul the IP, port, and HTTP/HTTPS.
+
+### Step 1: Start the API server
+
+Use the same virtualenv where `trisul_ai_cli` is installed. The process must stay running.
+
+```bash
+source .venv/bin/activate
+trisul_ai_cli api --host 0.0.0.0 --port 8200
+```
+
+You should see something like:
+
+```
+Trisul AI REST API starting in HTTP mode on http://0.0.0.0:8200
+   Interactive docs: http://0.0.0.0:8200/docs
+   Health check:     http://0.0.0.0:8200/api/health
+```
+
+Useful options:
+
+| Flag | Meaning |
+|------|---------|
+| `--host` | Bind address. `0.0.0.0` lets the WebTrisul browser reach the server. |
+| `--port` | Listen port (default `8200`). Must match the WebTrisul setting. |
+| `--log-level` | `debug`, `info`, `warning`, `error` |
+| `--ssl-certfile` / `--ssl-keyfile` | Enable HTTPS. Check **AI SSL Mode** in WebTrisul if you use these. |
+
+HTTPS example:
+
+```bash
+trisul_ai_cli api --host 0.0.0.0 --port 8200 \
+  --ssl-certfile /path/to/cert.pem \
+  --ssl-keyfile /path/to/key.pem
+```
+
+Confirm the server is up:
+
+```bash
+curl http://127.0.0.1:8200/api/health
+```
+
+A healthy response looks like `{"status":"ok","mcp_connected":true,...}`.
+
+The first time you run the CLI or API on a machine, complete LLM setup (API key / model) the same way as CLI mode. The API server uses the same `.env` config.
+
+### Step 2: Point WebTrisul at the API server
+
+1. Log in to WebTrisul as an administrator.
+2. Open **WebTrisul Options** (`/webtrisul_options/edit`).
+3. Select the **Trisul AI** tab (left sidebar).
+4. Fill in **Trisul AI API Endpoint Configuration**:
+
+   | Field | What to enter |
+   |-------|----------------|
+   | **AI SSL Mode** | Unchecked for HTTP. Checked only if the API was started with `--ssl-certfile` / `--ssl-keyfile`. |
+   | **AI Endpoint IP** | Host the **browser** can reach (the hub IP, or `127.0.0.1` if the UI and API are on the same machine you browse from). |
+   | **AI Endpoint Port** | Same port as `--port` (for example `8200`). |
+
+5. Click **Save**.
+
+The chat page calls `{http or https}://{AI Endpoint IP}:{AI Endpoint Port}/api/query`. If SSL mode and the server protocol do not match, or the IP/port is wrong, the chat shows **Connection Failed**.
+
+You can reopen the same settings from a failed chat via **Configure Server Settings**, or go directly to `/webtrisul_options/edit?active_tab=tab_trisulai`.
+
+### Step 3: Open the chat from the current context
+
+1. In WebTrisul, switch to the Trisul **context** you want to query.
+2. Open the **Trisul AI** page (`/trisul_ai/index`). The header shows that context (for example `default`).
+3. Type a question and send it. Every request includes that context; the API locks all Trisul tools to it.
+
+Do not ask the chat to switch context. Change context in WebTrisul, then open Trisul AI again.
+
+### Step 4: What you can ask
+
+Examples:
+
+- *Show top 10 hosts by traffic in the last hour*
+- *How much HTTPS traffic did we see today?*
+- *Show a pie chart of top applications*
+- *Create a host dashboard* (preview first, then confirm)
+
+The reply can include:
+
+- A written answer
+- A **table**
+- A **line or pie chart**
+- A **dashboard package** (after you confirm the layout)
+
+### Step 5: Install a dashboard from chat
+
+When the assistant generates a dashboard:
+
+1. Read the **layout preview** in chat and confirm if it looks right.
+2. After generation, use the buttons on that message:
+   - **Preview dashboard** — opens a preview without installing
+   - **Download dashboard JSON** — saves the package file
+   - **Install dashboard** — installs it into WebTrisul, then **View dashboard** opens it
+
+The chat is bound to the context you opened it from, so dashboards and queries apply to that context only.
+
+### If the chat cannot connect
+
+1. Confirm `trisul_ai_cli api` is still running.
+2. Hit `/api/health` on the same IP and port you configured.
+3. Recheck SSL, IP, and port on the **Trisul AI** options tab.
+4. If the browser is on another machine, do not use `127.0.0.1` as **AI Endpoint IP** — use the hub’s reachable address.
+5. Check `trisul_ai_cli.log` in the directory where you started the API.
+
+## Usage (CLI mode)
 
 ### Basic Queries
 
@@ -298,6 +414,12 @@ If the bot returns empty responses, check:
 2. Counter group availability (`list_all_available_counter_groups`)
 3. Log file for detailed error messages
 
+### WebTrisul chat: Connection Failed
+The UI cannot reach `{protocol}://{AI Endpoint IP}:{AI Endpoint Port}/api/query`.
+1. Start the API: `trisul_ai_cli api --port 8200`
+2. Confirm `/api/health` returns `"mcp_connected": true`
+3. Match **AI SSL Mode**, **AI Endpoint IP**, and **AI Endpoint Port** on the WebTrisul **Trisul AI** options tab
+
 ## Roadmap
 
 - Support for additional LLMs (Claude, GPT-4, local models)
@@ -305,7 +427,6 @@ If the bot returns empty responses, check:
 - Multi-user conversation history
 - Advanced filtering and correlation queries
 - Integration with alerting systems
-- Web-based UI alongside CLI
 
 
 
