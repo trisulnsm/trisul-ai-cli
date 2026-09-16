@@ -1,0 +1,367 @@
+{
+  "_comment": "Catalog of Webtrisul dashboard module templates usable by generate_dashboard_json. Sourced from WEBTRISUL_MODULE_TEMPLATES in webtrisul_8/db/webtrisul.db. option_keys mirrors datatypes_json; defaults mirrors defaults_json. presentation is the shape the panel renders and must match the presentation the user asked for.",
+  "catalog_version": 5,
+  "templates": [
+    {
+      "template_id": 1,
+      "name": "Current toppers in a list",
+      "group": "Topper",
+      "presentation": "table",
+      "uri": "/trisul_trf_topper/mod_currentlist",
+      "looks_like": "Plain table of the current top N keys for a counter group, one row per key with its meter values and a percent-of-total bar.",
+      "use_when": "User wants a live 'top talkers' style table for the most recent window, e.g. 'top hosts right now'.",
+      "not_when": "Never for a chart, graph, trend or anything over time, and never for the traffic of a key the user named - this module has no 'key' option and cannot chart a single subject. Use 101/102/103 for those. For a toppers table over a time window use 3.",
+      "needs": ["cgguid"],
+      "option_keys": ["name", "topcount", "autohref", "autotooltips", "cgguid", "statid", "ajaxfreq", "resolve_key", "key_description", "key_filter", "inverse_key_filter", "show_attributes"],
+      "defaults": {"resolve_key": true, "key_description": true, "show_attributes": ""},
+      "enums": {},
+      "recommended_width": 6,
+      "example_options": {
+        "cgguid": "{4CD742B1-C1CA-4708-BE78-0FCA2EB01A86}",
+        "topcount": "10",
+        "statid": "0",
+        "key_filter": "",
+        "inverse_key_filter": ""
+      }
+    },
+    {
+      "template_id": 3,
+      "name": "Retro toppers in a list",
+      "group": "Topper",
+      "presentation": "table",
+      "uri": "/trisul_trf_topper/mod_customlist",
+      "looks_like": "Table of the top N keys over the dashboard's selected retro time window, with meter columns and a percent column.",
+      "use_when": "THE default toppers table. Use for 'top countries', 'top apps', 'top hosts', and for 'last 15 minutes' / recent-window lists — the dashboard time selector covers the window. Theme/overview dashboards should include at least two of these on different counter groups.",
+      "not_when": "Never for a chart, graph or trend, and never for the traffic of a key the user named - this module has no 'key' option. Use 101 for a named key and 102/103 to chart top N over time. Never on a realtime/live dashboard — use template 56.",
+      "needs": ["cgguid"],
+      "option_keys": ["cgguid", "topcount", "units", "statid", "resolve_key", "key_description", "key_filter", "inverse_key_filter"],
+      "defaults": {"topcount": 10, "units": "B", "statid": 0, "resolve_key": true, "key_description": true},
+      "enums": {},
+      "recommended_width": 6,
+      "example_options": {
+        "cgguid": "{00990011-44BD-4C55-891A-77823D59161B}",
+        "topcount": "10",
+        "statid": "0",
+        "key_filter": "",
+        "inverse_key_filter": ""
+      }
+    },
+    {
+      "template_id": 54,
+      "name": "Real time key traffic chart",
+      "group": "Real Time Flexible Chart",
+      "presentation": "timeseries_chart",
+      "uri": "/stab/stab_flexichart",
+      "looks_like": "Live line chart of one or more named keys, fed from the real-time stabber stream. Surface is LINE only.",
+      "use_when": "ONLY when the user explicitly says real time, realtime, live, or live-updating for a chart of keys they named (or a live theme dashboard). This is the live counterpart of template 101. On a realtime/live theme dashboard, include at least one of these — resolve 2-3 well-known Apps keys (https, http, dns) with search_keys, or chart Aggregates TOTALBW.",
+      "not_when": "Never when the user did not say real time/realtime/live. Never for a ranked-key list without named keys (there is no live pie/donut of top keys — use 56 for a live ranked list, or 102 only on a retro dashboard). Never for a table or KPI badge.",
+      "needs": ["models"],
+      "option_keys": ["surface", "models", "refmodel"],
+      "defaults": {"surface": "LINE", "models": "[]", "refmodel": "[{}]"},
+      "enums": {"surface": ["LINE"]},
+      "models_schema": "JSON string. Array of {\"cgguid\":\"{...}\",\"meter\":\"0\",\"key\":\"<key>\",\"label\":\"<series label>\"} - one entry per named series. Keys must be human-readable (https[[443]], 192.168.10.13, TOTALBW). NEVER host keyformat.",
+      "recommended_width": 6,
+      "notes": "Explicit opt-in only. Chart pixel size defaults to 600x300 in Webtrisul; do not put grid span in options.width — set the module width field instead (recommended 6). Do not put topcount in models; this template charts named keys only. Meter is per series inside models, not a top-level option.",
+      "example_options": {
+        "surface": "LINE",
+        "models": "[{\"cgguid\":\"{C51B48D4-7876-479E-B0D9-BD9EFF03CE2E}\",\"meter\":\"0\",\"key\":\"https[[443]]\",\"label\":\"https\"},{\"cgguid\":\"{C51B48D4-7876-479E-B0D9-BD9EFF03CE2E}\",\"meter\":\"0\",\"key\":\"http[[80]]\",\"label\":\"http\"}]",
+        "refmodel": "[{}]"
+      }
+    },
+    {
+      "template_id": 56,
+      "name": "Real time toppers list (stabber)",
+      "group": "Real Time Topper List",
+      "presentation": "table",
+      "uri": "/stab/cg_toppers",
+      "looks_like": "Continuously self-updating top N list fed from the real-time stabber stream, no page refresh needed.",
+      "use_when": "ONLY when the user explicitly says real time, realtime, live, or live-updating toppers, e.g. 'real time top apps', or when the whole dashboard request is realtime/live. This is the live counterpart of template 3. Never infer real time from current, latest, last, now, or bandwidth.",
+      "not_when": "Never when the user did not say real time/realtime/live. Never for a chart of named keys (use 54) or a retro toppers table (use 3).",
+      "needs": ["cgguid"],
+      "option_keys": ["cgguid", "statid", "topcount"],
+      "defaults": {"topcount": 10},
+      "enums": {},
+      "recommended_width": 6,
+      "example_options": {
+        "cgguid": "{C51B48D4-7876-479E-B0D9-BD9EFF03CE2E}",
+        "statid": "0",
+        "topcount": "5"
+      }
+    },
+    {
+      "template_id": 61,
+      "name": "Single value badge",
+      "group": "Single Value",
+      "presentation": "kpi",
+      "uri": "/manage_keys/ci_aggregate",
+      "looks_like": "Compact KPI card showing one big number with a label, an optional up/down trend arrow and a small sparkline.",
+      "use_when": "User wants a headline metric, e.g. 'current bandwidth', 'total volume for India'. Put these across the top of the dashboard. On a theme/overview dashboard (no named modules or keys) place 3-4 of these as the first row using Aggregates keys TOTALBW / DIR_INTOHOME / DIR_OUTOFHOME.",
+      "not_when": "Not when the user asked for a chart, graph or trend of that metric - a badge is one number, not a time series. Use 101 for a chart of a named key. Never on a realtime/live dashboard — use template 105.",
+      "needs": ["cgguid", "key"],
+      "option_keys": ["cgguid", "statid", "bucketsize", "key", "ajaxfreq", "ajaxurl", "label", "color", "aggregation", "recentsecs", "show_trends", "chart_color"],
+      "defaults": {"recentsecs": 3600, "bucketsize": "0", "statid": 0, "color": "Info", "aggregation": "Total", "key": "TOTALBW", "cgguid": "{393B5EBC-AB41-4387-8F31-8077DB917336}", "label": "Total Volume", "show_trends": 0},
+      "enums": {
+        "color": ["primary", "secondary", "success", "danger", "warning", "info", "light", "dark"],
+        "aggregation": ["total", "average", "max", "min"]
+      },
+      "recommended_width": 4,
+      "notes": "Default single-value/KPI template when the user has not explicitly requested real time. Use this for requests such as 'last bandwidth of IP 192.168.10.13'; do NOT select template 105 unless the user explicitly says real time/realtime/live/live-updating. Renders without a panel frame by default (undecoratedmods); set undecorated false if the user wants the frame back. key must identify a real item in the counter group. ALWAYS use human-readable form, NEVER Trisul keyformat: hosts as dotted IP (192.168.10.13), not hex (C0.A8.0A.0D). TOTALBW and DIR_INTOHOME / DIR_OUTOFHOME / DIR_WITHINHOME / DIR_TRANSIT exist ONLY in the Aggregate counter group {393B5EBC-AB41-4387-8F31-8077DB917336}; never pair them with a host, application or any other counter group, take the key from search_keys instead. Apps/countries often use a bracket suffix, e.g. 'https[[443]]' or 'India[[IN]]'. Prefer search_keys 'readable' (or label/bracket form for apps), never the raw 'key' hex.",
+      "example_options": {
+        "cgguid": "{393B5EBC-AB41-4387-8F31-8077DB917336}",
+        "statid": "0",
+        "key": "TOTALBW",
+        "label": "Total Bandwidth",
+        "color": "primary",
+        "aggregation": "total",
+        "show_trends": 1,
+        "chart_color": "#2794eb"
+      }
+    },
+    {
+      "template_id": 101,
+      "name": "Traffic chart for given model",
+      "group": "Traffic charts",
+      "presentation": "timeseries_chart",
+      "uri": "/trpjs/apex_chart",
+      "looks_like": "Time-series chart (line, stacked area or MRTG style) of one or more explicitly named keys, with an optional data table underneath.",
+      "use_when": "THE default chart module. Use whenever the user asks for a chart, graph, trend or traffic over time of subjects they named - 'https traffic chart', 'chart of DNS and HTTPS', 'bandwidth trend for 10.1.1.5'. One models entry per named key.",
+      "not_when": "Not when the user named no keys and wants the top N charted - use 102. Not when they want a table of toppers - use 3. Never on a realtime/live dashboard — use template 54.",
+      "needs": ["models"],
+      "option_keys": ["surface", "legend_position", "models", "refmodel", "expression", "title", "height", "show_range_slider", "show_time_selector", "pcap_range_marker", "show_table", "key_filter", "inverse_key_filter", "cgguid", "meter", "key", "label"],
+      "defaults": {"surface": "SQUARELINE", "legend_position": "top", "models": "[]", "refmodel": "[]", "height": 300, "show_table": 1},
+      "enums": {
+        "surface": ["SQUARELINE", "MRTG", "LINE", "STACKEDAREA", "SQUARESTACKEDAREA", "PIE", "DONUT", "BAR"],
+        "legend_position": ["top", "bottom", "left", "right"]
+      },
+      "models_schema": "JSON string. Array of {\"cgguid\":\"{...}\",\"meter\":\"0\",\"key\":\"<key>\",\"label\":\"<series label>\"} - one entry per series.",
+      "recommended_width": 6,
+      "example_options": {
+        "surface": "STACKEDAREA",
+        "models": "[{\"cgguid\":\"{C51B48D4-7876-479E-B0D9-BD9EFF03CE2E}\",\"meter\":\"0\",\"key\":\"https[[443]]\",\"label\":\"HTTPS Traffic\"}]",
+        "refmodel": "[{}]",
+        "show_table": 1,
+        "legend_position": "top",
+        "title": "",
+        "height": "300",
+        "key_filter": "",
+        "inverse_key_filter": "",
+        "show_range_slider": 0,
+        "pcap_range_marker": 0,
+        "show_time_selector": 0
+      }
+    },
+    {
+      "template_id": 102,
+      "name": "Toppers traffic chart for given model",
+      "group": "Toppers Chart",
+      "presentation": "timeseries_chart",
+      "uri": "/trpjs/apex_chart",
+      "looks_like": "Time-series chart with one series per top key, discovered automatically from the counter group's toppers. Optional table below.",
+      "use_when": "User wants a chart of the top N keys without naming them, including pie/donut/bar share-of-total of toppers and 'chart the top 10 hosts'. Set surface to PIE, DONUT or BAR for a breakdown; LINE/STACKEDAREA/SQUARELINE for over time. Theme/overview dashboards MUST include at least one 102 with PIE or DONUT and another 102/103 with LINE or AREA.",
+      "not_when": "Not when the user named the keys - use 101. Not when they asked for a list or table of toppers - use 3. Never on a realtime/live dashboard — there is no live toppers pie/donut; use 54 for named-key live charts and 56 for live toppers lists.",
+      "needs": ["models"],
+      "option_keys": ["surface", "legend_position", "models", "refmodel", "expression", "title", "height", "show_range_slider", "show_time_selector", "pcap_range_marker", "show_table", "key_filter", "inverse_key_filter", "cgguid", "meter", "key", "label"],
+      "defaults": {"surface": "SQUARESTACKEDAREA", "legend_position": "top", "models": "[]", "refmodel": "[]", "show_table": 1},
+      "enums": {
+        "surface": ["SQUARELINE", "MRTG", "LINE", "STACKEDAREA", "SQUARESTACKEDAREA", "PIE", "DONUT", "BAR"],
+        "legend_position": ["top", "bottom", "left", "right"]
+      },
+      "models_schema": "JSON string. Array of {\"cgguid\":\"{...}\",\"meter\":\"0\",\"topcount\":\"10\"} - no key, the toppers are resolved at render time.",
+      "recommended_width": 6,
+      "example_options": {
+        "surface": "LINE",
+        "models": "[{\"cgguid\":\"{4CD742B1-C1CA-4708-BE78-0FCA2EB01A86}\",\"meter\":\"0\",\"topcount\":\"10\"}]",
+        "refmodel": "[{}]",
+        "show_table": 0,
+        "legend_position": "top",
+        "title": "",
+        "height": "300",
+        "key_filter": "",
+        "inverse_key_filter": ""
+      }
+    },
+    {
+      "template_id": 103,
+      "name": "Topper trend chart for given model",
+      "group": "Toppers Trend Traffic Chart",
+      "presentation": "timeseries_chart",
+      "uri": "/trpjs/apex_chart",
+      "looks_like": "Stacked area chart showing how the composition of the top N keys shifts over time, with a ranked table below.",
+      "use_when": "User wants to see how the leaderboard changes over the window, e.g. 'topper trend for apps', or a retro toppers chart over a historical range.",
+      "not_when": "Not when the user named the keys - use 101. Never on a realtime/live dashboard — use template 54.",
+      "needs": ["models"],
+      "option_keys": ["surface", "legend_position", "models", "refmodel", "expression", "title", "height", "show_range_slider", "show_time_selector", "pcap_range_marker", "show_table", "key_filter", "inverse_key_filter", "cgguid", "meter", "key", "label"],
+      "defaults": {"surface": "SQUARESTACKEDAREA", "models": "[]", "refmodel": "[]", "legend_position": "top", "show_table": 1},
+      "enums": {
+        "surface": ["SQUARELINE", "MRTG", "LINE", "STACKEDAREA", "SQUARESTACKEDAREA"],
+        "legend_position": ["top", "bottom", "left", "right"]
+      },
+      "models_schema": "JSON string. Array of {\"cgguid\":\"{...}\",\"meter\":\"0\",\"topcount\":\"10\"}",
+      "recommended_width": 6,
+      "notes": "PIE, DONUT and BAR surfaces are disabled for this template in the Webtrisul UI - do not use them.",
+      "example_options": {
+        "surface": "STACKEDAREA",
+        "models": "[{\"cgguid\":\"{C51B48D4-7876-479E-B0D9-BD9EFF03CE2E}\",\"meter\":\"0\",\"topcount\":\"10\"}]",
+        "refmodel": "[{}]",
+        "show_table": 1,
+        "legend_position": "top",
+        "title": "",
+        "height": "300",
+        "key_filter": "",
+        "inverse_key_filter": ""
+      }
+    },
+    {
+      "template_id": 105,
+      "name": "Real time single value",
+      "group": "Real Time Single Value",
+      "presentation": "kpi",
+      "uri": "/stab/single_value",
+      "looks_like": "KPI card that ticks live from the real-time stream, optionally drawn as a gauge with a small live chart.",
+      "use_when": "ONLY when the user explicitly says real time, realtime, live, or live-updating for this value, e.g. 'real time total bandwidth', or when the whole dashboard request is realtime/live. This is the live counterpart of template 61. Never infer real time from current, latest, last, now, or bandwidth.",
+      "needs": ["counter_group", "key"],
+      "option_keys": ["counter_group", "meter", "key", "label", "color", "show_gauge", "chart_color", "probe"],
+      "defaults": {"meter": 0, "color": "Info", "key": "TOTALBW", "counter_group": "{393B5EBC-AB41-4387-8F31-8077DB917336}", "label": "Total Volume", "show_gauge": 0},
+      "enums": {"color": ["primary", "secondary", "success", "danger", "warning", "info", "light", "dark"]},
+      "recommended_width": 4,
+      "notes": "Explicit opt-in only: do not use unless the user says real time/realtime/live/live-updating. For 'last bandwidth of IP ...' use template 61 instead. Renders without a panel frame by default (undecoratedmods); set undecorated false if the user wants the frame back. This template uses 'counter_group' and 'meter', NOT 'cgguid' and 'statid'. 'probe' names the stabber probe, usually 'probe0'. For 'key', ALWAYS use human-readable form (e.g. 192.168.10.13 or https[[443]]), NEVER host keyformat (C0.A8.0A.0D). TOTALBW and the DIR_* keys are valid ONLY with counter_group {393B5EBC-AB41-4387-8F31-8077DB917336} (Aggregate); for any other counter group take the key from search_keys.",
+      "example_options": {
+        "counter_group": "{C51B48D4-7876-479E-B0D9-BD9EFF03CE2E}",
+        "meter": "0",
+        "key": "https[[443]]",
+        "label": "Total Volume",
+        "color": "primary",
+        "show_gauge": 0,
+        "chart_color": "#6fb92c",
+        "probe": "probe0"
+      }
+    },
+    {
+      "template_id": 106,
+      "name": "Recent alerts in a list",
+      "group": "Alert List",
+      "presentation": "alert_feed",
+      "uri": "/trisul_ids_alerts/mod_show_alert_list",
+      "looks_like": "Scrollable feed of recent alerts, each row showing severity icon, signature name, description and the source/destination endpoints.",
+      "use_when": "User wants to see recent alerts from an alert group (IDS, blacklist, user alerts, TCA).",
+      "not_when": "Not when they only want how many alerts fired - use 108.",
+      "needs": ["alert_group"],
+      "option_keys": ["alert_group", "topcount", "sigid", "message_regex", "show_description", "show_endpoints"],
+      "defaults": {"alert_group": "{9AFD8C08-07EB-47E0-BF05-28B4A7AE8DC9}", "topcount": 10, "show_description": 1, "show_endpoints": 1},
+      "enums": {},
+      "recommended_width": 6,
+      "example_options": {
+        "alert_group": "{5E97C3A3-41DB-4E34-92C3-87C904FAB83E}",
+        "topcount": "10",
+        "sigid": "",
+        "message_regex": "",
+        "show_description": 1,
+        "show_endpoints": 1
+      }
+    },
+    {
+      "template_id": 107,
+      "name": "Custom URL page",
+      "group": "Custom URL Page",
+      "presentation": "embed",
+      "uri": "/webtrisul_module/custom_url",
+      "looks_like": "Embeds another Webtrisul page inside the dashboard panel, e.g. the session flow map at /sessions/flowmap.",
+      "use_when": "User asks for a flowmap / flow map / session flow map, or wants any existing Webtrisul view embedded (iframe). Prefer this over Crosskey sankey when they say flowmap.",
+      "needs": ["url"],
+      "option_keys": ["url", "url_params_json"],
+      "defaults": {},
+      "enums": {},
+      "recommended_width": 12,
+      "notes": "Flowmap = this template with url='/sessions/flowmap'. NO counter group and NO crosskey required. Do NOT confuse with template 110 (Crosskey sankey), which is a different module.",
+      "example_options": {"url": "/sessions/flowmap", "url_params_json": ""}
+    },
+    {
+      "template_id": 108,
+      "name": "Alert counts",
+      "group": "Alert List",
+      "presentation": "kpi",
+      "uri": "/trisul_ids_alerts/alerts_count",
+      "looks_like": "KPI card with the number of alerts fired in the window for the chosen alert group.",
+      "use_when": "User wants an alert count badge rather than the full alert feed.",
+      "not_when": "Not when they want to read the alerts themselves - use 106.",
+      "needs": ["alert_group"],
+      "option_keys": ["alert_group", "sigid", "message_regex", "color", "show_description"],
+      "defaults": {"alert_group": "{9AFD8C08-07EB-47E0-BF05-28B4A7AE8DC9}", "color": "Info", "show_description": 1},
+      "enums": {"color": ["primary", "secondary", "success", "danger", "warning", "info", "light", "dark"]},
+      "recommended_width": 4,
+      "example_options": {
+        "alert_group": "{9AFD8C08-07EB-47E0-BF05-28B4A7AE8DC9}",
+        "sigid": "",
+        "message_regex": "",
+        "color": "primary",
+        "show_description": 1
+      }
+    },
+    {
+      "template_id": 109,
+      "name": "Crosskey toppers tree",
+      "group": "Crosskey Tree",
+      "presentation": "tree",
+      "uri": "/crosskey/toppers_list",
+      "looks_like": "Expandable two-level tree: parent keys with their child keys nested underneath, each with traffic totals.",
+      "use_when": "User wants an A-by-B breakdown from a crosskey counter group, e.g. 'interface to protocol'. Also add this (or template 110 sankey) on a theme dashboard when live inventory has a related crosskey (Hosts_X_Apps, FlowIntf_bx_Apps, names with _X_ / _bx_). Do not create a new crosskey just to fill the slot.",
+      "needs": ["cgguid"],
+      "option_keys": ["cgguid", "topcount", "statid", "key_filter", "inverse_key_filter"],
+      "defaults": {"topcount": 10, "statid": 0},
+      "enums": {},
+      "recommended_width": 6,
+      "notes": "cgguid must be a crosskey counter group. Always call list_all_available_counter_groups first and reuse an existing crosskey (e.g. Hosts_X_Apps) when it fits. Only call create_crosskey_counter_group if live inventory has no suitable group.",
+      "example_options": {
+        "cgguid": "{7CC98142-F08C-C5FE-AAB8-F2653530F216}",
+        "topcount": "10",
+        "statid": "0",
+        "key_filter": "",
+        "inverse_key_filter": ""
+      }
+    },
+    {
+      "template_id": 110,
+      "name": "Crosskey sankey diagram",
+      "group": "Crosskey Sankey",
+      "presentation": "sankey",
+      "uri": "/crosskey/sankey",
+      "looks_like": "Sankey diagram with ribbons whose thickness is proportional to traffic between the left and right key sets of a crosskey counter group.",
+      "use_when": "User explicitly asks for a sankey / crosskey sankey between two dimensions, e.g. 'interface to apps as a sankey'. Also include on a theme/overview dashboard when a related live crosskey GUID exists. NOT for 'flowmap' — that is template 107 Custom URL with /sessions/flowmap. Do not create a new crosskey solely to add a sankey.",
+      "needs": ["cgguid"],
+      "option_keys": ["cgguid", "topcount", "meter", "key_filter", "inverse_key_filter", "assign_equal_weight"],
+      "defaults": {"topcount": 10, "meter": 0, "assign_equal_weight": 0},
+      "enums": {},
+      "recommended_width": 6,
+      "notes": "cgguid must be a crosskey counter group. Uses 'meter', not 'statid'. This is NOT the session flowmap; flowmap needs no crosskey and uses template 107. Always reuse an existing live crosskey when available; create only after list_all_available_counter_groups shows none fit.",
+      "example_options": {
+        "cgguid": "{4F1D6F68-6E89-41F4-F4F4-43F9A3C9C530}",
+        "topcount": "10",
+        "meter": "0",
+        "key_filter": "",
+        "inverse_key_filter": "",
+        "assign_equal_weight": 0
+      }
+    },
+    {
+      "template_id": 111,
+      "name": "Top resources table",
+      "group": "Top Resources Table",
+      "presentation": "resource_table",
+      "uri": "/resource/index",
+      "looks_like": "Wide table of top N resources (DNS names, URLs, TLS certificates) with hit counts and the associated IP addresses.",
+      "use_when": "User wants top DNS / URL / SSL resources. Choose the matching resource group GUID.",
+      "needs": ["rguid"],
+      "option_keys": ["rguid", "ip_address", "message_regex", "topcount", "valid_input"],
+      "defaults": {"rguid": "{4EF9DEB9-4332-4867-A667-6A30C5900E9E}", "ip_address": "", "message_regex": "", "topcount": "10", "valid_input": "1"},
+      "enums": {},
+      "recommended_width": 12,
+      "example_options": {
+        "rguid": "{D1E27FF0-6D66-4E57-BB91-99F76BB2143E}",
+        "ip_address": "",
+        "message_regex": "",
+        "topcount": "10"
+      }
+    }
+  ]
+}
+

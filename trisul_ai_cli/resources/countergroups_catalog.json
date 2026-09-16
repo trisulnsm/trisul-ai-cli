@@ -1,0 +1,430 @@
+{
+  "_comment": "Catalog of derived Trisul counter groups (crosskey, filter, keyset). Live inventory always wins: call list_all_available_counter_groups before proposing create_*. Never copy GUIDs from this file.",
+  "catalog_version": 1,
+  "reuse_first": "Always call list_all_available_counter_groups (and get_cginfo_from_countergroup_name for candidate names) before proposing or creating. If a live group already matches the dimensions, filter rules, or keyset buckets, reuse its GUID. Only create when nothing suitable exists, via confirm=False then explicit user confirmation then confirm=True.",
+  "how_to_choose": [
+    {
+      "if_user_wants": "A relationship or drill-down between two (or three) dimensions: interface-to-app, host-to-country, A-by-B, sankey, tree",
+      "choose": "crosskey",
+      "create_tool": "create_crosskey_counter_group"
+    },
+    {
+      "if_user_wants": "The same keys as a parent group, but only traffic that matches (or excludes) specific keys from another group: HTTPS-only hosts, DNS on interfaces",
+      "choose": "filter",
+      "create_tool": "create_filter_counter_group"
+    },
+    {
+      "if_user_wants": "Several parent keys rolled into named buckets that appear as new toppers: web vs dns vs p2p, server farms, office vs DC interfaces",
+      "choose": "keyset",
+      "create_tool": "create_keyset_counter_group"
+    }
+  ],
+  "show_in_module_overview": {
+    "crosskey": "Must use template 109 (tree) or 110 (sankey) when the user asked for A-by-B / tree / sankey. The created GUID goes in options.cgguid. Composite keys can also drive ordinary toppers/charts (3, 102) if the user asked for a list or pie of the crosskey itself.",
+    "filter": "The new group behaves like the parent: keys are still parent keys (hosts, interfaces, …), just restricted. Put its GUID in cgguid (templates 1, 3, 56, 61, 109 if parent is already a crosskey) or in models[].cgguid (54, 101, 102, 103) or counter_group (105).",
+    "keyset": "The new group's keys ARE the bucket names (web, p2p, gateways). Chart or list those bucket names. Template 3/56 for a bucket toppers table, 102 pie of buckets, 101/54/61/105 for a named bucket."
+  },
+  "types": [
+    {
+      "type": "crosskey",
+      "name": "Crosskey counter group",
+      "create_tool": "create_crosskey_counter_group",
+      "what_it_is": "A derived counter group whose keys are pairs (or triples) of keys from two or three parent groups. Each composite key records traffic that belongs to both dimensions at once, e.g. this-host AND that-app.",
+      "how_it_works": "Trisul crosses every key of cross_guid1 with matching keys of cross_guid2 (and optionally cross_guid3). Typical names look like Hosts_X_Apps or FlowIntf_bx_Apps. Slice keys are enabled so dashboards can expand a parent into children.",
+      "use_when": "The metric is a relationship between dimensions: who talks to whom, which apps on which interface, host-to-country, sankey ribbons, expandable A-by-B tree.",
+      "not_when": "Do not use for a session flowmap (template 107, no counter group). Do not create a crosskey just to fill a theme-dashboard sankey slot if a live _X_ / _bx_ group already exists. Do not use when the user only wants a subset of one group's keys (that is filter) or named buckets of keys (that is keyset).",
+      "create_required": ["name", "cross_guid1", "cross_guid2", "creation_reason", "dashboard_usage"],
+      "create_optional": ["cross_guid3", "description", "resolver_counter_guid", "toppers_interval", "bucket_size", "track_hi_water", "track_lo_water", "enable_slice_keys", "balance_depth"],
+      "how_to_create": [
+        "Call list_all_available_counter_groups. Reuse any live group that already crosses the same dimensions (names with _X_, _bx_, or ' x ').",
+        "Resolve parent names to GUIDs with get_cginfo_from_countergroup_name. Never ask the user for GUIDs.",
+        "Call create_crosskey_counter_group with confirm=False, creation_reason (inventory was checked, nothing fits), and dashboard_usage (template id and which option gets the new GUID).",
+        "If status is reuse_existing, use an existing_counter_groups GUID and stop.",
+        "If status is pending_confirmation, show type, name, both parent names/GUIDs, reason, and the exact module that will consume the GUID. Ask for confirmation.",
+        "After explicit approval, call again with the same arguments and confirm=True. Use the returned counter_group_guid in the dashboard module."
+      ],
+      "example_create_args": {
+        "name": "Hosts_X_Apps",
+        "description": "Hosts crossed with applications",
+        "cross_guid1": "<HOSTS_GUID_FROM_LIVE_COUNTER_GROUP_INFO>",
+        "cross_guid2": "<APPS_GUID_FROM_LIVE_COUNTER_GROUP_INFO>",
+        "cross_guid3": null,
+        "enable_slice_keys": 1,
+        "creation_reason": "Live inventory has no Hosts x Apps crosskey; template 110 sankey needs one.",
+        "dashboard_usage": "Template 110 Crosskey sankey, options.cgguid = created GUID, meter 0.",
+        "confirm": false
+      },
+      "scenarios": [
+        {
+          "title": "Which hosts use which applications",
+          "parents": ["Hosts", "Apps"],
+          "why": "Plain Hosts toppers hide the app mix; plain Apps toppers hide who is using them.",
+          "module": "Template 110 sankey or 109 tree with cgguid of Hosts_X_Apps"
+        },
+        {
+          "title": "Apps on each NetFlow interface",
+          "parents": ["FlowIntfs", "Apps"],
+          "why": "Shows which application is consuming each WAN/LAN interface.",
+          "module": "Template 109 tree (interface → apps) or 110 sankey. Prefer reusing FlowIntf_bx_Apps if live."
+        },
+        {
+          "title": "Hosts by country",
+          "parents": ["Hosts", "Country"],
+          "why": "Answers where each top talker is communicating.",
+          "module": "Template 109 tree or 110 sankey"
+        },
+        {
+          "title": "Who is behind each interface",
+          "parents": ["FlowIntfs", "Hosts"],
+          "why": "Per-interface talkers for capacity and incident response. Reuse FlowIntf_bx_Hosts when present.",
+          "module": "Template 109 tree"
+        },
+        {
+          "title": "Application mix by geography",
+          "parents": ["Apps", "Country"],
+          "why": "Detect region-specific app usage or unexpected geo for an app.",
+          "module": "Template 110 sankey"
+        },
+        {
+          "title": "Interface to ASN (ISP / peering)",
+          "parents": ["FlowIntfs", "ASNumber"],
+          "why": "Peering and transit mix on each interface. Reuse FlowIntf_bx_ASN when present.",
+          "module": "Template 110 sankey, width 12"
+        },
+        {
+          "title": "User identity to host",
+          "parents": ["User-ID", "Hosts"],
+          "why": "Map authenticated users onto IPs when a User-ID group exists.",
+          "module": "Template 109 tree"
+        },
+        {
+          "title": "Three-way host, app, country",
+          "parents": ["Hosts", "Apps", "Country"],
+          "why": "Only when the user needs a third drill-down axis. Pass cross_guid3.",
+          "module": "Template 109 tree (three-level) if supported; otherwise two-level plus a second module"
+        }
+      ],
+      "show_in_module": {
+        "guid_goes_in": "options.cgguid (109, 110, 1, 3, 56) or models[].cgguid (102). Never for template 107 flowmap.",
+        "preferred_templates": [
+          {
+            "template_id": 109,
+            "name": "Crosskey toppers tree",
+            "presentation": "tree",
+            "when": "User asked for tree, drill-down, A-by-B breakdown, interface to protocol",
+            "options_note": "cgguid, topcount, statid (not meter), key_filter, inverse_key_filter. Width 6 or 12."
+          },
+          {
+            "template_id": 110,
+            "name": "Crosskey sankey diagram",
+            "presentation": "sankey",
+            "when": "User asked for sankey or A-to-B ribbons. Also on theme dashboards when a related live crosskey exists.",
+            "options_note": "cgguid, topcount, meter (not statid), key_filter, inverse_key_filter, assign_equal_weight. Width 6 or 12."
+          }
+        ],
+        "also_usable_templates": [
+          {
+            "template_id": 3,
+            "when": "Top composite keys as a table (unusual; prefer 109/110 for A-by-B)."
+          },
+          {
+            "template_id": 102,
+            "when": "Pie/donut of top composite keys over the dashboard window."
+          }
+        ],
+        "example_module": {
+          "name": "Hosts to apps",
+          "template_id": 110,
+          "width": 12,
+          "intent": "hosts to apps sankey",
+          "options": {
+            "cgguid": "<CREATED_OR_REUSED_CROSSKEY_GUID>",
+            "topcount": 10,
+            "meter": 0,
+            "key_filter": "",
+            "inverse_key_filter": "",
+            "assign_equal_weight": 0
+          }
+        }
+      }
+    },
+    {
+      "type": "filter",
+      "name": "Filtered counter group",
+      "create_tool": "create_filter_counter_group",
+      "what_it_is": "A derived group that keeps the parent's key space (hosts, interfaces, …) but only meters traffic that matches include keys — or drops traffic matching inverse keys — taken from a second counter group (the filter group).",
+      "how_it_works": "Parent supplies what you display. Filter group supplies which keys qualify the traffic. Include list (filter_key_list) AND/OR exclude list (filter_key_inv_list). Keys are stored in Trisul DB format (p-0035 for DNS, p-0050,p-01BB for 80+443). Human labels such as dns are resolved via search_keys inside the create tool.",
+      "use_when": "The user wants toppers or charts of a familiar parent, restricted to a protocol, app, country, or other qualifier: HTTPS-only hosts, DNS on interfaces, hosts talking to India, everything except web on an interface.",
+      "not_when": "Do not use when they want an A-by-B relationship (crosskey) or named aggregate buckets that replace the original keys (keyset). Do not use a filter when an existing native group already is that subset (e.g. HTTP Hosts).",
+      "create_required": ["name", "parent_counter_guid", "filter_counter_guid", "filter_key_list or filter_key_inv_list", "creation_reason", "dashboard_usage"],
+      "create_optional": ["description", "row_status", "enable_slice_keys"],
+      "how_to_create": [
+        "Call list_all_available_counter_groups. Reuse an existing filter with the same parent, filter group, and include/exclude keys.",
+        "Resolve parent and filter group names to GUIDs with get_cginfo_from_countergroup_name.",
+        "Pass explicit keys (Port-80, p-0035, 53, full IP, ranges a~b) or labels (dns, http). The tool resolves labels.",
+        "Call create_filter_counter_group with confirm=False plus creation_reason and dashboard_usage.",
+        "If status is reuse_existing, use that GUID.",
+        "If keys are ambiguous, show candidates and ask the user to pick — do not guess.",
+        "Show the proposal (parent, filter, resolved DB keys, module usage) and wait for confirmation, then confirm=True."
+      ],
+      "example_create_args": {
+        "name": "HTTPS Hosts",
+        "description": "Hosts restricted to HTTPS (port 443)",
+        "parent_counter_guid": "<HOSTS_GUID_FROM_LIVE_COUNTER_GROUP_INFO>",
+        "filter_counter_guid": "<APPS_GUID_FROM_LIVE_COUNTER_GROUP_INFO>",
+        "filter_key_list": "Port-443",
+        "filter_key_inv_list": null,
+        "creation_reason": "Live inventory has no Hosts-filtered-by-HTTPS group; toppers table needs that subset.",
+        "dashboard_usage": "Template 3 retro toppers list, options.cgguid = created GUID, statid 0.",
+        "confirm": false
+      },
+      "scenarios": [
+        {
+          "title": "Top hosts using HTTPS only",
+          "parent": "Hosts",
+          "filter": "Apps",
+          "keys": "Port-443 or https",
+          "why": "Isolate encrypted web talkers from general host toppers.",
+          "module": "Template 3 table or 102 pie of the filtered Hosts GUID"
+        },
+        {
+          "title": "DNS load per interface",
+          "parent": "FlowIntfs",
+          "filter": "Apps",
+          "keys": "Port-53 or dns",
+          "why": "See which interfaces carry DNS, useful for resolver placement.",
+          "module": "Template 3 or 102; live: template 56"
+        },
+        {
+          "title": "Web ports on interfaces (80+443+8080)",
+          "parent": "FlowIntfs",
+          "filter": "Apps",
+          "keys": "Port-80,Port-443,Port-8080",
+          "why": "Capacity planning for HTTP(S) vs other traffic.",
+          "module": "Template 102 stacked area or 3 table"
+        },
+        {
+          "title": "Hosts communicating with a country",
+          "parent": "Hosts",
+          "filter": "Country",
+          "keys": "India or the country label from search_keys",
+          "why": "Incident or compliance view of who talks to a region.",
+          "module": "Template 3 toppers of filtered Hosts"
+        },
+        {
+          "title": "Non-web traffic on interfaces (inverse)",
+          "parent": "FlowIntfs",
+          "filter": "Apps",
+          "keys": "filter_key_inv_list = Port-80,Port-443",
+          "why": "Highlight everything that is not ordinary web on the WAN.",
+          "module": "Template 3 or 102"
+        },
+        {
+          "title": "Internal hosts using DNS",
+          "parent": "Internal Hosts",
+          "filter": "Apps",
+          "keys": "Port-53",
+          "why": "Find noisy resolvers or clients inside the home network.",
+          "module": "Template 3; named-host chart 101 if they named an IP"
+        },
+        {
+          "title": "ASN-filtered interface traffic",
+          "parent": "FlowIntfs",
+          "filter": "ASNumber",
+          "keys": "a specific ASN from search_keys",
+          "why": "Traffic toward one peer/transit on each interface without a full crosskey.",
+          "module": "Template 3 or 61 badges per interface key on the filtered group"
+        },
+        {
+          "title": "HTTP Hosts already exist — reuse, do not filter",
+          "parent": "n/a",
+          "filter": "n/a",
+          "keys": "n/a",
+          "why": "If live inventory has HTTP Hosts, TLS Orgs, etc., reuse those native groups instead of creating a filter.",
+          "module": "Use the native GUID with template 3 / 102"
+        }
+      ],
+      "show_in_module": {
+        "guid_goes_in": "The filtered GUID is a normal counter group of the PARENT key type. Use it anywhere a parent GUID would go: options.cgguid, models[].cgguid, or options.counter_group (template 105).",
+        "preferred_templates": [
+          {
+            "template_id": 3,
+            "name": "Retro toppers in a list",
+            "presentation": "table",
+            "when": "Top N parent keys under the filter (default)."
+          },
+          {
+            "template_id": 102,
+            "name": "Toppers flexible chart",
+            "presentation": "timeseries_chart or pie",
+            "when": "Pie/donut/bar or line/area of top N filtered keys. models entry uses cgguid of the filter group and topcount, no key."
+          },
+          {
+            "template_id": 56,
+            "name": "Real time toppers list",
+            "presentation": "table",
+            "when": "Only if the user said real time / live."
+          },
+          {
+            "template_id": 101,
+            "name": "Key traffic flexible chart",
+            "presentation": "timeseries_chart",
+            "when": "User named a specific parent key (an IP, an interface) and wants its filtered traffic over time. models[].key is that parent key, cgguid is the filter group."
+          },
+          {
+            "template_id": 61,
+            "name": "Single value badge",
+            "presentation": "kpi",
+            "when": "One named parent key's filtered volume. Real time counterpart is 105."
+          }
+        ],
+        "example_module": {
+          "name": "Top HTTPS hosts",
+          "template_id": 3,
+          "width": 6,
+          "intent": "top https hosts table",
+          "options": {
+            "cgguid": "<CREATED_OR_REUSED_FILTER_GUID>",
+            "topcount": 10,
+            "units": "B",
+            "statid": 0,
+            "resolve_key": true,
+            "key_description": true,
+            "key_filter": "",
+            "inverse_key_filter": ""
+          }
+        }
+      }
+    },
+    {
+      "type": "keyset",
+      "name": "Keyset counter group",
+      "create_tool": "create_keyset_counter_group",
+      "what_it_is": "A derived group that folds many keys from one parent into named buckets. Each KeysetKey (web, p2p, gateways) becomes a first-class key whose meters are the sum of its KeyFrom members.",
+      "how_it_works": "Parent is the source key space. Each bucket is {keyset_key, keys_from}. KeysetKey must not contain comma, tilde, or !. KeyFrom is stored in DB format, comma-separated, ranges allowed (p-1AE1~p-1AE9). meter_only_keysets=true (default) counts only keys that belong to a bucket. You may create an empty group (name + parent) and add buckets later.",
+      "use_when": "The user wants custom aggregates that do not exist as native keys: business vs recreational apps, server farms, office vs datacenter interfaces, P2P as one number.",
+      "not_when": "Do not use to restrict toppers to a few keys while still showing those original keys (that is a filter, or key_filter on a module). Do not use for A-by-B drill-down (crosskey).",
+      "create_required": ["name", "parent_counter_guid", "creation_reason", "dashboard_usage"],
+      "create_optional": ["keyset_key + keys_from", "keysets list", "meter_only_keysets", "description"],
+      "how_to_create": [
+        "Call list_all_available_counter_groups. Reuse a keyset with the same parent and bucket purpose/name.",
+        "Resolve the parent GUID with get_cginfo_from_countergroup_name.",
+        "Supply one bucket (keyset_key + keys_from) or several via keysets=[{keyset_key, keys_from}, ...]. Labels in keys_from are resolved against the parent.",
+        "Call create_keyset_counter_group with confirm=False, creation_reason, dashboard_usage.",
+        "If reuse_existing, use that GUID. If keys are ambiguous, ask the user to pick.",
+        "Show every KeysetKey and resolved KeyFrom plus the module that will chart the buckets, then confirm=True."
+      ],
+      "example_create_args": {
+        "name": "App classes",
+        "description": "Web, DNS, and P2P buckets over Apps",
+        "parent_counter_guid": "<APPS_GUID_FROM_LIVE_COUNTER_GROUP_INFO>",
+        "meter_only_keysets": true,
+        "keysets": [
+          {"keyset_key": "web", "keys_from": "Port-80,Port-443,Port-8080"},
+          {"keyset_key": "dns", "keys_from": "Port-53"},
+          {"keyset_key": "p2p", "keys_from": "Port-6881,Port-6882,Port-6883"}
+        ],
+        "creation_reason": "Live inventory has no Apps keyset with web/dns/p2p buckets; pie of classes needs one.",
+        "dashboard_usage": "Template 102 DONUT, models cgguid = created GUID, topcount 10, meter 0.",
+        "confirm": false
+      },
+      "scenarios": [
+        {
+          "title": "Web vs DNS vs P2P application classes",
+          "parent": "Apps",
+          "buckets": "web=80/443/8080, dns=53, p2p=typical BitTorrent ports",
+          "why": "Leadership view of traffic classes instead of hundreds of ports.",
+          "module": "Template 102 pie/donut of the keyset GUID; 101 to trend the 'web' bucket"
+        },
+        {
+          "title": "Server farms / gateways",
+          "parent": "Hosts",
+          "buckets": "gateways=10.1.17.1,10.1.18.1 ; web-tier=list of IPs ; db-tier=list of IPs",
+          "why": "Treat a farm as one talker for capacity and failover.",
+          "module": "Template 3 table of farms; 61 badge for one farm key"
+        },
+        {
+          "title": "Office vs datacenter interfaces",
+          "parent": "FlowIntfs",
+          "buckets": "office=ifIndex list, datacenter=ifIndex list",
+          "why": "Roll many NetFlow interfaces into two site totals.",
+          "module": "Template 102 stacked area of the two buckets; 54 if live named buckets"
+        },
+        {
+          "title": "Business vs recreational apps",
+          "parent": "Apps",
+          "buckets": "business=https,http,smtp,imap ; rec=youtube,netflix,bittorrent labels via search_keys",
+          "why": "Acceptable-use reporting without a full app taxonomy.",
+          "module": "Template 102 DONUT; 3 table"
+        },
+        {
+          "title": "Critical vs guest subnets",
+          "parent": "Hosts or Prefix",
+          "buckets": "critical=CIDR or host list, guest=host list",
+          "why": "Compare two populations as two keys.",
+          "module": "Template 101 two series (critical, guest) with cgguid of the keyset"
+        },
+        {
+          "title": "Cloud / peer ASN groups",
+          "parent": "ASNumber",
+          "buckets": "cloud=list of cloud ASNs, transit=list of transit ASNs",
+          "why": "Peering cost view without a sankey.",
+          "module": "Template 3 or 102"
+        },
+        {
+          "title": "Empty keyset to fill later",
+          "parent": "any",
+          "buckets": "none yet",
+          "why": "User asked to create the group now and add members in Trisul later. Still requires confirmation.",
+          "module": "Do not add a dashboard module until at least one bucket exists, or the panel will be empty."
+        }
+      ],
+      "show_in_module": {
+        "guid_goes_in": "The keyset GUID's keys are the bucket names (web, p2p, gateways), not the original parent keys. search_keys against the keyset group to confirm bucket spellings before using them in models or template 61/101/54/105.",
+        "preferred_templates": [
+          {
+            "template_id": 102,
+            "name": "Toppers flexible chart",
+            "presentation": "pie or timeseries",
+            "when": "Share of each bucket (PIE/DONUT) or buckets over time (LINE/STACKEDAREA). models use cgguid of the keyset and topcount."
+          },
+          {
+            "template_id": 3,
+            "name": "Retro toppers in a list",
+            "presentation": "table",
+            "when": "Ranked list of buckets."
+          },
+          {
+            "template_id": 101,
+            "name": "Key traffic flexible chart",
+            "presentation": "timeseries_chart",
+            "when": "User named buckets. models[].key is the KeysetKey (web), not Port-80."
+          },
+          {
+            "template_id": 61,
+            "name": "Single value badge",
+            "presentation": "kpi",
+            "when": "One bucket as a KPI. Real time: 105 with counter_group = keyset GUID and key = bucket name."
+          },
+          {
+            "template_id": 56,
+            "name": "Real time toppers list",
+            "presentation": "table",
+            "when": "Live ranked buckets. User must have said real time / live."
+          }
+        ],
+        "example_module": {
+          "name": "App classes",
+          "template_id": 102,
+          "width": 6,
+          "intent": "donut of app classes",
+          "options": {
+            "surface": "DONUT",
+            "models": "[{\"cgguid\":\"<CREATED_OR_REUSED_KEYSET_GUID>\",\"meter\":\"0\",\"topcount\":\"10\"}]",
+            "refmodel": "[{}]"
+          }
+        }
+      }
+    }
+  ]
+}

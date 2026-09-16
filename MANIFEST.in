@@ -1,2 +1,3 @@
 recursive-include trisul_ai_cli/chroma_store *
+recursive-include trisul_ai_cli/resources *.json
 

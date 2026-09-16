@@ -70,6 +70,9 @@ class TrisulAIClient:
         self.table_data = {}
         self.report_path = None
         self.verified_report_path = None
+        self.dashboard_path = None
+        self.dashboard_json = None
+        self.dashboard_filename = None
         self.auto_open_reports = True
         self.pending_report_request = False
         self.report_data_fetched = False
@@ -82,8 +85,10 @@ class TrisulAIClient:
         # Load main system prompt
         system_prompt_path = self.root_dir / "prompts/system_main.txt"
         template = system_prompt_path.read_text(encoding="utf-8")
-        main_system_prompt = template.format(
-            existing_ai_memory=self.existing_ai_memory
+        # Literal replace: str.format() treats JSON braces in the prompt as placeholders.
+        main_system_prompt = template.replace(
+            "{existing_ai_memory}",
+            str(self.existing_ai_memory),
         )
     
         self.conversation_history = [
@@ -419,13 +424,115 @@ class TrisulAIClient:
                 if self.zmq_endpoint:
                     return
 
-    def _normalize_tool_args(self, function_name: str, function_args: dict) -> dict:
+    @staticmethod
+    def _canonical_context(ctx: str) -> str:
+        """Normalize a context name the same way the MCP server does."""
+        if not ctx:
+            return ""
+        ctx = str(ctx).strip().lower()
+        if ctx.startswith("context_"):
+            ctx = ctx.split("_", 1)[-1]
+        if ctx in ("default", "context0"):
+            return "context0"
+        return f"context_{ctx}"
+
+    def _contexts_equivalent(self, left: str, right: str) -> bool:
+        return bool(left) and bool(right) and self._canonical_context(left) == self._canonical_context(right)
+
+    def _resolve_locked_context(self, context_id: Optional[str]) -> Optional[str]:
+        if context_id is None:
+            return None
+        context_id = str(context_id).strip()
+        return context_id or None
+
+    _LOCKED_CONTEXT_MENTION_RE = re.compile(
+        r"\bcontext[_-]?0\b"
+        r"|\bcontext[_-][A-Za-z][\w-]*\b"
+        r"|(?:connect\s+to|use|switch\s+to|query)\s+(?:the\s+)?context\s+['\"]?([A-Za-z][\w-]*)['\"]?",
+        re.I,
+    )
+
+    def _mentioned_other_contexts(self, text: str, locked_context: str) -> List[str]:
+        if not text or not locked_context:
+            return []
+        others = []
+        seen = set()
+        for match in self._LOCKED_CONTEXT_MENTION_RE.finditer(text):
+            raw = match.group(1) or match.group(0)
+            raw = raw.strip().strip("'\"")
+            if not raw or self._contexts_equivalent(raw, locked_context):
+                continue
+            key = self._canonical_context(raw)
+            if key and key not in seen:
+                seen.add(key)
+                others.append(raw)
+        return others
+
+    def _locked_context_switch_message(self, locked_context: str, requested: str = None) -> str:
+        requested_bit = f" '{requested}'" if requested else " a different context"
+        return (
+            f"This chat is connected to the **{locked_context}** context selected in WebTrisul. "
+            f"I cannot use{requested_bit} from here. To use that context, switch to it in the "
+            f"WebTrisul UI, then open the Trisul AI chat window from that context."
+        )
+
+    def _locked_context_instructions(self, locked_context: str) -> str:
+        return (
+            "\n\n### 🔒 WEB UI LOCKED CONTEXT (MANDATORY)\n"
+            f"This Web UI session is bound to Trisul context `{locked_context}` only.\n"
+            f"- ALWAYS pass `context=\"{locked_context}\"` to every tool that accepts a context argument.\n"
+            "- NEVER use any other context name, even if the user asks for it.\n"
+            "- NEVER use a ZMQ/tcp endpoint to reach another context or server.\n"
+            "- If the user asks to use a different context, do NOT switch and do NOT query it. "
+            "Tell them clearly: they must switch to that context in the WebTrisul UI and open "
+            "the Trisul AI chat window from there.\n"
+            f"- After explaining, continue answering their question using `{locked_context}` "
+            "when the question is otherwise valid.\n"
+        )
+
+    def _ensure_locked_context_prompt(self, history: list, locked_context: str) -> None:
+        if not locked_context or not history:
+            return
+        marker = "### 🔒 WEB UI LOCKED CONTEXT"
+        first = history[0]
+        if not isinstance(first, SystemMessage):
+            return
+        content = first.content or ""
+        if marker not in content:
+            first.content = content + self._locked_context_instructions(locked_context)
+            return
+        if locked_context not in content and self._canonical_context(locked_context) not in content:
+            first.content = content + self._locked_context_instructions(locked_context)
+
+    def _locked_context_override_notice(
+        self, function_name: str, original_args: dict, locked_context: str
+    ) -> Optional[str]:
+        if not locked_context or function_name not in self.CONTEXT_TOOLS:
+            return None
+        original_args = original_args or {}
+        requested_ctx = original_args.get("context")
+        if requested_ctx and not self._contexts_equivalent(requested_ctx, locked_context):
+            return (
+                f"[SYSTEM] The requested context '{requested_ctx}' was ignored. This Web UI "
+                f"session is locked to '{locked_context}'. Tell the user: "
+                f"{self._locked_context_switch_message(locked_context, requested_ctx)}"
+            )
+        return None
+
+    def _normalize_tool_args(
+        self, function_name: str, function_args: dict, locked_context: str = None
+    ) -> dict:
         args = dict(function_args or {})
         if "report_title" in args and "title" not in args:
             args["title"] = args.pop("report_title")
+        if locked_context and function_name in self.CONTEXT_TOOLS:
+            args["context"] = locked_context
+            args.pop("zmq_endpoint", None)
+            return args
         if function_name in self.TRP_ENDPOINT_TOOLS:
             if not args.get("zmq_endpoint") and self.zmq_endpoint:
                 args["zmq_endpoint"] = self.zmq_endpoint
+        if function_name in self.CONTEXT_TOOLS:
             if not args.get("context") and self.trisul_context:
                 args.setdefault("context", self.trisul_context)
         if args.get("zmq_endpoint"):
@@ -459,13 +566,19 @@ class TrisulAIClient:
             return content
         
         if isinstance(content, list):
+            # Gemini 3+ and other thinking models return content blocks; only the text
+            # blocks belong in the user-facing answer. Reasoning blocks carry the
+            # thought signatures and must never be rendered.
             text_parts = []
             for item in content:
-                if isinstance(item, dict) and 'text' in item:
-                    text_parts.append(item['text'])
-                else:
-                    text_parts.append(str(item))
-            return '\n'.join(text_parts)
+                if isinstance(item, str):
+                    text_parts.append(item)
+                elif isinstance(item, dict):
+                    if item.get('type') not in (None, 'text'):
+                        continue
+                    if 'text' in item:
+                        text_parts.append(item['text'])
+            return '\n'.join(p for p in text_parts if p)
         
         return str(content)
 
@@ -494,7 +607,12 @@ class TrisulAIClient:
         "generate_dynamic_report",
         "generate_dynamic_excel_report",
         "generate_key_monitor_excel_report",
+        "generate_dashboard_json",
+        "create_crosskey_counter_group",
+        "create_filter_counter_group",
+        "create_keyset_counter_group",
     })
+    CONTEXT_TOOLS = TRP_ENDPOINT_TOOLS
     MAX_REPORT_CONTINUE_ATTEMPTS = 8
     _REPORT_IN_PROGRESS_RE = re.compile(
         r"stay tuned|hang tight|gathering|fetching|working on|"
@@ -521,6 +639,115 @@ class TrisulAIClient:
         ):
             return True
         return False
+
+    _DASHBOARD_CREATE_RE = re.compile(
+        r"\b(create|build|generate|design|make|compose|draft|new)\b.{0,60}\bdashboard\b"
+        r"|\bdashboard\b.{0,40}\b(create|build|generate|design|make)\b",
+        re.I,
+    )
+    _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+    _GUID_RE = re.compile(r"\{[0-9A-Fa-f]{8}-")
+    _SPECIFIC_PANEL_RE = re.compile(
+        r"\b(pie|donut|doughnut|table|chart|graph|list|tree|sankey)\b.{0,24}\b(of|for|showing)\b"
+        r"|\b(of|for|showing)\b.{0,24}\b(pie|donut|table|chart|graph|list)\b",
+        re.I,
+    )
+    _THEME_DASHBOARD_HINT = (
+        "THEME DASHBOARD: The user named a theme, not specific modules, a counter group, "
+        "or a key. Do NOT ask clarifying questions. Design an attractive dashboard with "
+        "AT LEAST 6 modules: (1) 3-4 single-value badges (template 61, width 3 or 4) first, "
+        "using Aggregates keys TOTALBW, DIR_INTOHOME, DIR_OUTOFHOME with different colors; "
+        "(2) one toppers chart template 102 with surface PIE or DONUT; (3) another chart "
+        "template 102 or 103 with surface LINE, STACKEDAREA, or SQUARESTACKEDAREA; "
+        "(4) at least two toppers tables (template 3) on different dimensions of the theme; "
+        "(5) if list_all_available_counter_groups returns a related crosskey (likely_crosskey, "
+        "names with _X_ or _bx_ such as Hosts_X_Apps or FlowIntf_bx_Apps), add a sankey "
+        "(110) or crosskey tree (109). Do NOT create a new crosskey just to fill that slot. "
+        "Map the theme to live groups (host→Hosts, netflow→Flowgens/FlowIntfs, general→"
+        "Aggregates+Hosts+Apps+Country). Set each module intent to the designed panel "
+        "including the presentation word (badge/pie/donut/line/table/sankey). Keep names short."
+    )
+    _REALTIME_THEME_DASHBOARD_HINT = (
+        "REALTIME THEME DASHBOARD: The user asked for a realtime/real-time/live dashboard "
+        "without naming specific modules. Do NOT use retro templates 61, 3, 101, 102, or 103. "
+        "Design at least 6 live stabber modules: (1) 3-4 real-time single-value badges "
+        "(template 105, width 4) first, Aggregates TOTALBW / DIR_INTOHOME / DIR_OUTOFHOME, "
+        "options counter_group+meter+probe=probe0, undecorated true; (2) at least one "
+        "real-time key traffic chart (template 54, surface LINE) of named keys — resolve "
+        "https/http/dns with search_keys on Apps, or chart Aggregates TOTALBW; (3) at least "
+        "two real-time toppers lists (template 56) on different groups (Hosts, Apps, Country). "
+        "There is no live pie/donut. Skip sankey unless the user asked. Put 'real time' in "
+        "each module intent (e.g. 'real time total bandwidth badge', 'real time https chart', "
+        "'real time top hosts list'). Query list_dashboard_module_types with "
+        "'real time badge', 'real time chart', 'real time toppers'."
+    )
+    _REALTIME_DASHBOARD_HINT = (
+        "REALTIME DASHBOARD: The user asked for realtime/live modules. Use template 105 "
+        "for live KPIs, 54 for live named-key charts (surface LINE), and 56 for live "
+        "toppers lists. Do not use 61, 3, 101, 102, or 103 on this dashboard."
+    )
+
+    def _is_dashboard_request(self, query: str) -> bool:
+        q = (query or "").lower()
+        if "dashboard" not in q:
+            return False
+        return bool(self._DASHBOARD_CREATE_RE.search(query or "")) or any(
+            phrase in q for phrase in ("dashboard json", "dashboard package", "dashboard layout")
+        )
+
+    def _is_theme_dashboard_request(self, query: str) -> bool:
+        """True when the user wants a dashboard but named no modules, CG, or key."""
+        if not self._is_dashboard_request(query):
+            return False
+        q = query or ""
+        lowered = q.lower()
+        if self._IPV4_RE.search(q) or self._GUID_RE.search(q):
+            return False
+        if "counter group" in lowered or "cgguid" in lowered:
+            return False
+        specific_module_words = (
+            "sankey", "flowmap", "flow map", "kpi", "badge", "single value",
+            "template", "donut", "doughnut", "pie chart", "line chart", "area chart",
+        )
+        if any(word in lowered for word in specific_module_words):
+            return False
+        if self._SPECIFIC_PANEL_RE.search(q):
+            return False
+        if re.search(r"\btop\s+\d+\b", lowered) or "topper" in lowered:
+            return False
+        if re.search(r"\b(https?|dns|ssh)\b", lowered):
+            return False
+        return True
+
+    def _query_has_explicit_realtime(self, query: str) -> bool:
+        """True when the user asked for real time / realtime / live modules."""
+        return bool(
+            re.search(
+                r"\b(?:real[\s-]?time|realtime|live(?:[\s-]?updating)?)\b",
+                query or "",
+                re.I,
+            )
+        )
+
+    def _augment_query_with_hints(self, query: str) -> str:
+        hints = []
+        if self.pending_report_request:
+            report_hints = self._report_query_hints(query)
+            if report_hints:
+                hints.append(report_hints)
+        if self._is_theme_dashboard_request(query):
+            if self._query_has_explicit_realtime(query):
+                logging.info("[Client] Injecting realtime theme-dashboard layout hint")
+                hints.append(self._REALTIME_THEME_DASHBOARD_HINT)
+            else:
+                logging.info("[Client] Injecting theme-dashboard layout hint")
+                hints.append(self._THEME_DASHBOARD_HINT)
+        elif self._is_dashboard_request(query) and self._query_has_explicit_realtime(query):
+            logging.info("[Client] Injecting realtime dashboard template hint")
+            hints.append(self._REALTIME_DASHBOARD_HINT)
+        if not hints:
+            return query
+        return f"{query}\n\n[SYSTEM: {' '.join(hints)}]"
 
     def _report_query_hints(self, query: str) -> str:
         """Derive server-side report routing hints from natural language."""
@@ -608,7 +835,51 @@ class TrisulAIClient:
 
     def _get_finish_reason(self, response):
         meta = getattr(response, "response_metadata", None) or {}
-        return meta.get("finish_reason") or meta.get("finishReason") or ""
+        return (
+            meta.get("finish_reason")
+            or meta.get("finishReason")
+            or meta.get("stop_reason")
+            or ""
+        )
+
+    TRUNCATED_FINISH_REASONS = frozenset({"max_tokens", "MAX_TOKENS", "length"})
+
+    def _is_truncated_response(self, response) -> bool:
+        return self._get_finish_reason(response) in self.TRUNCATED_FINISH_REASONS
+
+    def _truncated_tool_call_id(self, response):
+        """The id of the tool call whose arguments the token limit cut short, if any.
+
+        Only the last block of a truncated completion can be incomplete; the ones
+        before it were emitted in full and are still safe to execute.
+        """
+        if not response.tool_calls or not self._is_truncated_response(response):
+            return None
+        return response.tool_calls[-1]["id"]
+
+    def _truncated_tool_call_error(self, function_name: str) -> str:
+        return (
+            f"Error: the arguments of this {function_name} call were cut off by the model's "
+            "output token limit, so the call was NOT executed and nothing was written. "
+            "The arguments you sent were incomplete — a required field is missing, not wrong. "
+            "Retry with a smaller payload instead of resending the same one: keep names and "
+            "descriptions short. For a dashboard where the user listed specific panels, send "
+            "the 4-5 most important modules first, then extend it once this call succeeds. "
+            "For a theme dashboard (no named modules/keys) still send at least 6 compact "
+            "modules (KPI badges, pie/donut, line/area, tables, optional sankey)."
+        )
+
+    def _log_llm_response_stats(self, response, prefix: str):
+        usage = getattr(response, "usage_metadata", None) or {}
+        logging.info(
+            f"{prefix} LLM response: finish_reason={self._get_finish_reason(response)!r}, "
+            f"tool_calls={len(response.tool_calls or [])}, "
+            f"output_tokens={usage.get('output_tokens')}"
+        )
+        if self._is_truncated_response(response):
+            logging.warning(
+                f"{prefix} LLM output hit the token limit — any trailing tool call is incomplete."
+            )
 
     def _response_has_tool_issues(self, response):
         if getattr(response, "invalid_tool_calls", None):
@@ -665,7 +936,7 @@ class TrisulAIClient:
             )
         return self._report_continue_message()
 
-    def _finalize_user_response(self, content):
+    def _finalize_user_response(self, content, api_mode: bool = False):
         content = (content or "").strip()
         if self._is_blank_response(content) and self._last_tool_had_connection_error():
             endpoint_hint = self.zmq_endpoint or "tcp://<host>:<port>"
@@ -678,6 +949,12 @@ class TrisulAIClient:
             if self.verified_report_path not in content:
                 suffix = f"Excel report saved to `{self.verified_report_path}`."
                 content = f"{content}\n\n{suffix}" if content else suffix
+        if self.dashboard_path and os.path.isfile(self.dashboard_path):
+            if api_mode and self.dashboard_json:
+                content = self._sanitize_dashboard_answer_for_api(content)
+            elif self.dashboard_path not in content:
+                suffix = f"Dashboard package saved to `{self.dashboard_path}`."
+                content = f"{content}\n\n{suffix}" if content else suffix
         if not content:
             logging.warning("[Client] Empty final response after agent loop")
             return (
@@ -685,6 +962,42 @@ class TrisulAIClient:
                 "Please try again."
             )
         return self._guard_report_path_claims(content)
+
+    def _sanitize_dashboard_answer_for_api(self, content: str) -> str:
+        """Remove server file paths from dashboard answers in Web UI / API mode."""
+        sanitized = content or ""
+        # Rewrite "…saved to /tmp/….json" into a clean "has been generated"
+        sanitized = re.sub(
+            r"(?i)(?:has\s+)?(?:been\s+)?(?:successfully\s+)?(?:generated\s+and\s+)?"
+            r"saved\s+to\s*`?/tmp/[^\s`\"']+\.json`?",
+            "has been generated",
+            sanitized,
+        )
+        # Strip any remaining bare /tmp/...json paths
+        sanitized = re.sub(r"`?/tmp/[^\s`\"']+\.json`?", "", sanitized, flags=re.IGNORECASE)
+        # Drop how-to about Download / Install dashboard buttons or Admin > Packages
+        sanitized = re.sub(
+            r"(?is)(?:\n|^)#{1,6}\s*(?:📥\s*)?(?:How to Install|Next Steps)\s*\n"
+            r"(?:.*?)(?=\n#{1,6}\s|\Z)",
+            "\n",
+            sanitized,
+        )
+        sanitized = re.sub(
+            r"(?im)^[-*]\s+.*(?:Install dashboard|Admin\s*[→>\-]+\s*Packages).*\n?",
+            "",
+            sanitized,
+        )
+        sanitized = re.sub(
+            r"(?i)[^\n]*?(?:Download and Install dashboard buttons|"
+            r"Install dashboard buttons(?: already shown)?|"
+            r"Admin\s*[→>\-]+\s*Packages\s*[→>\-]+\s*Install dashboard)[^\n]*\n?",
+            "",
+            sanitized,
+        )
+        sanitized = re.sub(r"[ \t]{2,}", " ", sanitized)
+        sanitized = re.sub(r" +\.", ".", sanitized)
+        sanitized = re.sub(r"\n{3,}", "\n\n", sanitized).strip()
+        return sanitized or "The dashboard package has been generated."
 
     def _report_continue_message(self):
         return (
@@ -763,6 +1076,64 @@ class TrisulAIClient:
         )
         return json.dumps(error_payload), error_payload
 
+    def _record_dashboard_file(self, json_result, tool_result) -> None:
+        """Remember where the generated dashboard package landed.
+
+        The path is reported once, in the final assistant reply, so nothing is
+        printed here. Also capture raw JSON for API/UI download.
+        """
+        if not json_result or json_result.get("status") != "success":
+            logging.warning(
+                f"[Client] [generate_dashboard_json] {json_result.get('message') if json_result else tool_result}"
+            )
+            return
+
+        file_path = json_result.get("file_path")
+        if not file_path or not os.path.isfile(file_path):
+            logging.warning(f"[Client] Dashboard tool reported success but file is missing: {file_path}")
+            return
+
+        self.dashboard_path = file_path
+        self.dashboard_filename = (
+            json_result.get("filename")
+            or Path(file_path).name
+        )
+        dashboard_json = json_result.get("dashboard_json")
+        if not dashboard_json:
+            try:
+                dashboard_json = Path(file_path).read_text(encoding="utf-8")
+            except OSError as exc:
+                logging.warning(f"[Client] Could not read dashboard JSON from {file_path}: {exc}")
+                dashboard_json = None
+        elif not isinstance(dashboard_json, str):
+            dashboard_json = json.dumps(dashboard_json)
+        self.dashboard_json = dashboard_json
+        logging.info(f"[Client] Dashboard package written to {file_path}")
+
+    def _api_tool_result_for_dashboard(self, json_result, tool_result_text: str) -> str:
+        """Rewrite dashboard tool output for the LLM in API/Web UI mode.
+
+        Hide server paths and omit the raw JSON payload so the model does not
+        print file paths or install how-to.
+        """
+        if not json_result or json_result.get("status") != "success":
+            return tool_result_text
+
+        sanitized = {
+            k: v
+            for k, v in json_result.items()
+            if k not in ("dashboard_json", "file_path", "message_to_llm")
+        }
+        sanitized["message"] = "Dashboard package generated successfully."
+        sanitized["message_to_llm"] = (
+            "Tell the user the dashboard package was successfully generated. "
+            "Do NOT mention any server file path, /tmp location, or filename path. "
+            "Do NOT mention Download or Install dashboard buttons, how to install, "
+            "or Admin > Packages > Install dashboard. "
+            "List the modules that were included. Do not print the JSON contents."
+        )
+        return json.dumps(sanitized)
+
     def _open_report_file(self, file_path: str) -> bool:
         """Open a generated report with the OS default application."""
         if not file_path or not os.path.isfile(file_path):
@@ -826,14 +1197,13 @@ class TrisulAIClient:
         
         self.verified_report_path = None
         self.report_path = None
+        self.dashboard_path = None
+        self.dashboard_json = None
+        self.dashboard_filename = None
         self.pending_report_request = self._is_report_request(query)
         self.report_data_fetched = False
         self.report_continue_attempts = 0
-        user_content = query
-        if self.pending_report_request:
-            hints = self._report_query_hints(query)
-            if hints:
-                user_content = f"{query}\n\n[SYSTEM: {hints}]"
+        user_content = self._augment_query_with_hints(query)
         self.conversation_history.append(HumanMessage(content=user_content))
         self._update_connection_from_text(query)
         self._sync_connection_from_history()
@@ -860,6 +1230,7 @@ class TrisulAIClient:
                     return f"Error communicating with LLM: {msg}"
                 
                 self.conversation_history.append(response)
+                self._log_llm_response_stats(response, "[Client]")
                 
                 if not response.tool_calls:
                     content = self.extract_text_from_content(response.content)
@@ -880,12 +1251,23 @@ class TrisulAIClient:
                     return self._finalize_user_response(content)
                 
                 # Process tool calls
+                truncated_call_id = self._truncated_tool_call_id(response)
                 for tool_call in response.tool_calls:
                     function_name = tool_call["name"]
                     function_args = self._normalize_tool_args(
                         function_name, tool_call["args"]
                     )
                     tool_call_id = tool_call["id"]
+                    
+                    if tool_call_id == truncated_call_id:
+                        tool_result = self._truncated_tool_call_error(function_name)
+                        logging.warning(f"[Client] {tool_result}")
+                        self.conversation_history.append(ToolMessage(
+                            content=tool_result,
+                            tool_call_id=tool_call_id,
+                            name=function_name
+                        ))
+                        continue
                     
                     logging.info(f"[Client] Calling function: {function_name} with args: {function_args}")
                     
@@ -932,6 +1314,9 @@ class TrisulAIClient:
                         if function_name == "generate_trisul_report":
                             if not (json_result and json_result.get('status') == "success"):
                                 logging.warning(f"[Client] [process_query] {json_result.get('message') if json_result else tool_result}")
+
+                        if function_name == "generate_dashboard_json":
+                            self._record_dashboard_file(json_result, tool_result)
 
                         if function_name == "configure_llm_model":
                             print("\033[F\033[K", end="")
@@ -983,15 +1368,21 @@ class TrisulAIClient:
             self._maybe_open_generated_report()
 
 
-    async def process_query_api(self, query: str, system_prompt: str = None, session_id: str = None) -> dict:
+    async def process_query_api(
+        self, query: str, system_prompt: str = None, session_id: str = None, context_id: str = None
+    ) -> dict:
         """Process a query for the REST API. Returns structured JSON data.
         
         Does NOT call any interactive/terminal methods.
+        When context_id is provided (Web UI), all tool calls are locked to that context.
         """
         import time
         start_time = time.time()
         self.verified_report_path = None
         self.report_path = None
+        self.dashboard_path = None
+        self.dashboard_json = None
+        self.dashboard_filename = None
         self.pending_report_request = self._is_report_request(query)
         self.report_data_fetched = False
         self.report_continue_attempts = 0
@@ -999,14 +1390,19 @@ class TrisulAIClient:
         self.auto_open_reports = False
         try:
             return await self._process_query_api_body(
-                query, system_prompt, session_id, start_time,
+                query, system_prompt, session_id, start_time, context_id,
             )
         finally:
             self.auto_open_reports = prev_auto_open
 
     async def _process_query_api_body(
         self, query: str, system_prompt: str, session_id: str, start_time: float,
+        context_id: str = None,
     ) -> dict:
+        locked_context = self._resolve_locked_context(context_id)
+        if locked_context:
+            logging.info(f"[Client][API] [Session: {session_id}] Locked to context '{locked_context}'")
+
         if query.strip().lower() in ["exit", "quit"]:
             if session_id and session_id in self.sessions:
                 logging.info(f"[Client][API] [Session: {session_id}] Exiting and cleaning up session history.")
@@ -1022,6 +1418,8 @@ class TrisulAIClient:
                 "tool_calls": [],
                 "chart_data": None,
                 "table_data": None,
+                "dashboard_json": None,
+                "dashboard_filename": None,
             }
 
         if session_id and session_id in self.sessions:
@@ -1046,17 +1444,44 @@ class TrisulAIClient:
                 "4. **Conciseness**: Provide a brief, friendly textual summary and let the tools handle the data visualization. Do not repeat data that is already shown in the table/chart unless for highlighting a specific point.\n"
                 "5. **Ambiguous Matches**: For queries with multiple potential matches (e.g., 'Google', 'Shell', or ambiguous interface names), you **MUST** follow the **AUTO-SELECT AND SHOW TOP MATCH** workflow. Use the topper list to identify and display the most active candidate immediately, then list the other candidates as options. **Never ask for clarification as your first response if a topper query can resolve the ambiguity.**\n"
                 "6. **STRICT GROUNDING**: You are FORBIDDEN from suggesting matches or options based on your internal knowledge. Every option you present MUST have been returned by a `search_keys` call or in existing traffic data. If a tool returns no matches, do not invent any.\n"
-                "7. Ensure you still perform all necessary data calculations and grounding based on tool results."
+                "7. Ensure you still perform all necessary data calculations and grounding based on tool results.\n"
+                "8. **Dashboard packages**: When `generate_dashboard_json` succeeds, NEVER mention any server file path, `/tmp/...`, or absolute filename path. "
+                "Tell the user the dashboard was generated and list the modules. "
+                "Do NOT mention Download or Install dashboard buttons, how to install, or Admin → Packages → Install dashboard. "
+                "Do not print the JSON contents."
             )
+            if locked_context:
+                api_instructions += self._locked_context_instructions(locked_context)
             
             history = [SystemMessage(content=base_prompt + api_instructions)]
             
             if session_id:
                 self.sessions[session_id] = history
+
+        if locked_context:
+            self._ensure_locked_context_prompt(history, locked_context)
         
         logging.info(f"[Client][API] [Session: {session_id}] User Query: {query}")
-        history.append(HumanMessage(content=query))
-        self._update_connection_from_text(query)
+        user_content = self._augment_query_with_hints(query)
+        other_contexts = self._mentioned_other_contexts(query, locked_context) if locked_context else []
+        if other_contexts:
+            mentioned = ", ".join(other_contexts)
+            lock_note = (
+                f"[SYSTEM: The user mentioned context(s) {mentioned}. "
+                f"This session is locked to {locked_context}. Do not use the mentioned "
+                f"context(s). Tell the user they must switch to that context in the "
+                f"WebTrisul UI and open the Trisul AI chat window from there.]"
+            )
+            if user_content == query:
+                user_content = f"{query}\n\n{lock_note}"
+            else:
+                user_content = f"{user_content}\n{lock_note}"
+            logging.info(
+                f"[Client][API] [Session: {session_id}] Ignored mentioned context(s): {mentioned}"
+            )
+        history.append(HumanMessage(content=user_content))
+        if not locked_context:
+            self._update_connection_from_text(query)
 
         llm = self.llm_factory.get_llm()
         if not llm:
@@ -1066,6 +1491,8 @@ class TrisulAIClient:
                 "answer": None,
                 "tool_calls": [],
                 "chart_data": None,
+                "dashboard_json": None,
+                "dashboard_filename": None,
             }
 
         tools = await self.get_mcp_tools()
@@ -1091,16 +1518,19 @@ class TrisulAIClient:
                     "tool_calls": collected_tool_calls,
                     "chart_data": chart_data,
                     "table_data": table_data,
+                    "dashboard_json": self.dashboard_json,
+                    "dashboard_filename": self.dashboard_filename,
                 }
 
             history.append(response)
+            self._log_llm_response_stats(response, f"[Client][API] [Session: {session_id}]")
 
             if not response.tool_calls:
                 answer = self.extract_text_from_content(response.content)
                 if self._should_retry_after_no_tools(response, answer):
                     if self.report_continue_attempts >= self.MAX_REPORT_CONTINUE_ATTEMPTS:
                         logging.warning("[Client][API] Agent loop hit max retry attempts")
-                        answer = self._finalize_user_response(answer)
+                        answer = self._finalize_user_response(answer, api_mode=True)
                     else:
                         self.report_continue_attempts += 1
                         logging.info(
@@ -1110,7 +1540,10 @@ class TrisulAIClient:
                         history.append(HumanMessage(content=self._retry_message(response, answer)))
                         continue
                 else:
-                    answer = self._finalize_user_response(answer)
+                    answer = self._finalize_user_response(answer, api_mode=True)
+                if other_contexts and "webtrisul" not in (answer or "").lower():
+                    switch_msg = self._locked_context_switch_message(locked_context, other_contexts[0])
+                    answer = f"{switch_msg}\n\n{answer}" if answer else switch_msg
                 elapsed = time.time() - start_time
                 logging.info(f"[Client][API] [Session: {session_id}] Final AI Response (took {elapsed:.2f}s): {answer}")
                 return {
@@ -1119,15 +1552,37 @@ class TrisulAIClient:
                     "tool_calls": collected_tool_calls,
                     "chart_data": chart_data,
                     "table_data": table_data,
+                    "dashboard_json": self.dashboard_json,
+                    "dashboard_filename": self.dashboard_filename,
                 }
 
             # Process tool calls
+            truncated_call_id = self._truncated_tool_call_id(response)
             for tool_call in response.tool_calls:
                 function_name = tool_call["name"]
+                original_args = tool_call["args"]
+                lock_notice = self._locked_context_override_notice(
+                    function_name, original_args, locked_context
+                )
                 function_args = self._normalize_tool_args(
-                    function_name, tool_call["args"]
+                    function_name, original_args, locked_context=locked_context
                 )
                 tool_call_id = tool_call["id"]
+
+                if tool_call_id == truncated_call_id:
+                    tool_result = self._truncated_tool_call_error(function_name)
+                    logging.warning(f"[Client][API] [Session: {session_id}] {tool_result}")
+                    history.append(ToolMessage(
+                        content=tool_result,
+                        tool_call_id=tool_call_id,
+                        name=function_name
+                    ))
+                    collected_tool_calls.append({
+                        "tool": function_name,
+                        "args": function_args,
+                        "result": {"error": tool_result},
+                    })
+                    continue
 
                 # Skip interactive-only tools in API mode
                 if function_name in (
@@ -1167,6 +1622,19 @@ class TrisulAIClient:
                         function_name, tool_result_json, tool_result_text
                     )
 
+                    if function_name == "generate_dashboard_json":
+                        self._record_dashboard_file(tool_result_json, tool_result_text)
+                        tool_result_text = self._api_tool_result_for_dashboard(
+                            tool_result_json, tool_result_text
+                        )
+                        # Keep a lean result for the API tool_calls payload (no huge JSON)
+                        if isinstance(tool_result_json, dict) and tool_result_json.get("status") == "success":
+                            tool_result_json = {
+                                k: v
+                                for k, v in tool_result_json.items()
+                                if k != "dashboard_json"
+                            }
+
                     # Capture chart data for API consumers
                     if function_name in ["show_line_chart", "show_pie_chart"]:
                         chart_type = "line" if function_name == "show_line_chart" else "pie"
@@ -1201,6 +1669,10 @@ class TrisulAIClient:
                         tool_result_json = self.get_current_model_status()
                         tool_result_text = json.dumps(tool_result_json)
 
+                    if lock_notice:
+                        logging.info(f"[Client][API] [Session: {session_id}] {lock_notice}")
+                        tool_result_text = f"{tool_result_text}\n\n{lock_notice}"
+
                     collected_tool_calls.append({
                         "tool": function_name,
                         "args": function_args,
@@ -1234,6 +1706,8 @@ class TrisulAIClient:
             "tool_calls": collected_tool_calls,
             "chart_data": chart_data,
             "table_data": table_data,
+            "dashboard_json": self.dashboard_json,
+            "dashboard_filename": self.dashboard_filename,
         }
 
 

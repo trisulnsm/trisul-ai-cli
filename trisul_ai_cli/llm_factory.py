@@ -2,14 +2,16 @@ from dotenv import dotenv_values, set_key
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_anthropic import ChatAnthropic
-from langchain_community.embeddings import VoyageEmbeddings
+from langchain_voyageai import VoyageAIEmbeddings
 
 
 
 
 class LLMFactory:
     SUPPORTED_MODELS = {
-        "gemini": {"llm": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-2.0-flash-lite"], 
+        # Gemini 2.x is retired on the public API; 3.x models require the thought-signature
+        # round-trip that langchain-google-genai >= 4 provides.
+        "gemini": {"llm": ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-pro-preview", "gemini-3.1-flash-lite"],
                    "embedding": "models/gemini-embedding-001"
                 },
         "openai": {
@@ -27,6 +29,10 @@ class LLMFactory:
                     }
     }
 
+    # langchain_anthropic caps completions at 1024 tokens by default, which silently
+    # truncates large tool calls such as a multi-module generate_dashboard_json payload.
+    DEFAULT_MAX_OUTPUT_TOKENS = 16384
+
     def __init__(self, env_path = None, logging = None):
         self.env_path = env_path
         self.logging = logging
@@ -38,6 +44,7 @@ class LLMFactory:
         self.model_name = self.config.get("TRISUL_AI_MODEL")
         self.api_key = self.config.get(f"TRISUL_{self.provider.upper()}_API_KEY")
         self.api_base_url = self.config.get("TRISUL_CUSTOM_API_BASE_URL")
+        self.max_output_tokens, self.max_output_tokens_configured = self._read_max_output_tokens()
 
         # Embedding config
         self.embedding_model = self.config.get("TRISUL_EMBEDDING_MODEL")
@@ -55,8 +62,30 @@ class LLMFactory:
         self.logging.info(
             f"[LLMFactory] Loaded config: provider={self.provider}, model={self.model_name}, "
             f"api_base_url={self.api_base_url}, embedding_model={self.embedding_model}, "
-            f"embedding_provider={self.embedding_provider}"
+            f"embedding_provider={self.embedding_provider}, "
+            f"max_output_tokens={self.max_output_tokens}"
         )
+
+    def _read_max_output_tokens(self):
+        """Return (limit, explicitly_configured) for the completion token budget."""
+        raw = self.config.get("TRISUL_AI_MAX_TOKENS")
+        if not raw:
+            return self.DEFAULT_MAX_OUTPUT_TOKENS, False
+        try:
+            limit = int(str(raw).strip())
+        except ValueError:
+            self.logging.warning(
+                f"[LLMFactory] TRISUL_AI_MAX_TOKENS={raw!r} is not an integer; "
+                f"using {self.DEFAULT_MAX_OUTPUT_TOKENS}"
+            )
+            return self.DEFAULT_MAX_OUTPUT_TOKENS, False
+        if limit <= 0:
+            self.logging.warning(
+                f"[LLMFactory] TRISUL_AI_MAX_TOKENS={limit} must be positive; "
+                f"using {self.DEFAULT_MAX_OUTPUT_TOKENS}"
+            )
+            return self.DEFAULT_MAX_OUTPUT_TOKENS, False
+        return limit, True
 
 
 
@@ -83,6 +112,7 @@ class LLMFactory:
                 model=self.model_name,
                 api_key=api_key,
                 base_url=self._normalize_openai_base_url(self.api_base_url),
+                **self._optional_max_tokens("max_tokens"),
             )
 
         if not self.api_key:
@@ -90,13 +120,31 @@ class LLMFactory:
             return None
 
         if self.provider == "gemini":
-            return ChatGoogleGenerativeAI(model=self.model_name, google_api_key=self.api_key)
+            return ChatGoogleGenerativeAI(
+                model=self.model_name,
+                google_api_key=self.api_key,
+                **self._optional_max_tokens("max_output_tokens"),
+            )
         elif self.provider == "openai":
-            return ChatOpenAI(model=self.model_name, api_key=self.api_key)
+            return ChatOpenAI(
+                model=self.model_name,
+                api_key=self.api_key,
+                **self._optional_max_tokens("max_tokens"),
+            )
         elif self.provider == "anthropic":
-            return ChatAnthropic(model=self.model_name, api_key=self.api_key)
+            return ChatAnthropic(
+                model=self.model_name,
+                api_key=self.api_key,
+                max_tokens=self.max_output_tokens,
+            )
         else:
             raise ValueError(f"Unsupported provider: {self.provider}")
+
+    def _optional_max_tokens(self, param_name: str) -> dict:
+        """Only cap providers whose own default is the model maximum."""
+        if not self.max_output_tokens_configured:
+            return {}
+        return {param_name: self.max_output_tokens}
 
     def get_embedding_llm(self):
         self._load_config()
@@ -112,7 +160,7 @@ class LLMFactory:
         elif self.embedding_provider == "openai":
             return OpenAIEmbeddings(model=self.embedding_model, api_key=self.embedding_api_key)
         elif self.embedding_provider == "voyageai":
-            return VoyageEmbeddings(model=self.embedding_model, voyage_api_key=self.embedding_api_key)
+            return VoyageAIEmbeddings(model=self.embedding_model, voyage_api_key=self.embedding_api_key)
         else:
             return None
 

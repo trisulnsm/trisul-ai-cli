@@ -95,6 +95,7 @@ class QueryRequest(BaseModel):
     query: str
     system_prompt: Optional[str] = None
     session_id: Optional[str] = None  # reserved for future multi-turn support
+    context_id: Optional[str] = None  # Web UI locks the session to this Trisul context
 
 
 class ToolCallRecord(BaseModel):
@@ -120,6 +121,8 @@ class QueryResponse(BaseModel):
     tool_calls: List[ToolCallRecord] = []
     chart_data: Optional[ChartData] = None
     table_data: Optional[TableData] = None
+    dashboard_json: Optional[str] = None  # raw dashboard package JSON string for UI download
+    dashboard_filename: Optional[str] = None
     message: Optional[str] = None  # error message when status == "error"
     session_id: Optional[str] = None
 
@@ -174,18 +177,23 @@ async def query(req: QueryRequest):
       answer is returned in the `answer` field.
     - `chart_data` is populated when a chart tool was invoked so the caller
       can render the chart directly.
+    - `dashboard_json` is populated when a dashboard package was generated so
+      the Web UI can offer a client-side download without exposing server paths.
     """
     if not _client or not _client.session:
         logging.error("[API] Rejecting query: MCP server not connected")
         raise HTTPException(status_code=503, detail="MCP server not connected")
 
-    logging.info(f"[API] /api/query  session={req.session_id}  query={req.query!r}")
+    logging.info(
+        f"[API] /api/query  session={req.session_id}  context_id={req.context_id!r}  query={req.query!r}"
+    )
 
     try:
         result = await _client.process_query_api(
             query=req.query,
             system_prompt=req.system_prompt,
             session_id=req.session_id,
+            context_id=req.context_id,
         )
         
         # Log summary of the result
@@ -194,7 +202,11 @@ async def query(req: QueryRequest):
         num_tools = len(result.get("tool_calls", []))
         has_chart = "yes" if result.get("chart_data") else "no"
         has_table = "yes" if result.get("table_data") else "no"
-        logging.info(f"[API] Query processed: status={status}, ans_len={ans_len}, tool_calls={num_tools}, chart={has_chart}, table={has_table}")
+        has_dashboard = "yes" if result.get("dashboard_json") else "no"
+        logging.info(
+            f"[API] Query processed: status={status}, ans_len={ans_len}, "
+            f"tool_calls={num_tools}, chart={has_chart}, table={has_table}, dashboard={has_dashboard}"
+        )
 
     except Exception as e:
         logging.error(f"[API] Unhandled error in process_query_api: {e}")
@@ -225,6 +237,8 @@ async def query(req: QueryRequest):
             if result.get("table_data")
             else None
         ),
+        dashboard_json=result.get("dashboard_json"),
+        dashboard_filename=result.get("dashboard_filename"),
         message=result.get("message"),
         session_id=req.session_id,
     )

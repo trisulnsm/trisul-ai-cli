@@ -191,9 +191,63 @@ and 'Destination IP' counter groups to track traffic between specific IP pairs..
 | `get_cginfo_from_countergroup_name` | Get counter group details by name |
 | `get_counter_group_topper` | Fetch top N items by traffic/metrics |
 | `get_key_traffic_data` | Get time-series traffic for specific keys |
-| `create_crosskey_counter_group` | Create custom multi-dimensional counter groups |
+| `create_crosskey_counter_group` | Propose, confirm, then create custom multi-dimensional counter groups |
+| `create_filter_counter_group` | Propose, confirm, then create filtered counter groups (parent + filter keys) |
+| `create_keyset_counter_group` | Propose, confirm, then create keyset counter groups (parent + named key buckets) |
+| `list_derived_counter_group_types` | Catalog of crosskey / filter / keyset: when to use, how to create, scenarios, which dashboard module shows them |
+| `list_dashboard_module_types` | Browse dashboard module templates and their accepted options |
+| `generate_dashboard_json` | Validate against live Trisul, preview, then write an importable dashboard JSON under `/tmp` |
 | `rag_query` | Search Trisul documentation and knowledge base |
 | `generate_and_show_chart` | Generate interactive traffic visualizations |
+
+#### Filtered counter groups (`create_filter_counter_group`)
+
+Creates a filtered counter group by writing to the Trisul config SQLite DB (same pattern as `create_crosskey_counter_group`). Filter keys are stored in **DB key format** (e.g. `p-0035` for DNS port 53, or `p-0050,p-01BB,p-0019` for multiple ports).
+
+| User provides | Tool behavior |
+|---------------|---------------|
+| Explicit or partial keys | With `confirm=False`, returns `pending_confirmation` with the complete resolved proposal; no DB write |
+| Proposal | Includes arguments/rules, `creation_reason`, and the exact `dashboard_usage` |
+| User confirms | Call again with `confirm=True` and identical parameters; returns the created GUID |
+
+Example: Parent=FlowIntfs, Filter=Apps, name=`DNSPorts`, keys=`Port-53` → saved as `FilterKeyList=p-0035`.
+
+#### Keyset counter groups (`create_keyset_counter_group`)
+
+Groups keys from a parent counter group into named buckets (KeysetKey → KeyFrom). Keys in KeyFrom are stored in **DB key format** (e.g. `p-0050,p-01BB,p-1F90`).
+
+| User provides | Tool behavior |
+|---------------|---------------|
+| Name + parent, explicit keys, or partial keys | With `confirm=False`, returns the complete proposal; no DB write |
+| Proposal | Includes resolved KeysetKey/KeyFrom rules, why it is needed, and where the dashboard uses it |
+| User confirms | Call again with `confirm=True` and identical parameters; returns the created GUID |
+
+Example: Parent=Apps, name=`P2P Traffic`, keyset_key=`p2ptraffic`, keys_from=`Port-6890,Port-6891,...` → saved as comma-separated `p-XXXX` keys.
+
+#### Derived counter groups catalog (`list_derived_counter_group_types`)
+
+Static catalog (not live inventory) covering **crosskey**, **filter**, and **keyset**: what each is, create-tool arguments and confirm workflow, example scenarios, and which dashboard template receives the created GUID (109/110 for crosskey; ordinary toppers/charts for filter and keyset). Always resolve GUIDs from live `list_all_available_counter_groups` — never copy examples from the catalog.
+
+#### Dashboard JSON generation
+
+Dashboard generation never trusts a static counter-group GUID map. It always sends a
+live `COUNTER_GROUP_INFO` request and validates every key with `SEARCH_KEYS`. If the
+requested data requires a new crosskey, filter, or keyset group, the assistant first
+shows the proposed type, name, arguments/rules, reason, and dashboard module usage.
+Creation begins only after explicit confirmation.
+
+Each module also carries an `intent` holding the user's own words for that one panel.
+Every catalog template declares the `presentation` it renders (table, time-series chart,
+single-value badge, tree, sankey, embedded page, alert feed), and
+validation rejects a module whose template contradicts the presentation those words ask
+for — so "https traffic chart" cannot be generated as a toppers list. An option the
+template does not accept is an error too, and the hint names the templates that do
+accept it.
+
+`generate_dashboard_json(confirm=False)` returns a layout preview that states the shape
+each panel renders and the words it was built from. After approval,
+`generate_dashboard_json(confirm=True)` writes the package to `/tmp` and returns the
+complete absolute path including the JSON filename.
 
 ### User Commands
 

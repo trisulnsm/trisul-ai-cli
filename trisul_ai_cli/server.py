@@ -24,10 +24,11 @@ import os
 import ast
 from trisul_ai_cli.tools.json_to_toon_converter import json_to_toon
 import json
-from typing import List, Any
+from typing import List, Any, Dict
 from dotenv import dotenv_values
 from pathlib import Path
 from trisul_ai_cli.llm_factory import LLMFactory
+from trisul_ai_cli import dashboard_builder
 
 
 logging.basicConfig(
@@ -64,6 +65,316 @@ def normalize_context(ctx: str) -> str:
     except Exception as e:
         logging.error(f"[normalize_context] Error normalizing context '{ctx}': {str(e)}")
         return "context0"  # Default fallback
+
+
+def _is_port_key_form(patt):
+    if not patt:
+        return False
+    patt = str(patt)
+    return len(patt) == 6 and patt[0] == "p" and patt[1] == "-"
+
+
+def _is_host_key_form(patt):
+    if not patt:
+        return False
+    return re.match(r"^((([0-9A-Fa-f]){2}\.){3}([0-9A-Fa-f]){2})$", str(patt)) is not None
+
+
+def _port_to_dbkey(dstring):
+    dstring = str(dstring).strip()
+    if _is_port_key_form(dstring):
+        return dstring
+    if dstring.upper().startswith("PORT-"):
+        port_num = dstring[5:]
+    else:
+        port_num = dstring
+    return "p-" + format(int(port_num), "04X")
+
+
+def _host_to_dbkey(dstring):
+    dstring = str(dstring).strip()
+    if _is_host_key_form(dstring):
+        return dstring
+    return ".".join(format(int(decbyte), "02X") for decbyte in dstring.split("."))
+
+
+def _to_dbkey(patt):
+    patt = str(patt).strip()
+    if _is_port_key_form(patt) or _is_host_key_form(patt):
+        return patt
+    if re.match(r"^Port-", patt, re.I) or (patt.isdigit() and 1 <= int(patt) <= 65535):
+        return _port_to_dbkey(patt)
+    if re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", patt):
+        return _host_to_dbkey(patt)
+    return patt
+
+
+def _is_explicit_filter_key(patt):
+    """Return True when a key can be converted to DB format without search_keys."""
+    patt = str(patt).strip()
+    if not patt:
+        return False
+    if _is_port_key_form(patt) or _is_host_key_form(patt):
+        return True
+    if re.match(r"^Port-", patt, re.I):
+        return True
+    if patt.isdigit() and 1 <= int(patt) <= 65535:
+        return True
+    return re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", patt) is not None
+
+
+def _filter_zmq_endpoint(context, zmq_endpoint):
+    if zmq_endpoint:
+        return zmq_endpoint
+    ctx = normalize_context(context)
+    return f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{ctx}/run/trp_0"
+
+
+def _search_filter_key_matches(key_str, filter_counter_guid, zmq_endpoint, maxitems=10):
+    """Resolve partial/label filter keys via SEARCH_KEYS_REQUEST."""
+    matches = []
+    seen = set()
+
+    def _append_matches(resp):
+        for item in resp.keys:
+            key_id = item.key
+            if not key_id or key_id in seen:
+                continue
+            seen.add(key_id)
+            matches.append(
+                {
+                    "key": key_id,
+                    "label": item.label.strip() if item.label and item.label.strip() else None,
+                    "readable": item.readable.strip() if item.readable and item.readable.strip() else None,
+                }
+            )
+
+    for label, pattern in ((key_str, None), (None, f"(?i).*{re.escape(key_str)}.*")):
+        try:
+            req = trp_pb2.Message()
+            req.trp_command = req.SEARCH_KEYS_REQUEST
+            q = req.search_keys_request
+            q.counter_group = filter_counter_guid
+            q.maxitems = int(maxitems)
+            if label:
+                q.label = label
+            if pattern:
+                q.pattern = pattern
+            resp = get_response(zmq_endpoint, req)
+            _append_matches(resp)
+            if matches:
+                break
+        except Exception as e:
+            logging.warning(
+                f"[_search_filter_key_matches] search_keys failed for '{key_str}': {e}"
+            )
+    return matches
+
+
+def _resolve_filter_key_entry(key_str, filter_counter_guid, context, zmq_endpoint):
+    key_str = str(key_str).strip()
+    entry = {
+        "input": key_str,
+        "db_key": None,
+        "label": None,
+        "readable": None,
+        "resolution_method": None,
+        "needs_confirmation": False,
+        "candidates": [],
+    }
+
+    if _is_explicit_filter_key(key_str):
+        entry["db_key"] = _to_dbkey(key_str)
+        entry["resolution_method"] = "direct"
+        return entry
+
+    endpoint = _filter_zmq_endpoint(context, zmq_endpoint)
+    matches = _search_filter_key_matches(key_str, filter_counter_guid, endpoint)
+    if not matches:
+        entry["db_key"] = key_str
+        entry["resolution_method"] = "unresolved"
+        entry["needs_confirmation"] = True
+        return entry
+
+    if len(matches) == 1:
+        best = matches[0]
+        entry["db_key"] = best["key"]
+        entry["label"] = best.get("label")
+        entry["readable"] = best.get("readable")
+        entry["resolution_method"] = "search_keys"
+        entry["needs_confirmation"] = True
+        return entry
+
+    entry["candidates"] = matches
+    entry["resolution_method"] = "ambiguous"
+    entry["needs_confirmation"] = True
+    return entry
+
+
+def _resolve_filter_keylist(key_list_str, filter_counter_guid, context, zmq_endpoint):
+    if not key_list_str:
+        return {"db_keylist": None, "entries": [], "needs_confirmation": False, "blocked": False}
+
+    key_list_str = str(key_list_str).strip()
+    if not key_list_str:
+        return {"db_keylist": None, "entries": [], "needs_confirmation": False, "blocked": False}
+
+    entries = []
+    db_parts = []
+    needs_confirmation = False
+    blocked = False
+
+    for ksk in key_list_str.split(","):
+        ksk = ksk.strip()
+        if not ksk:
+            continue
+        if "~" in ksk or re.search(r"\bto\b", ksk, re.I):
+            kp = re.split(r"~|\bto\b", ksk, maxsplit=1, flags=re.I)
+            if len(kp) < 2:
+                continue
+            start_entry = _resolve_filter_key_entry(
+                kp[0].strip(), filter_counter_guid, context, zmq_endpoint
+            )
+            end_entry = _resolve_filter_key_entry(
+                kp[1].strip(), filter_counter_guid, context, zmq_endpoint
+            )
+            range_entry = {
+                "input": ksk,
+                "db_key": None,
+                "range_start": start_entry,
+                "range_end": end_entry,
+                "resolution_method": "range",
+                "needs_confirmation": start_entry["needs_confirmation"]
+                or end_entry["needs_confirmation"],
+                "candidates": [],
+            }
+            if start_entry.get("resolution_method") == "ambiguous" or end_entry.get(
+                "resolution_method"
+            ) == "ambiguous":
+                blocked = True
+                range_entry["db_key"] = None
+            elif start_entry.get("db_key") and end_entry.get("db_key"):
+                range_entry["db_key"] = f"{start_entry['db_key']}~{end_entry['db_key']}"
+                db_parts.append(range_entry["db_key"])
+            entries.append(range_entry)
+            needs_confirmation = needs_confirmation or range_entry["needs_confirmation"]
+            continue
+
+        entry = _resolve_filter_key_entry(ksk, filter_counter_guid, context, zmq_endpoint)
+        entries.append(entry)
+        if entry.get("resolution_method") == "ambiguous":
+            blocked = True
+        elif entry.get("db_key"):
+            db_parts.append(entry["db_key"])
+        needs_confirmation = needs_confirmation or entry["needs_confirmation"]
+
+    return {
+        "db_keylist": ",".join(db_parts) if db_parts else None,
+        "entries": entries,
+        "needs_confirmation": needs_confirmation,
+        "blocked": blocked,
+    }
+
+
+def _validate_keyset_key_name(keyset_key):
+    if not keyset_key:
+        return False, "Keyset key name is required"
+    if re.search(r"[,~!]", str(keyset_key)):
+        return False, "Keyset key name cannot contain comma, tilde, or exclamation mark"
+    return True, None
+
+
+def _parse_keyset_entries(keyset_key, keys_from, keysets):
+    entries = []
+    if keysets:
+        parsed = keysets
+        if isinstance(parsed, str):
+            parsed = json.loads(parsed)
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            entries.append(
+                {
+                    "keyset_key": str(
+                        item.get("keyset_key") or item.get("KeysetKey") or ""
+                    ).strip(),
+                    "keys_from": str(
+                        item.get("keys_from") or item.get("KeyFrom") or item.get("keys") or ""
+                    ).strip(),
+                }
+            )
+    if keyset_key and keys_from:
+        entries.append(
+            {"keyset_key": str(keyset_key).strip(), "keys_from": str(keys_from).strip()}
+        )
+    return [entry for entry in entries if entry["keyset_key"] or entry["keys_from"]]
+
+
+def _resolve_keyset_entries(entries, parent_counter_guid, context, zmq_endpoint):
+    resolved = []
+    needs_confirmation = False
+    blocked = False
+
+    for entry in entries:
+        ok, err = _validate_keyset_key_name(entry["keyset_key"])
+        if not ok:
+            return {
+                "entries": [],
+                "needs_confirmation": False,
+                "blocked": True,
+                "error": err,
+            }
+        if not entry["keys_from"]:
+            return {
+                "entries": [],
+                "needs_confirmation": False,
+                "blocked": True,
+                "error": f"keys_from is required for keyset '{entry['keyset_key']}'",
+            }
+
+        key_resolution = _resolve_filter_keylist(
+            entry["keys_from"], parent_counter_guid, context, zmq_endpoint
+        )
+        if key_resolution["blocked"]:
+            blocked = True
+        needs_confirmation = needs_confirmation or key_resolution["needs_confirmation"]
+        resolved.append(
+            {
+                "keyset_key": entry["keyset_key"],
+                "keys_from_input": entry["keys_from"],
+                "keys_from_db": key_resolution["db_keylist"],
+                "resolved_keys": key_resolution,
+            }
+        )
+
+    if blocked:
+        return {
+            "entries": resolved,
+            "needs_confirmation": needs_confirmation,
+            "blocked": True,
+            "error": None,
+        }
+
+    for item in resolved:
+        if not item["keys_from_db"]:
+            return {
+                "entries": resolved,
+                "needs_confirmation": needs_confirmation,
+                "blocked": True,
+                "error": (
+                    f"Could not resolve keys for keyset '{item['keyset_key']}' "
+                    "to database format"
+                ),
+            }
+
+    return {
+        "entries": resolved,
+        "needs_confirmation": needs_confirmation,
+        "blocked": False,
+        "error": None,
+    }
 
 
 def countergroup_info(zmq_endpoint: str = None, context: str = "context0", get_meter_info: bool = False):
@@ -797,13 +1108,28 @@ def list_all_available_counter_groups(context: str = "context0", zmq_endpoint: s
         simplified_groups = []
         for g in group_details:
             try:
-                simplified_groups.append({"guid": g["guid"], "name": g["name"]})
+                name = g["name"]
+                simplified_groups.append({
+                    "guid": g["guid"],
+                    "name": name,
+                    "likely_crosskey": dashboard_builder.is_likely_crosskey_name(name),
+                })
             except KeyError as e:
                 logging.warning(f"[list_all_available_counter_groups] Missing key in group details: {str(e)}, skipping group")
                 continue
         
         logging.info(f"[list_all_available_counter_groups] Retrieved {len(simplified_groups)} counter groups")
-        return json_to_toon({"groupDetails": simplified_groups})
+        crosskeys = [g for g in simplified_groups if g.get("likely_crosskey")]
+        return json_to_toon({
+            "groupDetails": simplified_groups,
+            "crosskeys": crosskeys,
+            "dashboard_note": (
+                "Entries with likely_crosskey=true (also listed in crosskeys) can drive "
+                "sankey (template 110) or crosskey tree (template 109) modules. On a theme "
+                "dashboard, reuse a related one if it matches the topic; do not create a "
+                "new crosskey just to add a sankey."
+            ),
+        })
         
     except Exception as e:
         logging.error(f"[list_all_available_counter_groups] Error in list_all_available_counter_groups: {str(e)}", exc_info=True)
@@ -1418,11 +1744,326 @@ def get_flows_or_sessions_data(
 
 # Non TRP tools
 
+def _normalize_cg_name(name):
+    """Normalize counter group names for fuzzy reuse matching."""
+    if not name:
+        return ""
+    return "".join(ch for ch in str(name).lower() if ch.isalnum())
+
+
+def _config_db_path(context):
+    return (
+        f"/usr/local/var/lib/trisul-config/domain0/"
+        f"{normalize_context(context)}/profile0/TRISULCONFIG.SQDB"
+    )
+
+
+def _reuse_existing_response(group_type, name, existing, match_reason):
+    """Block creation when a suitable live/DB counter group already exists."""
+    return {
+        "status": "reuse_existing",
+        "counter_group_type": group_type,
+        "requested_name": name,
+        "match_reason": match_reason,
+        "existing_counter_groups": existing,
+        "message": (
+            f"Do not create a new {group_type} counter group named '{name}'. "
+            f"One or more existing counter groups already satisfy this use case "
+            f"({match_reason})."
+        ),
+        "message_to_llm": (
+            "Reuse one of existing_counter_groups.guid values. Do NOT ask the user "
+            "to create a new counter group and do NOT call this creation tool again "
+            "for the same use case. Prefer an exact name or dimension match when "
+            "several candidates are returned."
+        ),
+    }
+
+
+def _find_existing_by_name(name, context, zmq_endpoint):
+    """Find live counter groups whose normalized name matches the proposed name."""
+    if not name:
+        return []
+    if not zmq_endpoint:
+        zmq_endpoint = (
+            "ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/"
+            f"{normalize_context(context)}/run/trp_0"
+        )
+    info = countergroup_info(zmq_endpoint)
+    if info.get("error"):
+        return []
+    target = _normalize_cg_name(name)
+    matches = []
+    for group in info.get("groupDetails", []):
+        gname = group.get("name") or ""
+        guid = group.get("guid")
+        if not guid:
+            continue
+        if _normalize_cg_name(gname) == target:
+            matches.append({
+                "guid": guid,
+                "name": gname,
+                "match": "exact_name",
+            })
+    return matches
+
+
+def _find_existing_crosskeys(context, cross_guid1, cross_guid2, cross_guid3=None):
+    """Find DB crosskeys with the same parent dimensions (order-sensitive)."""
+    db_path = _config_db_path(context)
+    matches = []
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT c.CounterGUID, g.Name,
+                   c.ParentCounterGUID, c.CrosskeyCounterGUID,
+                   c.CrosskeyThirdCounterGUID
+            FROM TRISUL_COUNTER_GROUP_CROSSKEYS c
+            JOIN TRISUL_COUNTER_GROUPS g ON g.CounterGUID = c.CounterGUID
+            WHERE UPPER(c.ParentCounterGUID) = UPPER(?)
+              AND UPPER(c.CrosskeyCounterGUID) = UPPER(?)
+            """,
+            (cross_guid1, cross_guid2),
+        )
+        for row in cursor.fetchall():
+            guid, gname, parent, cross2, cross3 = row
+            wanted_third = (cross_guid3 or "").upper()
+            have_third = (cross3 or "").upper()
+            if wanted_third or have_third:
+                if wanted_third != have_third:
+                    continue
+            matches.append({
+                "guid": guid,
+                "name": gname,
+                "match": "same_crosskey_dimensions",
+                "cross_guid1": parent,
+                "cross_guid2": cross2,
+                "cross_guid3": cross3,
+            })
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        logging.warning(
+            f"[_find_existing_crosskeys] Could not query existing crosskeys: {e}"
+        )
+    return matches
+
+
+def _find_existing_filters(
+    context, parent_counter_guid, filter_counter_guid,
+    filter_key_list=None, filter_key_inv_list=None,
+):
+    """Find DB filtered groups with the same parent/filter/key rules."""
+    db_path = _config_db_path(context)
+    matches = []
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT f.CounterGUID, g.Name,
+                   f.ParentCounterGUID, f.FilterCounterGUID,
+                   f.FilterKeyList, f.FilterKeyInvList
+            FROM TRISUL_COUNTER_GROUP_FILTERS f
+            JOIN TRISUL_COUNTER_GROUPS g ON g.CounterGUID = f.CounterGUID
+            WHERE UPPER(f.ParentCounterGUID) = UPPER(?)
+              AND UPPER(f.FilterCounterGUID) = UPPER(?)
+            """,
+            (parent_counter_guid, filter_counter_guid),
+        )
+        want_inc = (filter_key_list or "").strip()
+        want_exc = (filter_key_inv_list or "").strip()
+        for row in cursor.fetchall():
+            guid, gname, parent, fguid, inc, exc = row
+            have_inc = (inc or "").strip()
+            have_exc = (exc or "").strip()
+            if want_inc or want_exc:
+                if have_inc != want_inc or have_exc != want_exc:
+                    continue
+                match = "same_filter_rules"
+            else:
+                match = "same_parent_and_filter_groups"
+            matches.append({
+                "guid": guid,
+                "name": gname,
+                "match": match,
+                "parent_counter_guid": parent,
+                "filter_counter_guid": fguid,
+                "filter_key_list": have_inc,
+                "filter_key_inv_list": have_exc,
+            })
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        logging.warning(
+            f"[_find_existing_filters] Could not query existing filters: {e}"
+        )
+    return matches
+
+
+def _find_existing_keysets_by_parent(context, parent_counter_guid, name=None):
+    """Find DB keyset groups for the same parent; prefer exact name matches."""
+    db_path = _config_db_path(context)
+    matches = []
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT k.CounterGUID, g.Name, k.ParentCounterGUID
+            FROM TRISUL_COUNTER_GROUP_KEYSETS k
+            JOIN TRISUL_COUNTER_GROUPS g ON g.CounterGUID = k.CounterGUID
+            WHERE UPPER(k.ParentCounterGUID) = UPPER(?)
+            """,
+            (parent_counter_guid,),
+        )
+        target = _normalize_cg_name(name) if name else None
+        for row in cursor.fetchall():
+            guid, gname, parent = row
+            if target and _normalize_cg_name(gname) != target:
+                continue
+            matches.append({
+                "guid": guid,
+                "name": gname,
+                "match": "exact_name" if target else "same_parent_keyset",
+                "parent_counter_guid": parent,
+            })
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        logging.warning(
+            f"[_find_existing_keysets_by_parent] Could not query existing keysets: {e}"
+        )
+    return matches
+
+
+def _counter_group_creation_preview(
+    group_type, name, creation_reason, dashboard_usage, arguments, rules
+):
+    """Build the mandatory user-facing proposal returned before any DB write."""
+    if not creation_reason or not dashboard_usage:
+        return {
+            "status": "error",
+            "message": (
+                "creation_reason and dashboard_usage are required before proposing or "
+                "creating a derived counter group."
+            ),
+            "message_to_llm": (
+                "First call list_all_available_counter_groups (or get_cginfo_from_countergroup_name) "
+                "and confirm no existing group satisfies the request. Then explain why existing "
+                "live counter groups cannot satisfy the request and identify the exact dashboard "
+                "module/template and option that will use the new GUID. Call this tool with "
+                "creation_reason, dashboard_usage, and confirm=False to obtain the complete proposal."
+            ),
+        }
+    return {
+        "status": "pending_confirmation",
+        "counter_group_type": group_type,
+        "name": name,
+        "creation_reason": creation_reason,
+        "dashboard_usage": dashboard_usage,
+        "arguments": arguments,
+        "rules": rules,
+        "message": (
+            f"Proposed {group_type} counter group '{name}'. "
+            "No counter group has been created yet."
+        ),
+        "message_to_llm": (
+            "Before calling any counter-group creation tool with confirm=True, show the user: "
+            "(1) the counter-group type and name, (2) every argument/rule in this proposal, "
+            "(3) why the existing counter groups cannot satisfy the request "
+            "(you must have already checked live counter-group info), and "
+            "(4) exactly which dashboard module will use the new GUID and how. "
+            "Ask for explicit confirmation. Only after the user confirms, call the same tool "
+            "again with the same arguments and confirm=True."
+        ),
+    }
+
+
+def _live_counter_group_details(refs, context, zmq_endpoint):
+    """Resolve creation-rule GUIDs through a mandatory live CG-info request."""
+    if not zmq_endpoint:
+        zmq_endpoint = (
+            "ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/"
+            f"{context}/run/trp_0"
+        )
+    info = countergroup_info(zmq_endpoint)
+    if info.get("error"):
+        return None, {
+            "status": "error",
+            "message": (
+                "Live COUNTER_GROUP_INFO failed while validating the proposed "
+                f"counter-group rules: {info['error']}"
+            ),
+            "message_to_llm": (
+                "Do not propose or create the derived counter group. Check the context or "
+                "ZMQ endpoint, then issue a live counter-group-info request and retry."
+            ),
+        }
+
+    live = {
+        str(group.get("guid", "")).upper(): group.get("name")
+        for group in info.get("groupDetails", [])
+        if group.get("guid")
+    }
+    details = {}
+    missing = []
+    for role, guid in refs.items():
+        if not guid:
+            continue
+        normalized = str(guid).upper()
+        name = live.get(normalized)
+        if not name:
+            missing.append({"role": role, "guid": guid})
+        else:
+            details[role] = {"guid": guid, "name": name}
+    if missing:
+        return None, {
+            "status": "error",
+            "message": "One or more proposed counter-group GUIDs do not exist in live Trisul.",
+            "missing_counter_groups": missing,
+            "message_to_llm": (
+                "Re-run list_all_available_counter_groups or "
+                "get_cginfo_from_countergroup_name. Replace each missing GUID with a value "
+                "returned by the live request before presenting a creation proposal."
+            ),
+        }
+    return details, None
+
+
 @mcp.tool()
-def create_crosskey_counter_group( context: str = "context0", name: str = None, description: str = "No description", toppers_interval: int = 300, bucket_size: int = 60, track_hi_water: int = 500, track_lo_water: int = 100, tail_prune_factor: int = None, last_topper_bucket_ts: str = None, row_status: str = "Active", cardinality_estimate_bits: int = None, topper_traffic_only: bool = None, enable_slice_keys: int = 1, resolver_counter_guid: str = None, cross_guid1: str = None, cross_guid2: str = None, cross_guid3: str = None, balance_depth : int = None):
+def create_crosskey_counter_group(
+    context: str = "context0",
+    name: str = None,
+    description: str = "No description",
+    toppers_interval: int = 300,
+    bucket_size: int = 60,
+    track_hi_water: int = 500,
+    track_lo_water: int = 100,
+    tail_prune_factor: int = None,
+    last_topper_bucket_ts: str = None,
+    row_status: str = "Active",
+    cardinality_estimate_bits: int = None,
+    topper_traffic_only: bool = None,
+    enable_slice_keys: int = 1,
+    resolver_counter_guid: str = None,
+    cross_guid1: str = None,
+    cross_guid2: str = None,
+    cross_guid3: str = None,
+    balance_depth: int = None,
+    creation_reason: str = None,
+    dashboard_usage: str = None,
+    confirm: bool = False,
+    zmq_endpoint: str = None,
+):
     """
-    Create a new crosskey counter group in Trisul.
+        Create a new crosskey counter group in Trisul.
     We cannot create the crosskey with the zmq_endpoint, it require the context name.
+    Before proposing creation, this tool checks live counter-group info and the config DB
+    for an existing group with the same name or the same crosskey dimensions. If one is
+    found, it returns status="reuse_existing" — use that GUID instead of creating.
     Arguments:
         context (str): Context name, should be like context_XYZ or default or context0 etc.
         name (str): Name of the counter group
@@ -1437,6 +2078,11 @@ def create_crosskey_counter_group( context: str = "context0", name: str = None, 
         topper_traffic_only (bool): Whether to track topper traffic only or key traffic also (Default: None)
         enable_slice_keys (bool): Whether to enable slice keys (Default: True)
         resolver_counter_guid (str): Resolver counter GUID (Default: None)
+        creation_reason (str): Why existing counter groups cannot satisfy the request.
+        dashboard_usage (str): Which dashboard module will use this group and how.
+        confirm (bool): False returns a proposal without writing. True creates only after
+            the user explicitly approved that exact proposal.
+        zmq_endpoint (str): Optional live TRP endpoint used to verify and name all GUIDs.
         Returns: dict: Dictionary with details of the created counter group or error message.
         """
     
@@ -1450,8 +2096,85 @@ def create_crosskey_counter_group( context: str = "context0", name: str = None, 
             error_msg = "[create_crosskey_counter_group] Counter group name is required"
             logging.error(error_msg)
             return {"status": "error", "message": error_msg}
-        
+
+        if not cross_guid1 or not cross_guid2:
+            return {
+                "status": "error",
+                "message": "cross_guid1 and cross_guid2 are required for a crosskey counter group",
+            }
+
         context = normalize_context(context)
+        live_groups, live_error = _live_counter_group_details(
+            {
+                "cross_group_1": cross_guid1,
+                "cross_group_2": cross_guid2,
+                "cross_group_3": cross_guid3,
+                "resolver_group": resolver_counter_guid,
+            },
+            context,
+            zmq_endpoint,
+        )
+        if live_error:
+            return live_error
+
+        # Prefer reuse: exact name on live TRP, or same crosskey dimensions in config DB
+        name_matches = _find_existing_by_name(name, context, zmq_endpoint)
+        if name_matches:
+            return _reuse_existing_response(
+                "crosskey",
+                name,
+                name_matches,
+                "exact name already present in live counter-group info",
+            )
+        dim_matches = _find_existing_crosskeys(
+            context, cross_guid1, cross_guid2, cross_guid3
+        )
+        if dim_matches:
+            return _reuse_existing_response(
+                "crosskey",
+                name,
+                dim_matches,
+                "existing crosskey with the same parent dimensions",
+            )
+
+        proposal = _counter_group_creation_preview(
+            "crosskey",
+            name,
+            creation_reason,
+            dashboard_usage,
+            {
+                "context": context,
+                "description": description,
+                "cross_guid1": cross_guid1,
+                "cross_guid2": cross_guid2,
+                "cross_guid3": cross_guid3,
+                "resolver_counter_guid": resolver_counter_guid,
+                "live_counter_groups": live_groups,
+                "toppers_interval": toppers_interval,
+                "bucket_size": bucket_size,
+                "track_hi_water": track_hi_water,
+                "track_lo_water": track_lo_water,
+                "balance_depth": balance_depth,
+                "row_status": row_status,
+                "enable_slice_keys": enable_slice_keys,
+            },
+            [
+                "Cross each key from cross_guid1 with each matching key from cross_guid2.",
+                "Use cross_guid3 only when a three-dimensional crosskey is required.",
+                "The created GUID will be used by a crosskey tree or sankey dashboard module.",
+            ],
+        )
+        if not confirm:
+            return proposal
+        if not creation_reason or not dashboard_usage:
+            return {
+                "status": "error",
+                "message": (
+                    "creation_reason and dashboard_usage are required before confirmed creation. "
+                    "Show the full proposal to the user and obtain explicit confirmation first."
+                ),
+            }
+        
         db_path = f"/usr/local/var/lib/trisul-config/domain0/{context}/profile0/TRISULCONFIG.SQDB"
         logging.info(f"[create_crosskey_counter_group] Connecting to database: {db_path}")
         
@@ -1483,8 +2206,8 @@ def create_crosskey_counter_group( context: str = "context0", name: str = None, 
             cardinality_estimate_bits,
             topper_traffic_only,
             enable_slice_keys,
-            int(datetime.datetime.now().timestamp()),
-            int(datetime.datetime.now().timestamp()),
+            int(datetime.now().timestamp()),
+            int(datetime.now().timestamp()),
             resolver_counter_guid
         )
 
@@ -1519,7 +2242,14 @@ def create_crosskey_counter_group( context: str = "context0", name: str = None, 
         
         success_msg = f"[create_crosskey_counter_group] Counter group '{name}' successfully created with guid {new_guid}."
         logging.info(success_msg)
-        return {"status": "success", "message": success_msg}
+        return {
+            "status": "success",
+            "message": success_msg,
+            "counter_group_guid": new_guid,
+            "name": name,
+            "creation_reason": creation_reason,
+            "dashboard_usage": dashboard_usage,
+        }
         
     except sqlite3.IntegrityError as e:
         error_msg = f"[create_crosskey_counter_group] Database integrity error: {str(e)}"
@@ -1551,6 +2281,654 @@ def create_crosskey_counter_group( context: str = "context0", name: str = None, 
             except Exception as e:
                 logging.warning(f"[create_crosskey_counter_group] Error closing database connection: {str(e)}")
 
+
+@mcp.tool()
+def create_filter_counter_group(
+    context: str = "context0",
+    name: str = None,
+    description: str = "No description",
+    parent_counter_guid: str = None,
+    filter_counter_guid: str = None,
+    filter_key_list: str = None,
+    filter_key_inv_list: str = None,
+    row_status: str = "Active",
+    enable_slice_keys: int = 1,
+    creation_reason: str = None,
+    dashboard_usage: str = None,
+    confirm: bool = False,
+    zmq_endpoint: str = None,
+):
+    """
+    Create a new filtered counter group in Trisul.
+
+    A filtered counter group narrows a parent counter group using keys from a filter
+    counter group. Example: Parent=FlowIntfs, Filter=Apps, FilterKeyList=p-0035
+    (DNS port 53 stored as p-0035 in the database).
+
+    Filter keys are always stored in Trisul DB key format (e.g. p-0035,p-0050,p-01BB).
+    Human-readable inputs such as Port-53, Port-80, or 192.168.1.1 are converted directly.
+    Label or partial inputs (e.g. "dns", "http") are resolved via search_keys first.
+
+    Mandatory two-step workflow for every request:
+        0. Prefer reuse: this tool returns status="reuse_existing" if a live/DB group
+           already matches the name or the same parent/filter/key rules.
+        1. Call with confirm=False. The tool resolves keys and returns the full proposal.
+        2. Show the proposal, reason and dashboard usage to the user.
+        3. After explicit confirmation, call again with confirm=True and the same parameters.
+
+    Arguments:
+        context (str): Context name, e.g. context0, context_default, or context_XYZ.
+        name (str): REQUIRED. Name for the new filtered counter group.
+        description (str): Optional description (default: "No description").
+        parent_counter_guid (str): REQUIRED. Parent counter group GUID — the superset to filter.
+        filter_counter_guid (str): REQUIRED. Filter counter group GUID — keys belong to this group.
+        filter_key_list (str): Comma-separated include keys/ranges, e.g.
+            "Port-53", "p-0035", "Port-80,Port-443", "192.168.1.1~192.168.1.255".
+        filter_key_inv_list (str): Comma-separated inverse keys. At least one key list is required.
+        row_status (str): Counter group status (default: "Active").
+        enable_slice_keys (int): Enable slice keys (default: 1).
+        creation_reason (str): Why existing counter groups cannot satisfy the request.
+        dashboard_usage (str): Which dashboard module will use this group and how.
+        confirm (bool): Set True only after the user approves the complete proposal.
+        zmq_endpoint (str): Optional TRP endpoint for search_keys resolution.
+
+    Returns:
+        dict: Preview for verification, success with created GUID and DB key list, or error.
+    """
+    conn = None
+    cursor = None
+
+    try:
+        logging.info(
+            f"[create_filter_counter_group] Creating filter counter group: "
+            f"name={name}, context={context}, parent={parent_counter_guid}, "
+            f"filter={filter_counter_guid}, confirm={confirm}"
+        )
+
+        if not name:
+            error_msg = "[create_filter_counter_group] Counter group name is required"
+            logging.error(error_msg)
+            return {"status": "error", "message": error_msg}
+
+        if not parent_counter_guid:
+            error_msg = "[create_filter_counter_group] parent_counter_guid is required"
+            logging.error(error_msg)
+            return {"status": "error", "message": error_msg}
+
+        if not filter_counter_guid:
+            error_msg = "[create_filter_counter_group] filter_counter_guid is required"
+            logging.error(error_msg)
+            return {"status": "error", "message": error_msg}
+
+        if not filter_key_list and not filter_key_inv_list:
+            error_msg = (
+                "[create_filter_counter_group] At least one of filter_key_list or "
+                "filter_key_inv_list is required"
+            )
+            logging.error(error_msg)
+            return {"status": "error", "message": error_msg}
+
+        context = normalize_context(context)
+        live_groups, live_error = _live_counter_group_details(
+            {
+                "parent_group": parent_counter_guid,
+                "filter_group": filter_counter_guid,
+            },
+            context,
+            zmq_endpoint,
+        )
+        if live_error:
+            return live_error
+
+        resolved_include = _resolve_filter_keylist(
+            filter_key_list, filter_counter_guid, context, zmq_endpoint
+        )
+        resolved_exclude = _resolve_filter_keylist(
+            filter_key_inv_list, filter_counter_guid, context, zmq_endpoint
+        )
+
+        db_filter_key_list = resolved_include["db_keylist"]
+        db_filter_key_inv_list = resolved_exclude["db_keylist"]
+        needs_confirmation = (
+            resolved_include["needs_confirmation"] or resolved_exclude["needs_confirmation"]
+        )
+        blocked = resolved_include["blocked"] or resolved_exclude["blocked"]
+
+        if blocked:
+            return {
+                "status": "error",
+                "message": (
+                    "Multiple matches found for one or more filter keys. "
+                    "Ask the user to pick an exact key or provide a more specific label."
+                ),
+                "message_to_llm": (
+                    "Show the ambiguous key candidates to the user. Ask them to specify the exact "
+                    "key or use an explicit DB/human key (Port-80, p-0035, full IP). Do not create "
+                    "until ambiguity is resolved."
+                ),
+                "resolved_filter_key_list": resolved_include,
+                "resolved_filter_key_inv_list": resolved_exclude,
+            }
+
+        if not db_filter_key_list and not db_filter_key_inv_list:
+            error_msg = (
+                "[create_filter_counter_group] Could not resolve filter keys to database format"
+            )
+            logging.error(error_msg)
+            return {
+                "status": "error",
+                "message": error_msg,
+                "resolved_filter_key_list": resolved_include,
+                "resolved_filter_key_inv_list": resolved_exclude,
+            }
+
+        name_matches = _find_existing_by_name(name, context, zmq_endpoint)
+        if name_matches:
+            return _reuse_existing_response(
+                "filter",
+                name,
+                name_matches,
+                "exact name already present in live counter-group info",
+            )
+        filter_matches = _find_existing_filters(
+            context,
+            parent_counter_guid,
+            filter_counter_guid,
+            db_filter_key_list,
+            db_filter_key_inv_list,
+        )
+        if filter_matches:
+            return _reuse_existing_response(
+                "filter",
+                name,
+                filter_matches,
+                "existing filtered group with the same parent/filter/key rules",
+            )
+
+        proposal = _counter_group_creation_preview(
+            "filter",
+            name,
+            creation_reason,
+            dashboard_usage,
+            {
+                "context": context,
+                "description": description,
+                "parent_counter_guid": parent_counter_guid,
+                "filter_counter_guid": filter_counter_guid,
+                "live_counter_groups": live_groups,
+                "filter_key_list_input": filter_key_list,
+                "filter_key_inv_list_input": filter_key_inv_list,
+                "filter_key_list_db_format": db_filter_key_list,
+                "filter_key_inv_list_db_format": db_filter_key_inv_list,
+                "row_status": row_status,
+                "enable_slice_keys": enable_slice_keys,
+            },
+            [
+                "The parent counter group supplies the values that the module displays.",
+                "Keys in filter_key_list are included; keys in filter_key_inv_list are excluded.",
+                "Resolved DB keys, not human-readable labels, are saved in Trisul.",
+            ],
+        )
+        proposal["resolved_filter_key_list"] = resolved_include
+        proposal["resolved_filter_key_inv_list"] = resolved_exclude
+        proposal["keys_were_resolved_from_labels"] = needs_confirmation
+        if not confirm:
+            return proposal
+        if not creation_reason or not dashboard_usage:
+            return {
+                "status": "error",
+                "message": (
+                    "creation_reason and dashboard_usage are required before confirmed creation. "
+                    "Show the full proposal to the user and obtain explicit confirmation first."
+                ),
+            }
+
+        db_path = f"/usr/local/var/lib/trisul-config/domain0/{context}/profile0/TRISULCONFIG.SQDB"
+        logging.info(f"[create_filter_counter_group] Connecting to database: {db_path}")
+
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        logging.info("[create_filter_counter_group] Database connection established")
+
+        cursor.execute(
+            """
+            SELECT TopNCommitIntervalSecs, BucketSizeMS, TrackHiWater, TrackLoWater, TopperTrafficOnly
+            FROM TRISUL_COUNTER_GROUPS
+            WHERE CounterGUID = ?
+            """,
+            (parent_counter_guid,),
+        )
+        parent_row = cursor.fetchone()
+        if not parent_row:
+            error_msg = (
+                f"[create_filter_counter_group] Parent counter group not found: {parent_counter_guid}"
+            )
+            logging.error(error_msg)
+            return {"status": "error", "message": error_msg}
+
+        topn_commit, bucket_size_ms, track_hi, track_lo, topper_traffic_only = parent_row
+
+        new_guid = f"{{{str(uuid.uuid4()).upper()}}}"
+        logging.info(f"[create_filter_counter_group] Generated new GUID: {new_guid}")
+
+        now_ts = int(datetime.now().timestamp())
+        cg_sql = """
+            INSERT INTO TRISUL_COUNTER_GROUPS
+            (CounterGUID, Name, Description, TopNCommitIntervalSecs, BucketSizeMS, TrackHiWater,
+             TrackLoWater, TailPruneFactor, LastTopperBucketTS, RowStatus, CardinalityEstimateBits,
+             TopperTrafficOnly, EnableSliceKeys, CreateTimestamp, ModifyTimestamp, ResolverCounterGUID)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        cg_values = (
+            new_guid,
+            name,
+            description,
+            topn_commit,
+            bucket_size_ms,
+            track_hi,
+            track_lo,
+            None,
+            None,
+            row_status,
+            None,
+            topper_traffic_only,
+            enable_slice_keys,
+            now_ts,
+            now_ts,
+            None,
+        )
+
+        logging.info(f"[create_filter_counter_group] Executing counter group insert with values: {cg_values}")
+        cursor.execute(cg_sql, cg_values)
+
+        filter_sql = """
+            INSERT INTO TRISUL_COUNTER_GROUP_FILTERS
+            (CounterGUID, ParentCounterGUID, FilterCounterGUID, FilterKeyList, FilterKeyInvList)
+            VALUES (?, ?, ?, ?, ?)
+        """
+        filter_values = (
+            new_guid,
+            parent_counter_guid,
+            filter_counter_guid,
+            db_filter_key_list,
+            db_filter_key_inv_list,
+        )
+
+        logging.info(f"[create_filter_counter_group] Executing filter insert with values: {filter_values}")
+        cursor.execute(filter_sql, filter_values)
+        conn.commit()
+        logging.info("[create_filter_counter_group] Filter counter group inserted successfully")
+
+        success_msg = (
+            f"Filtered counter group '{name}' created with GUID {new_guid}. "
+            f"FilterKeyList={db_filter_key_list or ''}"
+            f"{', FilterKeyInvList=' + db_filter_key_inv_list if db_filter_key_inv_list else ''}."
+        )
+        logging.info(f"[create_filter_counter_group] {success_msg}")
+        return {
+            "status": "success",
+            "message": success_msg,
+            "counter_group_guid": new_guid,
+            "name": name,
+            "parent_counter_guid": parent_counter_guid,
+            "filter_counter_guid": filter_counter_guid,
+            "filter_key_list": db_filter_key_list,
+            "filter_key_inv_list": db_filter_key_inv_list,
+            "resolved_filter_key_list": resolved_include,
+            "resolved_filter_key_inv_list": resolved_exclude,
+            "creation_reason": creation_reason,
+            "dashboard_usage": dashboard_usage,
+        }
+
+    except sqlite3.IntegrityError as e:
+        error_msg = f"[create_filter_counter_group] Database integrity error: {str(e)}"
+        logging.error(error_msg)
+        if conn:
+            conn.rollback()
+        return {"status": "error", "message": error_msg}
+    except sqlite3.OperationalError as e:
+        error_msg = f"[create_filter_counter_group] Database operational error: {str(e)}"
+        logging.error(error_msg)
+        return {"status": "error", "message": error_msg}
+    except Exception as e:
+        error_msg = f"[create_filter_counter_group] Error creating counter group: {str(e)}"
+        logging.error(error_msg, exc_info=True)
+        if conn:
+            conn.rollback()
+        return {"status": "error", "message": error_msg}
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+                logging.info("[create_filter_counter_group] Cursor closed")
+            except Exception as e:
+                logging.warning(f"[create_filter_counter_group] Error closing cursor: {str(e)}")
+        if conn:
+            try:
+                conn.close()
+                logging.info("[create_filter_counter_group] Database connection closed")
+            except Exception as e:
+                logging.warning(f"[create_filter_counter_group] Error closing database connection: {str(e)}")
+
+
+@mcp.tool()
+def create_keyset_counter_group(
+    context: str = "context0",
+    name: str = None,
+    description: str = "No description",
+    parent_counter_guid: str = None,
+    meter_only_keysets: bool = True,
+    keyset_key: str = None,
+    keys_from: str = None,
+    keysets: List[Dict[str, str]] = None,
+    row_status: str = "Active",
+    enable_slice_keys: int = 1,
+    creation_reason: str = None,
+    dashboard_usage: str = None,
+    confirm: bool = False,
+    zmq_endpoint: str = None,
+):
+    """
+    Create a new keyset counter group in Trisul.
+
+    A keyset counter group aggregates sets of keys from a parent counter group into named
+    buckets (KeysetKey → KeyFrom). Example: Parent=Apps, keyset_key=web,
+    keys_from=Port-80,Port-443,Port-8080 stored as KeyFrom=p-0050,p-01BB,p-1F90.
+
+    Keys in KeyFrom are always stored in Trisul DB key format (comma-separated), e.g.
+    p-18CA,p-18CB,p-1236 or p-1AE1~p-1AE9 for ranges.
+
+    You can create an empty keyset group (name + parent only) and add keys later, or supply
+    initial keysets via keyset_key/keys_from or the keysets list:
+        keysets=[{"keyset_key": "web", "keys_from": "Port-80,Port-443"}]
+
+    Label/partial keys in keys_from are resolved via search_keys against the parent group.
+    Every creation uses the same mandatory proposal/confirmation workflow, including
+    explicit keys and empty keyset groups. If a live/DB group already matches the name
+    (and parent), this tool returns status="reuse_existing" instead of proposing creation.
+
+    Arguments:
+        context (str): Context name, e.g. context0.
+        name (str): REQUIRED. Name for the new keyset counter group.
+        description (str): Optional description.
+        parent_counter_guid (str): REQUIRED. Parent counter group GUID (keys belong to this group).
+        meter_only_keysets (bool): Only meter keys matching a keyset (default: True).
+        keyset_key (str): Single keyset bucket name (use with keys_from).
+        keys_from (str): Comma-separated keys/ranges for the single keyset bucket.
+        keysets (list): Multiple buckets, each {"keyset_key": "...", "keys_from": "..."}.
+        row_status (str): Counter group status (default: "Active").
+        enable_slice_keys (int): Enable slice keys (default: 1).
+        creation_reason (str): Why existing counter groups cannot satisfy the request.
+        dashboard_usage (str): Which dashboard module will use this group and how.
+        confirm (bool): Set True only after the user approves the complete proposal.
+        zmq_endpoint (str): Optional TRP endpoint for search_keys resolution.
+
+    Returns:
+        dict: Preview for verification, success with created GUID and keyset details, or error.
+    """
+    conn = None
+    cursor = None
+
+    try:
+        logging.info(
+            f"[create_keyset_counter_group] Creating keyset counter group: "
+            f"name={name}, context={context}, parent={parent_counter_guid}, confirm={confirm}"
+        )
+
+        if not name:
+            error_msg = "[create_keyset_counter_group] Counter group name is required"
+            logging.error(error_msg)
+            return {"status": "error", "message": error_msg}
+
+        if not parent_counter_guid:
+            error_msg = "[create_keyset_counter_group] parent_counter_guid is required"
+            logging.error(error_msg)
+            return {"status": "error", "message": error_msg}
+
+        context = normalize_context(context)
+        live_groups, live_error = _live_counter_group_details(
+            {"parent_group": parent_counter_guid},
+            context,
+            zmq_endpoint,
+        )
+        if live_error:
+            return live_error
+        parsed_keysets = _parse_keyset_entries(keyset_key, keys_from, keysets)
+
+        if (keyset_key and not keys_from) or (keys_from and not keyset_key):
+            return {
+                "status": "error",
+                "message": "Both keyset_key and keys_from are required when adding a single keyset bucket",
+            }
+
+        resolved_keysets = None
+        if parsed_keysets:
+            resolved_keysets = _resolve_keyset_entries(
+                parsed_keysets, parent_counter_guid, context, zmq_endpoint
+            )
+            if resolved_keysets.get("error"):
+                return {
+                    "status": "error",
+                    "message": resolved_keysets["error"],
+                    "resolved_keysets": resolved_keysets,
+                }
+            if resolved_keysets.get("blocked"):
+                return {
+                    "status": "error",
+                    "message": (
+                        "Multiple matches found for one or more keyset keys. "
+                        "Ask the user to pick an exact key or provide a more specific label."
+                    ),
+                    "message_to_llm": (
+                        "Show ambiguous key candidates to the user. Ask them to specify exact "
+                        "keys or use explicit DB/human keys (Port-80, p-0035, full IP)."
+                    ),
+                    "resolved_keysets": resolved_keysets,
+                }
+
+        name_matches = _find_existing_by_name(name, context, zmq_endpoint)
+        if name_matches:
+            return _reuse_existing_response(
+                "keyset",
+                name,
+                name_matches,
+                "exact name already present in live counter-group info",
+            )
+        keyset_matches = _find_existing_keysets_by_parent(
+            context, parent_counter_guid, name=name
+        )
+        if keyset_matches:
+            return _reuse_existing_response(
+                "keyset",
+                name,
+                keyset_matches,
+                "existing keyset group with the same name and parent",
+            )
+
+        proposal = _counter_group_creation_preview(
+            "keyset",
+            name,
+            creation_reason,
+            dashboard_usage,
+            {
+                "context": context,
+                "description": description,
+                "parent_counter_guid": parent_counter_guid,
+                "live_counter_groups": live_groups,
+                "meter_only_keysets": meter_only_keysets,
+                "keysets_input": parsed_keysets,
+                "keysets_resolved": (
+                    resolved_keysets.get("entries", []) if resolved_keysets else []
+                ),
+                "row_status": row_status,
+                "enable_slice_keys": enable_slice_keys,
+            },
+            [
+                "Each keyset_key is a new aggregate bucket shown by the dashboard module.",
+                "keys_from values are resolved and stored in Trisul DB key format.",
+                "meter_only_keysets controls whether only meter keys matching a bucket are counted.",
+            ],
+        )
+        proposal["resolved_keysets"] = resolved_keysets
+        if not confirm:
+            return proposal
+        if not creation_reason or not dashboard_usage:
+            return {
+                "status": "error",
+                "message": (
+                    "creation_reason and dashboard_usage are required before confirmed creation. "
+                    "Show the full proposal to the user and obtain explicit confirmation first."
+                ),
+            }
+
+        db_path = f"/usr/local/var/lib/trisul-config/domain0/{context}/profile0/TRISULCONFIG.SQDB"
+        logging.info(f"[create_keyset_counter_group] Connecting to database: {db_path}")
+
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        logging.info("[create_keyset_counter_group] Database connection established")
+
+        cursor.execute(
+            """
+            SELECT TrackHiWater, TrackLoWater, TopperTrafficOnly
+            FROM TRISUL_COUNTER_GROUPS
+            WHERE CounterGUID = ?
+            """,
+            (parent_counter_guid,),
+        )
+        parent_row = cursor.fetchone()
+        if not parent_row:
+            error_msg = (
+                f"[create_keyset_counter_group] Parent counter group not found: {parent_counter_guid}"
+            )
+            logging.error(error_msg)
+            return {"status": "error", "message": error_msg}
+
+        track_hi, track_lo, topper_traffic_only = parent_row
+        new_guid = f"{{{str(uuid.uuid4()).upper()}}}"
+        now_ts = int(datetime.now().timestamp())
+        meter_only_value = "true" if meter_only_keysets else "false"
+        topper_traffic_only = topper_traffic_only or "False"
+
+        logging.info(f"[create_keyset_counter_group] Generated new GUID: {new_guid}")
+
+        cg_sql = """
+            INSERT INTO TRISUL_COUNTER_GROUPS
+            (CounterGUID, Name, Description, TopNCommitIntervalSecs, BucketSizeMS, TrackHiWater,
+             TrackLoWater, TailPruneFactor, LastTopperBucketTS, RowStatus, CardinalityEstimateBits,
+             TopperTrafficOnly, EnableSliceKeys, CreateTimestamp, ModifyTimestamp, ResolverCounterGUID)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        cg_values = (
+            new_guid,
+            name,
+            description,
+            300,
+            60000,
+            track_hi,
+            track_lo,
+            None,
+            None,
+            row_status,
+            None,
+            topper_traffic_only,
+            enable_slice_keys,
+            now_ts,
+            now_ts,
+            None,
+        )
+        logging.info(f"[create_keyset_counter_group] Executing counter group insert with values: {cg_values}")
+        cursor.execute(cg_sql, cg_values)
+
+        keyset_sql = """
+            INSERT INTO TRISUL_COUNTER_GROUP_KEYSETS
+            (CounterGUID, ParentCounterGUID, MeterOnlyKeysets)
+            VALUES (?, ?, ?)
+        """
+        keyset_values = (new_guid, parent_counter_guid, meter_only_value)
+        logging.info(f"[create_keyset_counter_group] Executing keyset insert with values: {keyset_values}")
+        cursor.execute(keyset_sql, keyset_values)
+        keyset_row_id = cursor.lastrowid
+
+        saved_keysets = []
+        if resolved_keysets and resolved_keysets.get("entries"):
+            keyset_key_sql = """
+                INSERT INTO TRISUL_COUNTER_GROUP_KEYSET_KEYS
+                (trisul_counter_group_keyset_id, KeysetKey, KeyFrom, KeyTo)
+                VALUES (?, ?, ?, ?)
+            """
+            for item in resolved_keysets["entries"]:
+                cursor.execute(
+                    keyset_key_sql,
+                    (keyset_row_id, item["keyset_key"], item["keys_from_db"], None),
+                )
+                saved_keysets.append(
+                    {
+                        "keyset_key": item["keyset_key"],
+                        "keys_from": item["keys_from_db"],
+                    }
+                )
+
+        conn.commit()
+        logging.info("[create_keyset_counter_group] Keyset counter group inserted successfully")
+
+        if saved_keysets:
+            keyset_summary = "; ".join(
+                f"{item['keyset_key']}={item['keys_from']}" for item in saved_keysets
+            )
+            success_msg = (
+                f"Keyset counter group '{name}' created with GUID {new_guid}. "
+                f"Saved keysets: {keyset_summary}."
+            )
+        else:
+            success_msg = (
+                f"Keyset counter group '{name}' created with GUID {new_guid}. "
+                "No keyset buckets were added yet."
+            )
+
+        logging.info(f"[create_keyset_counter_group] {success_msg}")
+        return {
+            "status": "success",
+            "message": success_msg,
+            "counter_group_guid": new_guid,
+            "name": name,
+            "parent_counter_guid": parent_counter_guid,
+            "meter_only_keysets": meter_only_keysets,
+            "keysets": saved_keysets,
+            "resolved_keysets": resolved_keysets,
+            "creation_reason": creation_reason,
+            "dashboard_usage": dashboard_usage,
+        }
+
+    except sqlite3.IntegrityError as e:
+        error_msg = f"[create_keyset_counter_group] Database integrity error: {str(e)}"
+        logging.error(error_msg)
+        if conn:
+            conn.rollback()
+        return {"status": "error", "message": error_msg}
+    except sqlite3.OperationalError as e:
+        error_msg = f"[create_keyset_counter_group] Database operational error: {str(e)}"
+        logging.error(error_msg)
+        return {"status": "error", "message": error_msg}
+    except Exception as e:
+        error_msg = f"[create_keyset_counter_group] Error creating counter group: {str(e)}"
+        logging.error(error_msg, exc_info=True)
+        if conn:
+            conn.rollback()
+        return {"status": "error", "message": error_msg}
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+                logging.info("[create_keyset_counter_group] Cursor closed")
+            except Exception as e:
+                logging.warning(f"[create_keyset_counter_group] Error closing cursor: {str(e)}")
+        if conn:
+            try:
+                conn.close()
+                logging.info("[create_keyset_counter_group] Database connection closed")
+            except Exception as e:
+                logging.warning(f"[create_keyset_counter_group] Error closing database connection: {str(e)}")
 
 
 @mcp.tool()
@@ -2641,6 +4019,352 @@ def search_keys(
     except Exception as e:
         logging.error(f"[search_keys] Error: {str(e)}", exc_info=True)
         return json_to_toon({"error": str(e)})
+
+
+# Dashboard authoring tools
+
+def _search_keys_raw(counter_group, zmq_endpoint, label=None, pattern=None, maxitems=20):
+    req = trp_pb2.Message()
+    req.trp_command = req.SEARCH_KEYS_REQUEST
+    q = req.search_keys_request
+    q.counter_group = counter_group
+    q.maxitems = int(maxitems)
+    q.offset = 0
+    q.get_totals = False
+    q.get_attributes = False
+    if label:
+        q.label = str(label)
+    if pattern:
+        q.pattern = str(pattern)
+    return MessageToDict(get_response(zmq_endpoint, req)).get("keys", [])
+
+
+def _dashboard_resolvers(zmq_endpoint):
+    """Wire dashboard_builder's validation hooks to live TRP lookups."""
+
+    def counter_groups():
+        info = countergroup_info(zmq_endpoint)
+        if info.get("error"):
+            raise RuntimeError(info["error"])
+        return {group.get("guid"): group.get("name") for group in info.get("groupDetails", [])}
+
+    def key_lookup(cgguid, key):
+        matches = _search_keys_raw(cgguid, zmq_endpoint, label=key)
+        if matches:
+            return matches
+        # No exact hit: search on the bare name so the caller can suggest
+        # alternatives, since keys often carry a suffix like "https[[443]]".
+        return _search_keys_raw(cgguid, zmq_endpoint, pattern=str(key).split("[[")[0], maxitems=10)
+
+    return dashboard_builder.Resolvers(counter_groups=counter_groups, key_lookup=key_lookup)
+
+
+def _coerce_json_arg(value):
+    """LLMs frequently pass dict/list arguments as JSON strings."""
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        try:
+            return ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            return value
+
+
+@mcp.tool()
+def list_derived_counter_group_types(query: str = ""):
+    """
+    Explain derived Trisul counter groups: crosskey, filter, and keyset.
+
+    Call this when choosing which derived type to create, how to create it, which
+    scenarios it solves, or which dashboard module should display it. Always still
+    call list_all_available_counter_groups first and reuse a live group when one fits.
+
+    Arguments:
+        query (str): Keywords such as "crosskey sankey", "filter https hosts",
+                     "keyset buckets", "how to create", or a scenario phrase.
+                     Leave empty for the full catalog (choose-table + all three types).
+
+    Returns:
+        dict: reuse_first rules, how_to_choose, show_in_module_overview, and matching
+              type entries with what_it_is, how_to_create, scenarios, and show_in_module
+              (which template_id receives the created GUID).
+    """
+    try:
+        payload = dashboard_builder.derived_counter_group_types_for_llm(query)
+        logging.info(
+            f"[list_derived_counter_group_types] query={query!r} "
+            f"matched {len(payload.get('types', []))} types"
+        )
+        return json_to_toon(payload)
+    except Exception as e:
+        logging.error(f"[list_derived_counter_group_types] Error: {str(e)}", exc_info=True)
+        return json_to_toon({"error": str(e), "types": []})
+
+
+@mcp.tool()
+def list_dashboard_module_types(query: str = ""):
+    """
+    List the Webtrisul dashboard module types that can be placed on a generated dashboard.
+
+    Call this BEFORE generate_dashboard_json so you pick real template_ids and only
+    pass options the template accepts. Each entry describes what the module looks like
+    in the web UI, when to use it, when NOT to use it, its accepted option keys,
+    defaults, allowed enum values, and a ready-to-adapt example.
+
+    Query it ONCE PER PANEL using that panel's own words, not once for the whole
+    dashboard. "top 10 hosts" and "https traffic chart" are two different panels and
+    resolve to two different presentations; a single query for both will mis-rank them.
+    Including the user's presentation word ("chart", "list", "pie", "badge",
+    "sankey", "flowmap", "real time") restricts the result to modules that actually
+    render that shape, so pass it through verbatim. For a theme dashboard you may
+    query by presentation ("single value badge", "pie toppers chart", "line toppers
+    chart", "toppers table", "sankey") instead of the whole vague request. For a
+    realtime/live dashboard query "real time badge", "real time chart", "real time
+    toppers" so templates 105 / 54 / 56 are returned.
+
+    Arguments:
+        query (str): Keywords for one panel, e.g. "https traffic chart",
+                     "top hosts list", "alerts", "single value badge", "flowmap",
+                     "sankey", "real time". Leave empty to get the full catalog.
+                     Note: "flowmap" is Custom URL (/sessions/flowmap), not sankey.
+
+    Returns:
+        dict: {"templates": [...]} where each template has template_id, name, group,
+              presentation (the shape it renders), looks_like, use_when, not_when,
+              needs, option_keys, defaults, enums, recommended_width and
+              example_options.
+    """
+    try:
+        templates = dashboard_builder.templates_for_llm(query)
+        logging.info(f"[list_dashboard_module_types] query={query!r} matched {len(templates)} templates")
+        return json_to_toon({
+            "counter_group_guid_source": (
+                "Resolve every counter-group GUID with a live COUNTER_GROUP_INFO request. "
+                "Never copy a GUID from static catalog data."
+            ),
+            "templates": templates,
+        })
+    except Exception as e:
+        logging.error(f"[list_dashboard_module_types] Error: {str(e)}", exc_info=True)
+        return json_to_toon({"error": str(e), "templates": []})
+
+
+@mcp.tool()
+def generate_dashboard_json(
+    dashboard: dict,
+    modules: List[dict],
+    output_path: str = None,
+    confirm: bool = False,
+    context: str = "context0",
+    zmq_endpoint: str = None,
+):
+    """
+    Generate a Trisul dashboard package JSON file. After success, confirm generation
+    and list the modules. Do not tell the user how to download or install the dashboard,
+    and do not send them to Admin > Packages > Install dashboard.
+
+    Theme dashboards: if the user asked to create a dashboard without naming specific
+    modules, a counter group, or a key (e.g. "create a host dashboard", "create a netflow
+    dashboard", "create a general network monitoring dashboard"), design an attractive
+    layout yourself. Retro requirements: at least 6 modules; 3-4 single-value badges
+    (template 61) across the top using Aggregates TOTALBW / DIR_INTOHOME / DIR_OUTOFHOME;
+    at least one template 102 with surface PIE or DONUT; at least one template 102/103
+    with surface LINE or AREA/STACKEDAREA; at least two toppers tables (template 3); plus
+    a sankey (110) or crosskey tree (109) if list_all_available_counter_groups returned a
+    related crosskey. Realtime/live dashboards override that: use template 105 (not 61)
+    for KPIs, template 54 (named-key LINE chart, not 102) for live traffic, and template
+    56 (not 3) for toppers lists. Do not mix retro modules onto a realtime dashboard.
+    Do not create a new crosskey just to fill a sankey slot. Set each module intent to
+    the designed panel including the presentation word.
+
+    Every counter group GUID and key is validated against the connected Trisul instance.
+    A live COUNTER_GROUP_INFO request is mandatory; no static counter-group GUID fallback
+    is used. Resolve groups with list_all_available_counter_groups or
+    get_cginfo_from_countergroup_name and keys with search_keys before calling this.
+
+    This tool is a two-step workflow:
+      1. Call with confirm=False. You get status="pending_confirmation" plus a layout
+         preview. Show that preview to the user and ask them to approve it.
+      2. Only after the user approves, call again with identical arguments and
+         confirm=True to write the file.
+    If validation fails you get status="error" with a "problems" list naming the exact
+    module and what is wrong; fix it or ask the user, then retry.
+
+    Arguments:
+        dashboard (dict): {
+            "name": "Security Overview",              # required, shown as the dashboard title
+            "description": "Alerts and top talkers",  # required by Webtrisul
+            "key": "securityoverview",                # optional, alphanumeric only, derived from name
+            "author": "trisul",                       # optional
+            "version": "1.0"                          # optional
+        }
+        modules (list[dict]): Panels in the order they should appear, left to right and
+            top to bottom. Theme dashboards: KPI badges first, then pie/donut beside
+            line/area, then tables, then sankey/tree. Each entry is {
+              "template_id": 3,                 # required, from list_dashboard_module_types
+              "name": "Top Countries",          # required, the panel title
+              "intent": "top countries list",   # required, THIS panel's words
+                                                # (user's words, or the designed panel
+                                                # on a theme dashboard, e.g. "donut of
+                                                # top hosts"). Validation compares the
+                                                # presentation these words ask for
+                                                # against the shape the template renders
+                                                # and rejects the module when they
+                                                # disagree, e.g. "https traffic chart"
+                                                # built as a toppers table.
+              "description": "...",             # optional
+              "options": {...},                 # template-specific options, see the catalog
+              "width": 6,                       # optional 1-12 Bootstrap columns, a RELATIVE size hint
+                                                # only: modules wrap onto a new row once a row exceeds
+                                                # 12, then every row is widened to fill all 12 columns
+                                                # so no blank grid space is left. Give the panels of a
+                                                # row the ratio you want (e.g. 8 and 4 for wide+narrow).
+              "width_locked": false,            # optional, true keeps "width" exactly as given. Set this
+                                                # ONLY when the user asked for that specific column size.
+              "undecorated": true               # optional; only templates 61 and 105. Those
+                                                # default to true (no panel frame). Set false
+                                                # when the user wants the frame back; ignored
+                                                # on every other template.
+            }
+        output_path (str): Optional filename. Directory components are discarded because
+            dashboard files are always saved under /tmp. Defaults to a timestamped filename.
+        confirm (bool): False previews, True writes the file.
+        context (str): Trisul context (Default: "context0").
+        zmq_endpoint (str): TRP ZMQ endpoint. Auto-computed from context if omitted.
+
+    Returns:
+        dict: status "pending_confirmation" (with preview), "error" (with problems),
+              or "success" (with file_path, filename, and dashboard_json string).
+
+    Example:
+        For "top 10 hosts and the https traffic chart" the two panels have different
+        presentations, so they use different templates: a table for the toppers and a
+        time-series chart for the named key.
+
+        generate_dashboard_json(
+            dashboard={"name": "Network Overview", "description": "Top hosts and HTTPS traffic"},
+            modules=[
+                {"template_id": 3, "name": "Top 10 Hosts", "intent": "top 10 hosts", "width": 6,
+                 "options": {"cgguid": "{HOSTS_GUID_FROM_COUNTER_GROUP_INFO}",
+                             "topcount": "10", "statid": 0}},
+                {"template_id": 101, "name": "HTTPS Traffic", "intent": "https traffic chart",
+                 "width": 6,
+                 "options": {"surface": "STACKEDAREA", "show_table": 1,
+                             "models": '[{"cgguid":"{APPS_GUID_FROM_COUNTER_GROUP_INFO}",'
+                                       '"meter":0,"key":"https[[443]]","label":"HTTPS"}]'}}
+            ],
+            confirm=False
+        )
+    """
+    try:
+        dashboard = _coerce_json_arg(dashboard)
+        modules = _coerce_json_arg(modules)
+
+        if not zmq_endpoint:
+            ctx = normalize_context(context)
+            zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{ctx}/run/trp_0"
+
+        logging.info(
+            f"[generate_dashboard_json] confirm={confirm} modules="
+            f"{len(modules) if isinstance(modules, list) else 'n/a'} endpoint={zmq_endpoint}"
+        )
+
+        dashboard_spec, problems = dashboard_builder.validate_dashboard(dashboard)
+        resolvers = _dashboard_resolvers(zmq_endpoint)
+        live_counter_groups = resolvers.counter_groups()
+        if live_counter_groups is None:
+            problems.append({
+                "severity": "error",
+                "where": "dashboard",
+                "message": (
+                    "The mandatory live COUNTER_GROUP_INFO request failed; dashboard "
+                    "generation cannot use static counter-group GUIDs as a fallback."
+                ),
+                "hint": "Check the Trisul context or ZMQ endpoint and retry.",
+            })
+        module_specs, module_problems = dashboard_builder.validate_modules(
+            modules, resolvers, dashboard=dashboard_spec
+        )
+        problems.extend(module_problems)
+
+        errors = [p for p in problems if p["severity"] == "error"]
+        warnings = [p for p in problems if p["severity"] == "warning"]
+
+        if errors:
+            logging.info(f"[generate_dashboard_json] validation failed with {len(errors)} errors")
+            return {
+                "status": "error",
+                "problems": errors + warnings,
+                "message": f"{len(errors)} problem(s) must be fixed before the dashboard can be generated.",
+                "message_to_llm": (
+                    "Do NOT write the file. Read each problem and fix it. A problem about an "
+                    "option the template does not accept, or about an intent that asks for a "
+                    "different presentation, means the template is wrong for that panel: pick the "
+                    "template the hint names and rebuild the module's options for it. Always "
+                    "re-resolve counter "
+                    "groups with a live list_all_available_counter_groups or "
+                    "get_cginfo_from_countergroup_name request and keys with search_keys. Prefer "
+                    "reusing an existing counter group. Only if none can represent the requested "
+                    "data, choose crosskey, filter, or keyset creation; show its complete proposal, "
+                    "reason and dashboard usage to the user; obtain confirmation; create it; then "
+                    "use the returned GUID. If a create tool returns reuse_existing, use that GUID. "
+                    "Call generate_dashboard_json again only after those steps."
+                ),
+            }
+
+        preview = dashboard_builder.render_preview(dashboard_spec, module_specs)
+
+        if not confirm:
+            return {
+                "status": "pending_confirmation",
+                "preview": preview,
+                "warnings": warnings,
+                "message": "Dashboard validated. Awaiting user confirmation before writing the file.",
+                "message_to_llm": (
+                    "First re-read the preview yourself: every module line states the shape it "
+                    "renders and the words it was built from. If a shape does not match what the "
+                    "user asked for, fix the template and call this tool again instead of showing "
+                    "the mismatch. Resolve warnings the same way rather than telling the user an "
+                    "option will be ignored. Then show the user the preview verbatim and ask them "
+                    "to confirm the modules and layout. Only after they say yes, call "
+                    "generate_dashboard_json again with the same arguments and confirm=True."
+                ),
+            }
+
+        package = dashboard_builder.build_package(dashboard_spec, module_specs)
+
+        timestamp = int(datetime.now().timestamp())
+        requested_name = Path(output_path).name if output_path else ""
+        if not requested_name:
+            requested_name = f"{dashboard_spec['key']}_dashboard_{timestamp}.json"
+        elif not requested_name.lower().endswith(".json"):
+            requested_name += ".json"
+        output_file = Path("/tmp") / requested_name
+        package_json_str = json.dumps(package)
+        output_file.write_text(package_json_str, encoding="utf-8")
+
+        logging.info(f"[generate_dashboard_json] wrote {output_file}")
+        return {
+            "status": "success",
+            "file_path": str(output_file),
+            "filename": requested_name,
+            "dashboard_json": package_json_str,
+            "module_count": len(module_specs),
+            "warnings": warnings,
+            "message": f"Dashboard package written to {output_file}",
+            "message_to_llm": (
+                f"Tell the user the full file path and filename exactly as returned: {output_file}. "
+                "List the modules that were included. Do not print the JSON contents. "
+                "Do not mention Download or Install dashboard buttons, how to install, "
+                "or Admin > Packages > Install dashboard."
+            ),
+        }
+
+    except Exception as e:
+        logging.error(f"[generate_dashboard_json] Error: {str(e)}", exc_info=True)
+        return {"status": "error", "message": str(e)}
 
 
 # AI Config tools
