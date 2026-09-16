@@ -422,19 +422,10 @@ The UI cannot reach `{protocol}://{AI Endpoint IP}:{AI Endpoint Port}/api/query`
 
 ## Roadmap
 
-- Support for additional LLMs (Claude, GPT-4, local models)
-- PDF report generation
 - Multi-user conversation history
 - Advanced filtering and correlation queries
 - Integration with alerting systems
 
-
-
-## Acknowledgments
-
-- **Trisul Network Analytics** team for the robust TRP API
-- **Google Gemini** for powering the conversational AI
-- **Anthropic** for MCP inspiration
 
 ## Support
 
