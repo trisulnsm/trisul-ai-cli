@@ -2,8 +2,7 @@
 
 > Conversational AI for Next-Generation Network Monitoring 
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-
+[Python 3.10+](https://www.python.org/downloads/)
 
 ## Overview
 
@@ -12,6 +11,7 @@ Trisul AI CLI is a conversational AI interface for [Trisul Network Analytics](ht
 **Think ChatGPT, but for your network.**
 
 Instead of navigating through menus, logs, and reports, just ask:
+
 - *"What's the traffic trend on this interface in the last 24 hours?"*
 - *"Which ASNs pushed the most traffic this week?"*
 - *"Show me top IPs on the Airtel WAN"*
@@ -82,26 +82,22 @@ Trisul AI CLI combines several cutting-edge technologies:
 ### Setup
 
 1. **Update system and install dependencies** (Debian/Ubuntu):
-   ```bash
+  ```bash
    sudo apt update && sudo apt install python3-pip python3.12-venv -y
-   ```
-
+  ```
 2. **Create and activate virtual environment**:
-   ```bash
+  ```bash
    python3 -m venv .venv
    source .venv/bin/activate
-   ```
-
+  ```
 3. **Install Trisul AI CLI**:
-   ```bash
+  ```bash
    pip install trisul_ai_cli
-   ```
-
+  ```
 4. **Launch the CLI**:
-   ```bash
+  ```bash
    trisul_ai_cli
-   ```
-
+  ```
 5. **Enter your Gemini API key** when prompted (stored securely in `.env`)
 
 Trisul AI can run in two ways:
@@ -132,12 +128,14 @@ Trisul AI REST API starting in HTTP mode on http://0.0.0.0:8200
 
 Useful options:
 
-| Flag | Meaning |
-|------|---------|
-| `--host` | Bind address. `0.0.0.0` lets the WebTrisul browser reach the server. |
-| `--port` | Listen port (default `8200`). Must match the WebTrisul setting. |
-| `--log-level` | `debug`, `info`, `warning`, `error` |
-| `--ssl-certfile` / `--ssl-keyfile` | Enable HTTPS. Check **AI SSL Mode** in WebTrisul if you use these. |
+
+| Flag                               | Meaning                                                              |
+| ---------------------------------- | -------------------------------------------------------------------- |
+| `--host`                           | Bind address. `0.0.0.0` lets the WebTrisul browser reach the server. |
+| `--port`                           | Listen port (default `8200`). Must match the WebTrisul setting.      |
+| `--log-level`                      | `debug`, `info`, `warning`, `error`                                  |
+| `--ssl-certfile` / `--ssl-keyfile` | Enable HTTPS. Check **AI SSL Mode** in WebTrisul if you use these.   |
+
 
 HTTPS example:
 
@@ -164,11 +162,11 @@ The first time you run the CLI or API on a machine, complete LLM setup (API key 
 3. Select the **Trisul AI** tab (left sidebar).
 4. Fill in **Trisul AI API Endpoint Configuration**:
 
-   | Field | What to enter |
-   |-------|----------------|
-   | **AI SSL Mode** | Unchecked for HTTP. Checked only if the API was started with `--ssl-certfile` / `--ssl-keyfile`. |
-   | **AI Endpoint IP** | Host the **browser** can reach (the hub IP, or `127.0.0.1` if the UI and API are on the same machine you browse from). |
-   | **AI Endpoint Port** | Same port as `--port` (for example `8200`). |
+  | Field                | What to enter                                                                                                          |
+  | -------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+  | **AI SSL Mode**      | Unchecked for HTTP. Checked only if the API was started with `--ssl-certfile` / `--ssl-keyfile`.                       |
+  | **AI Endpoint IP**   | Host the **browser** can reach (the hub IP, or `127.0.0.1` if the UI and API are on the same machine you browse from). |
+  | **AI Endpoint Port** | Same port as `--port` (for example `8200`).                                                                            |
 
 5. Click **Save**.
 
@@ -206,9 +204,9 @@ When the assistant generates a dashboard:
 
 1. Read the **layout preview** in chat and confirm if it looks right.
 2. After generation, use the buttons on that message:
-   - **Preview dashboard** — opens a preview without installing
-   - **Download dashboard JSON** — saves the package file
-   - **Install dashboard** — installs it into WebTrisul, then **View dashboard** opens it
+  - **Preview dashboard** — opens a preview without installing
+  - **Download dashboard JSON** — saves the package file
+  - **Install dashboard** — installs it into WebTrisul, then **View dashboard** opens it
 
 The chat is bound to the context you opened it from, so dashboards and queries apply to that context only.
 
@@ -245,16 +243,12 @@ The chat is bound to the context you opened it from, so dashboards and queries a
 [Returns formatted table with IPs and traffic volumes]
 ```
 
-
 ```bash
 👤 (You): How much HTTPS traffic did we see today?
 
 🤖 (Bot): Total HTTPS traffic today: 127.45 GB
 Upload: 45.23 GB, Download: 82.22 GB
 ```
-
-
-
 
 ### Traffic Charts
 
@@ -301,30 +295,34 @@ and 'Destination IP' counter groups to track traffic between specific IP pairs..
 
 ### MCP Tools (Automatically Called)
 
-| Tool | Purpose |
-|------|---------|
-| `list_all_available_counter_groups` | List all available counter groups |
-| `get_cginfo_from_countergroup_name` | Get counter group details by name |
-| `get_counter_group_topper` | Fetch top N items by traffic/metrics |
-| `get_key_traffic_data` | Get time-series traffic for specific keys |
-| `create_crosskey_counter_group` | Propose, confirm, then create custom multi-dimensional counter groups |
-| `create_filter_counter_group` | Propose, confirm, then create filtered counter groups (parent + filter keys) |
-| `create_keyset_counter_group` | Propose, confirm, then create keyset counter groups (parent + named key buckets) |
-| `list_derived_counter_group_types` | Catalog of crosskey / filter / keyset: when to use, how to create, scenarios, which dashboard module shows them |
-| `list_dashboard_module_types` | Browse dashboard module templates and their accepted options |
-| `generate_dashboard_json` | Validate against live Trisul, preview, then write an importable dashboard JSON under `/tmp` |
-| `rag_query` | Search Trisul documentation and knowledge base |
-| `generate_and_show_chart` | Generate interactive traffic visualizations |
+
+| Tool                                | Purpose                                                                                                         |
+| ----------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `list_all_available_counter_groups` | List all available counter groups                                                                               |
+| `get_cginfo_from_countergroup_name` | Get counter group details by name                                                                               |
+| `get_counter_group_topper`          | Fetch top N items by traffic/metrics                                                                            |
+| `get_key_traffic_data`              | Get time-series traffic for specific keys                                                                       |
+| `create_crosskey_counter_group`     | Propose, confirm, then create custom multi-dimensional counter groups                                           |
+| `create_filter_counter_group`       | Propose, confirm, then create filtered counter groups (parent + filter keys)                                    |
+| `create_keyset_counter_group`       | Propose, confirm, then create keyset counter groups (parent + named key buckets)                                |
+| `list_derived_counter_group_types`  | Catalog of crosskey / filter / keyset: when to use, how to create, scenarios, which dashboard module shows them |
+| `list_dashboard_module_types`       | Browse dashboard module templates and their accepted options                                                    |
+| `generate_dashboard_json`           | Validate against live Trisul, preview, then write an importable dashboard JSON under `/tmp`                     |
+| `rag_query`                         | Search Trisul documentation and knowledge base                                                                  |
+| `generate_and_show_chart`           | Generate interactive traffic visualizations                                                                     |
+
 
 #### Filtered counter groups (`create_filter_counter_group`)
 
 Creates a filtered counter group by writing to the Trisul config SQLite DB (same pattern as `create_crosskey_counter_group`). Filter keys are stored in **DB key format** (e.g. `p-0035` for DNS port 53, or `p-0050,p-01BB,p-0019` for multiple ports).
 
-| User provides | Tool behavior |
-|---------------|---------------|
+
+| User provides            | Tool behavior                                                                                         |
+| ------------------------ | ----------------------------------------------------------------------------------------------------- |
 | Explicit or partial keys | With `confirm=False`, returns `pending_confirmation` with the complete resolved proposal; no DB write |
-| Proposal | Includes arguments/rules, `creation_reason`, and the exact `dashboard_usage` |
-| User confirms | Call again with `confirm=True` and identical parameters; returns the created GUID |
+| Proposal                 | Includes arguments/rules, `creation_reason`, and the exact `dashboard_usage`                          |
+| User confirms            | Call again with `confirm=True` and identical parameters; returns the created GUID                     |
+
 
 Example: Parent=FlowIntfs, Filter=Apps, name=`DNSPorts`, keys=`Port-53` → saved as `FilterKeyList=p-0035`.
 
@@ -332,11 +330,13 @@ Example: Parent=FlowIntfs, Filter=Apps, name=`DNSPorts`, keys=`Port-53` → save
 
 Groups keys from a parent counter group into named buckets (KeysetKey → KeyFrom). Keys in KeyFrom are stored in **DB key format** (e.g. `p-0050,p-01BB,p-1F90`).
 
-| User provides | Tool behavior |
-|---------------|---------------|
-| Name + parent, explicit keys, or partial keys | With `confirm=False`, returns the complete proposal; no DB write |
-| Proposal | Includes resolved KeysetKey/KeyFrom rules, why it is needed, and where the dashboard uses it |
-| User confirms | Call again with `confirm=True` and identical parameters; returns the created GUID |
+
+| User provides                                 | Tool behavior                                                                                |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Name + parent, explicit keys, or partial keys | With `confirm=False`, returns the complete proposal; no DB write                             |
+| Proposal                                      | Includes resolved KeysetKey/KeyFrom rules, why it is needed, and where the dashboard uses it |
+| User confirms                                 | Call again with `confirm=True` and identical parameters; returns the created GUID            |
+
 
 Example: Parent=Apps, name=`P2P Traffic`, keyset_key=`p2ptraffic`, keys_from=`Port-6890,Port-6891,...` → saved as comma-separated `p-XXXX` keys.
 
@@ -367,29 +367,30 @@ complete absolute path including the JSON filename.
 
 ### User Commands
 
-- **`exit`** or **`quit`**: Exit the CLI
-- **`change_api_key`**: Update your Gemini API key
+- `**exit`** or `**quit**`: Exit the CLI
+- `**change_api_key**`: Update your Gemini API key
 
 ## Configuration
 
 ### Default Context
 
 By default, Trisul AI connects to `context0` (local IPC socket). You can specify:
+
 - **Context name**: `context_XYZ`, `default`, `context0`
 - **ZMQ endpoint**: `tcp://<ip>:<port>` for remote servers
 
 ### Environment Variables
 
 The CLI stores your API key in `.env`:
+
 ```bash
 TRISUL_GEMINI_API_KEY=your_api_key_here
 ```
 
-
-
 ## Logging
 
 Detailed logs are written to `trisul_ai_cli.log` in the installation directory, including:
+
 - Query history
 - Function calls and responses
 - Error messages and debugging information
@@ -397,25 +398,33 @@ Detailed logs are written to `trisul_ai_cli.log` in the installation directory, 
 ## Troubleshooting
 
 ### Connection Issues
+
 ```bash
 Error: ZMQ timeout - no response from ipc://...
 ```
+
 **Solution**: Verify Trisul Network Analytics is running and the context exists.
 
 ### API Key Issues
+
 ```bash
 Error: Invalid API key
 ```
+
 **Solution**: Run `change_api_key` command and enter a valid Gemini API key.
 
 ### Empty Responses
+
 If the bot returns empty responses, check:
+
 1. Query clarity (be specific about timeframes and entities)
 2. Counter group availability (`list_all_available_counter_groups`)
 3. Log file for detailed error messages
 
 ### WebTrisul chat: Connection Failed
+
 The UI cannot reach `{protocol}://{AI Endpoint IP}:{AI Endpoint Port}/api/query`.
+
 1. Start the API: `trisul_ai_cli api --port 8200`
 2. Confirm `/api/health` returns `"mcp_connected": true`
 3. Match **AI SSL Mode**, **AI Endpoint IP**, and **AI Endpoint Port** on the WebTrisul **Trisul AI** options tab
@@ -425,7 +434,6 @@ The UI cannot reach `{protocol}://{AI Endpoint IP}:{AI Endpoint Port}/api/query`
 - Multi-user conversation history
 - Advanced filtering and correlation queries
 - Integration with alerting systems
-
 
 ## Support
 

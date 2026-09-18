@@ -3339,7 +3339,7 @@ def generate_key_monitor_excel_report(
 
 @mcp.tool()
 def generate_dynamic_report(
-    counter_group_guid: str,
+    counter_group_guid: str = None,
     intent: str = "auto",
     source: str = "auto",
     keys: List[str] = None,
@@ -3353,6 +3353,9 @@ def generate_dynamic_report(
     sort_meter: int = 0,
     row_layout: str = "auto",
     output_format: str = "xlsx",
+    visualization: str = "table",
+    chart_series: List[str] = None,
+    chart_category: str = None,
     columns: List[dict] = None,
     title: str = None,
     filename: str = None,
@@ -3362,6 +3365,8 @@ def generate_dynamic_report(
     merge_columns: List[str] = None,
     exclude_columns: List[str] = None,
     computed_columns: List[dict] = None,
+    sections: List[dict] = None,
+    report_title: str = None,
 ):
     """
     Generate Excel or PDF by fetching Trisul data server-side (no LLM row assembly).
@@ -3379,6 +3384,27 @@ def generate_dynamic_report(
     **source** (advanced override): auto | key_timeseries | topper | key_stats
 
     **output_format**: xlsx (default) | pdf
+
+    **PDF visualization**:
+      - visualization="table": tabular report (default).
+      - visualization="line": line chart; use with intent="key_traffic".
+      - visualization="area": filled area chart; use with intent="key_traffic".
+      - visualization="pie": category distribution; normally use with intent="topper".
+      - chart_series: optional meter column names/headers to plot, e.g. ["Total"].
+      - chart_category: optional pie label column, e.g. "Name" or "Key".
+      Line, area, and pie visualizations require output_format="pdf". Chart data is
+      rendered directly from the verified server-side rows.
+
+    **Multi-page PDF (sections)** — use this whenever ONE request asks for more than one
+    table/chart, e.g. "a toppers table AND an https traffic chart". Pass `sections`: a
+    list where each entry becomes its own page, fetched and verified server-side.
+      - Each section accepts: counter_group_guid, intent, keys, meters, max_count,
+        visualization, chart_series, chart_category, title, subtitle, columns,
+        exclude_columns, computed_columns, sort_meter, row_layout, source.
+      - Top-level counter_group_guid / context / time window act as defaults for every
+        section; a section may override any of them.
+      - Requires output_format="pdf". Returns ONE file_path plus a `sections` summary.
+      - Never call this tool twice for a single multi-part report request.
 
     **Time window** (absolute ranges):
       - Prefer `start_time` / `end_time`: human-readable IST strings, e.g.
@@ -3438,6 +3464,33 @@ def generate_dynamic_report(
             keys=["https"],
             duration_secs=600,
             output_format="pdf",
+            visualization="line",
+            chart_series=["Total"],
+        )
+
+        # ONE PDF, two pages: top-10 hosts table, then an HTTPS line chart
+        generate_dynamic_report(
+            output_format="pdf",
+            context="pcap",
+            duration_secs=300,
+            report_title="Network Report",
+            sections=[
+                {
+                    "counter_group_guid": "{Hosts-GUID}",
+                    "intent": "topper",
+                    "max_count": 10,
+                    "visualization": "table",
+                    "title": "Top 10 Hosts",
+                },
+                {
+                    "counter_group_guid": "{Apps-GUID}",
+                    "intent": "key_traffic",
+                    "keys": ["https"],
+                    "visualization": "line",
+                    "chart_series": ["Total"],
+                    "title": "HTTPS Traffic Trend",
+                },
+            ],
         )
     """
     from trisul_ai_cli.report_engine import run_dynamic_report
@@ -3456,6 +3509,9 @@ def generate_dynamic_report(
         sort_meter=sort_meter,
         row_layout=row_layout,
         output_format=output_format,
+        visualization=visualization,
+        chart_series=chart_series,
+        chart_category=chart_category,
         columns=columns,
         title=title,
         filename=filename,
@@ -3465,6 +3521,8 @@ def generate_dynamic_report(
         merge_columns=merge_columns,
         exclude_columns=exclude_columns,
         computed_columns=computed_columns,
+        sections=sections,
+        report_title=report_title,
     )
 
 
@@ -3659,6 +3717,62 @@ def generate_excel_report(
         return {"status": "error", "message": str(e), "file_path": None}
 
 
+def trisul_page_decorator(report_title, from_ts, to_ts):
+    """Build the onFirstPage/onLaterPages callback that draws the Trisul header and footer."""
+
+    def draw_header_footer(canvas, doc):
+        width, height = A4
+
+        # Header separator
+        canvas.setStrokeColor(colors.black)
+        canvas.line(15, height - 65, width - 15, height - 65)
+
+        logo_path = Path(__file__).resolve().parent / "assets/logo_tlhs.png"
+
+        try:
+            duration_string = epoch_to_duration(from_ts, to_ts) if from_ts and to_ts else ""
+        except Exception:
+            duration_string = ""
+
+        # Logo
+        try:
+            canvas.drawImage(logo_path, 14, height - 63, width=69, height=49, mask='auto')
+        except Exception:
+            pass
+
+        # Header text
+        canvas.setFillColorRGB(0, 0, 0)
+        canvas.setFont("Helvetica", 14)
+        canvas.drawRightString(width - 15, height - 28, report_title or "")
+        canvas.setFont("Helvetica", 10)
+        canvas.drawRightString(width - 15, height - 44, duration_string)
+        canvas.drawRightString(width - 15, height - 58, f"Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} +05:30")
+
+        # Footer line and text
+        canvas.line(15, 43, width - 15, 43)
+        canvas.setFont("Helvetica", 9)
+        canvas.setFillColor(colors.black)
+        canvas.drawString(15, 30, "ACME Inc")
+        canvas.drawCentredString(width / 2, 30, f"Page {doc.page}")
+        canvas.drawRightString(width - 15, 30, "Generated by Trisul Network Analytics (AI Edition)")
+
+    return draw_header_footer
+
+
+def trisul_table_style():
+    """The standard Trisul report table style."""
+    return TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#2880BA")),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('GRID', (0, 0), (-1, -1), 0.25, colors.lightgrey),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
+    ])
+
+
 @mcp.tool()
 def generate_trisul_report(pages, filename: str, report_title: str, from_ts, to_ts):
     """
@@ -3738,52 +3852,8 @@ def generate_trisul_report(pages, filename: str, report_title: str, from_ts, to_
         bottomMargin=70,
     )
 
-    # Header/footer rendering
-    def draw_header_footer(canvas, doc):
-        width, height = A4
-
-        # Header separator
-        canvas.setStrokeColor(colors.black)
-        canvas.line(15, height - 65, width - 15, height - 65)
-        
-        logo_path = Path(__file__).resolve().parent / "assets/logo_tlhs.png"
-        
-        duration_string = epoch_to_duration(from_ts, to_ts)
-        
-        
-        # Logo
-        try:
-            canvas.drawImage(logo_path, 14, height - 63, width=69, height=49, mask='auto')
-        except:
-            pass
-
-        # Header text
-        canvas.setFillColorRGB(0, 0, 0)
-        canvas.setFont("Helvetica", 14)
-        canvas.drawRightString(width - 15, height - 28, report_title)
-        canvas.setFont("Helvetica", 10)
-        canvas.drawRightString(width - 15, height - 44, duration_string)
-        canvas.drawRightString(width - 15, height - 58, f"Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} +05:30")
-
-        # Footer line and text
-        canvas.line(15, 43, width - 15, 43)
-        canvas.setFont("Helvetica", 9)
-        canvas.setFillColor(colors.black)
-        canvas.drawString(15, 30, "ACME Inc")
-        canvas.drawCentredString(width / 2, 30, f"Page {doc.page}")
-        canvas.drawRightString(width - 15, 30, "Generated by Trisul Network Analytics (AI Edition)")
-
-    # Shared table style
-    base_table_style = TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#2880BA")),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-        ('FONTSIZE', (0, 0), (-1, -1), 9),
-        ('GRID', (0, 0), (-1, -1), 0.25, colors.lightgrey),
-        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
-    ])
+    draw_header_footer = trisul_page_decorator(report_title, from_ts, to_ts)
+    base_table_style = trisul_table_style()
 
     elements = []
     for i, page in enumerate(pages):

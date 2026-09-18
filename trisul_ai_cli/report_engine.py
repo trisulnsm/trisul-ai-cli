@@ -1261,41 +1261,258 @@ def detect_assembled_traffic_hallucination(
     return None
 
 
-def _build_pdf_table(title, columns, rows, from_ts, to_ts, filename, report_title):
-    """Write a single-table PDF using server formatters."""
+def _normalize_visualization(value: Optional[str]) -> str:
+    """Return the canonical PDF visualization name."""
+    normalized = str(value or "table").strip().lower().replace("_", " ").replace("-", " ")
+    aliases = {
+        "table": "table",
+        "tabular": "table",
+        "line": "line",
+        "line chart": "line",
+        "area": "area",
+        "area chart": "area",
+        "pie": "pie",
+        "pie chart": "pie",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            "visualization must be one of: table, line, area, pie"
+        )
+    return aliases[normalized]
+
+
+def _chart_column(
+    norm_cols: List[dict],
+    rows: List[dict],
+    requested: Optional[str] = None,
+) -> dict:
+    """Resolve one numeric chart column by key/header, or choose the first."""
+    candidates = []
+    for col in norm_cols:
+        key = col.get("key")
+        if not key or key in {"timestamp", "key", "name", "description"}:
+            continue
+        values = [row.get(key) for row in rows if row.get(key) is not None]
+        if values and all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in values):
+            candidates.append(col)
+
+    if requested:
+        target = str(requested).strip().lower()
+        for col in candidates:
+            if target in {
+                str(col.get("key") or "").strip().lower(),
+                str(col.get("header") or "").strip().lower(),
+            }:
+                return col
+        raise ValueError(f"chart series '{requested}' is not a numeric report column")
+
+    if not candidates:
+        raise ValueError("no numeric report column is available for the requested chart")
+    return candidates[0]
+
+
+def _chart_columns(
+    norm_cols: List[dict],
+    rows: List[dict],
+    requested: Optional[List[str]] = None,
+) -> List[dict]:
+    """Resolve numeric series for line/area charts."""
+    if requested:
+        return [_chart_column(norm_cols, rows, item) for item in requested]
+
+    result = []
+    for col in norm_cols:
+        try:
+            resolved = _chart_column(norm_cols, rows, col.get("key"))
+        except ValueError:
+            continue
+        if resolved not in result:
+            result.append(resolved)
+    if not result:
+        raise ValueError("no numeric report columns are available for the requested chart")
+    return result
+
+
+def _chart_category_key(
+    norm_cols: List[dict],
+    rows: List[dict],
+    requested: Optional[str] = None,
+) -> str:
+    """Resolve a pie-chart category column."""
+    if requested:
+        target = str(requested).strip().lower()
+        for col in norm_cols:
+            if target in {
+                str(col.get("key") or "").strip().lower(),
+                str(col.get("header") or "").strip().lower(),
+            }:
+                return col["key"]
+        raise ValueError(f"chart category '{requested}' is not a report column")
+
+    for key in ("name", "key", "label", "timestamp"):
+        if any(row.get(key) not in (None, "") for row in rows):
+            return key
+    raise ValueError("no category column is available for the pie chart")
+
+
+def _build_chart_image(
+    visualization: str,
+    title: str,
+    columns: List[dict],
+    rows: List[dict],
+    chart_series: Optional[List[str]] = None,
+    chart_category: Optional[str] = None,
+):
+    """Render a chart into an in-memory PNG from verified report rows."""
+    from io import BytesIO
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+    import matplotlib.dates as mdates
+
+    s = _lazy_server()
+    norm_cols = s._normalize_excel_columns(columns)
+    figure = Figure(figsize=(10, 5.8), dpi=160, constrained_layout=True)
+    FigureCanvasAgg(figure)
+    axis = figure.add_subplot(111)
+
+    if visualization in {"line", "area"}:
+        if not any(row.get("timestamp") is not None for row in rows):
+            raise ValueError(
+                f"{visualization} charts require time-series rows with timestamps; "
+                "use intent='key_traffic'"
+            )
+        series_columns = _chart_columns(norm_cols, rows, chart_series)
+        entity_values = {
+            str(row.get("key") or row.get("name") or "").strip()
+            for row in rows
+        }
+        use_entity_labels = len(entity_values - {""}) > 1
+
+        for entity in sorted(entity_values):
+            entity_rows = [
+                row for row in rows
+                if str(row.get("key") or row.get("name") or "").strip() == entity
+            ]
+            entity_rows.sort(key=lambda row: int(row["timestamp"]))
+            x_values = [datetime.fromtimestamp(int(row["timestamp"])) for row in entity_rows]
+            for col in series_columns:
+                y_values = [float(row.get(col["key"]) or 0) for row in entity_rows]
+                label = col["header"]
+                if use_entity_labels and entity:
+                    label = f"{entity} — {label}"
+                line, = axis.plot(x_values, y_values, marker="o", linewidth=1.8, label=label)
+                if visualization == "area":
+                    axis.fill_between(x_values, y_values, 0, color=line.get_color(), alpha=0.20)
+
+        axis.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+        axis.xaxis.set_major_locator(mdates.AutoDateLocator())
+        figure.autofmt_xdate()
+        axis.set_xlabel("Time")
+        axis.set_ylabel("Traffic")
+        axis.grid(True, alpha=0.25)
+        axis.legend(loc="best")
+
+    elif visualization == "pie":
+        series_name = chart_series[0] if chart_series else None
+        value_col = _chart_column(norm_cols, rows, series_name)
+        category_key = _chart_category_key(norm_cols, rows, chart_category)
+        totals: Dict[str, float] = {}
+        for row in rows:
+            category = row.get(category_key)
+            if category_key == "timestamp" and category is not None:
+                category = datetime.fromtimestamp(int(category)).strftime("%H:%M:%S")
+            label = str(category if category not in (None, "") else "Unknown")
+            totals[label] = totals.get(label, 0.0) + max(float(row.get(value_col["key"]) or 0), 0.0)
+        totals = {label: value for label, value in totals.items() if value > 0}
+        if not totals:
+            raise ValueError("pie chart values are all zero")
+        wedges, _, _ = axis.pie(
+            list(totals.values()),
+            startangle=90,
+            autopct=lambda pct: f"{pct:.1f}%" if pct >= 3 else "",
+        )
+        axis.legend(
+            wedges,
+            list(totals.keys()),
+            title=value_col["header"],
+            loc="center left",
+            bbox_to_anchor=(1.0, 0.5),
+        )
+        axis.axis("equal")
+
+    axis.set_title(title)
+    image = BytesIO()
+    figure.savefig(image, format="png", bbox_inches="tight")
+    image.seek(0)
+    return image
+
+
+def _section_flowables(payload: dict, styles) -> list:
+    """Build the reportlab flowables for one report section (table or chart)."""
+    s = _lazy_server()
+    from reportlab.lib.units import inch
+    from reportlab.platypus import Table, Paragraph, Spacer, Image
+
+    title = payload.get("title") or ""
+    subtitle = payload.get("subtitle") or ""
+    visualization = payload.get("visualization") or "table"
+    columns = payload.get("columns") or []
+    rows = payload.get("rows") or []
+
+    story = [Spacer(1, 5)]
+    if title:
+        story.append(Paragraph(title, styles["Heading2"]))
+    if subtitle:
+        story.append(Paragraph(f"<font color='#800080'>{subtitle}</font>", styles["Heading5"]))
+    story.append(Spacer(1, 12))
+
+    if visualization == "table":
+        norm_cols = s._normalize_excel_columns(columns)
+        data = [[c["header"] for c in norm_cols]]
+        for row in rows:
+            data.append(s._excel_row_values(row, norm_cols))
+        table = Table(data, repeatRows=1)
+        table.setStyle(s.trisul_table_style())
+        story.append(table)
+    else:
+        image_data = _build_chart_image(
+            visualization, title, columns, rows,
+            chart_series=payload.get("chart_series"),
+            chart_category=payload.get("chart_category"),
+        )
+        story.append(Image(image_data, width=7.2 * inch, height=4.2 * inch, kind="proportional"))
+    return story
+
+
+def _build_pdf_document(payloads, filename, report_title, from_ts, to_ts) -> str:
+    """Write one PDF where each payload becomes its own page."""
     s = _lazy_server()
     from reportlab.lib.pagesizes import A4
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-    from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, PageBreak
     from reportlab.lib.styles import getSampleStyleSheet
 
-    norm_cols = s._normalize_excel_columns(columns)
-    headers = [c["header"] for c in norm_cols]
-    data = [headers]
-    for row in rows:
-        data.append(s._excel_row_values(row, norm_cols))
-
     filepath = filename if filename.startswith("/tmp/") else f"/tmp/{filename}"
-    pdf = SimpleDocTemplate(filepath, pagesize=A4, leftMargin=15, rightMargin=15, topMargin=55, bottomMargin=50)
+    pdf = SimpleDocTemplate(
+        filepath, pagesize=A4, leftMargin=15, rightMargin=15, topMargin=75, bottomMargin=70,
+    )
     styles = getSampleStyleSheet()
-    story = [Paragraph(title or report_title, styles["Heading2"]), Spacer(1, 12)]
-    if from_ts and to_ts:
-        story.append(Paragraph(s.epoch_to_duration(from_ts, to_ts), styles["Normal"]))
-        story.append(Spacer(1, 12))
 
-    table = Table(data, repeatRows=1)
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-        ("FONTSIZE", (0, 0), (-1, -1), 8),
-    ]))
-    story.append(table)
-    pdf.build(story)
+    story = []
+    for index, payload in enumerate(payloads):
+        story.extend(_section_flowables(payload, styles))
+        if index < len(payloads) - 1:
+            story.append(PageBreak())
+
+    decorator = s.trisul_page_decorator(report_title, from_ts, to_ts)
+    pdf.build(story, onFirstPage=decorator, onLaterPages=decorator)
     return filepath
 
 
-def run_dynamic_report(
+class ReportDataError(Exception):
+    """Raised when a report section cannot be assembled from Trisul data."""
+
+
+def _collect_section_payload(
     counter_group_guid: str,
     intent: str = "auto",
     source: str = "auto",
@@ -1309,7 +1526,327 @@ def run_dynamic_report(
     max_count: Optional[int] = None,
     sort_meter: int = 0,
     row_layout: str = "auto",
+    visualization: str = "table",
+    chart_series: Optional[List[str]] = None,
+    chart_category: Optional[str] = None,
+    columns: Optional[List[dict]] = None,
+    title: Optional[str] = None,
+    subtitle: Optional[str] = None,
+    context: str = "context0",
+    zmq_endpoint: Optional[str] = None,
+    merge_columns: Optional[List[str]] = None,
+    exclude_columns: Optional[List[str]] = None,
+    computed_columns: Optional[List[dict]] = None,
+) -> dict:
+    """Fetch and verify the rows for a single report section (no file written)."""
+    s = _lazy_server()
+    from trisul_ai_cli import trp_pb2
+
+    counter_group_guid = str(counter_group_guid).strip()
+    duration_secs = int(duration_secs)
+    sort_meter = int(sort_meter)
+    visualization = _normalize_visualization(visualization)
+
+    if not zmq_endpoint:
+        ctx = s.normalize_context(context)
+        zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{ctx}/run/trp_0"
+
+    data_type, resolved_source, resolved_layout = _resolve_intent_and_source(
+        intent, source, row_layout, keys, max_count
+    )
+
+    if data_type == DATA_TYPE_TOPPER and not max_count:
+        max_count = 10
+
+    from_ts_val, to_ts_val = s._get_time_window(
+        zmq_endpoint, duration_secs, start_ts, end_ts, start_time, end_time
+    )
+
+    is_flowintfs = counter_group_guid.upper() == s.FLOWINTFS_GUID.upper()
+
+    if meters is None:
+        if is_flowintfs and data_type == DATA_TYPE_TOPPER:
+            inferred_util = _infer_util_meter_refs(columns, computed_columns)
+            if inferred_util:
+                meters = inferred_util
+                logging.info(f"[report_engine] inferred FlowIntfs util meters: {meters}")
+        if meters is None:
+            if resolved_source == "key_timeseries":
+                meters = ["Total", "Into Homenet", "Outof Homenet"]
+                try:
+                    s._resolve_meter_ids(counter_group_guid, meters, zmq_endpoint)
+                except Exception:
+                    meters = ["0", "1", "2"]
+            else:
+                meters = ["0", "1", "2"]
+
+    resolved_meters, cg_group = s._resolve_meter_ids(counter_group_guid, meters, zmq_endpoint)
+    meter_ids = [m["id"] for m in resolved_meters]
+    meters_info = {m["id"]: m for m in resolved_meters}
+
+    if is_flowintfs and meter_ids and all(
+        _is_pct_meter(meters_info[mid]) for mid in meter_ids
+    ):
+        if sort_meter not in meter_ids:
+            sort_meter = 4 if 4 in meter_ids else meter_ids[0]
+    bucket_secs = _bucket_size_secs(cg_group)
+    cg_name = cg_group.get("name", "Counter Group")
+
+    logging.info(
+        f"[report_engine] data_type={data_type} source={resolved_source} "
+        f"layout={resolved_layout} keys={keys} max_count={max_count}"
+    )
+
+    rows: List[dict] = []
+    report_merge = merge_columns
+    key_entries: List[dict] = []
+    stat_bucket_secs = bucket_secs
+    bucket_warning: Optional[str] = None
+
+    if keys:
+        for k in keys:
+            key_entries.append(_search_resolve_key(
+                s.get_response, trp_pb2, zmq_endpoint, counter_group_guid, k
+            ))
+
+    if resolved_source == "key_timeseries":
+        if not key_entries:
+            raise ReportDataError("keys required for key traffic reports.")
+        for i, entry in enumerate(key_entries):
+            user_key = keys[i] if keys and i < len(keys) else entry.get("lookup", "")
+            resp = _fetch_key_timeseries(
+                s.get_response, trp_pb2, zmq_endpoint,
+                counter_group_guid, entry, from_ts_val, to_ts_val, user_key,
+            )
+            if not resp.stats:
+                logging.warning(f"[report_engine] no stats for key {entry['lookup']}")
+                continue
+            stat_bucket_secs = _infer_bucket_secs_from_stats(list(resp.stats), bucket_secs)
+            if stat_bucket_secs != bucket_secs:
+                logging.info(
+                    f"[report_engine] key={entry['lookup']} using stat bucket "
+                    f"{stat_bucket_secs}s (cg bucket {bucket_secs}s)"
+                )
+            rows.extend(
+                _build_timeseries_rows(resp, entry, meter_ids, meters_info, stat_bucket_secs)
+            )
+        bucket_warning = _key_traffic_bucket_warning(
+            cg_group, stat_bucket_secs, duration_secs, len(rows)
+        )
+        if bucket_warning:
+            logging.warning(f"[report_engine] {bucket_warning}")
+
+    elif resolved_source == "topper":
+        mc = int(max_count or 10)
+        if sort_meter not in meters_info:
+            sr, _ = s._resolve_meter_ids(counter_group_guid, [str(sort_meter)], zmq_endpoint)
+            sort_meter = sr[0]["id"] if sr else sort_meter
+
+        topper_keys = _fetch_cg_topper(
+            s.get_response, trp_pb2, zmq_endpoint, counter_group_guid,
+            sort_meter, mc, from_ts_val, to_ts_val,
+            s._is_system_key, s._is_interface_key, s.FLOWINTFS_GUID,
+        )
+        if not topper_keys:
+            raise ReportDataError("No topper keys found.")
+
+        router_names = {}
+        if is_flowintfs:
+            router_keys = {
+                keyt.key.split("_")[0]
+                for keyt in topper_keys
+                if s._is_interface_key(keyt.key)
+            }
+            router_names = s._fetch_router_names(router_keys, zmq_endpoint)
+
+        key_entries = []
+        for keyt in topper_keys:
+            lookup = keyt.readable or keyt.label or keyt.key
+            attrs = s._key_attrs_to_dict(keyt)
+            entry = {
+                "lookup": lookup,
+                "internal_key": keyt.key,
+                "readable": keyt.readable or keyt.key,
+                "label": _clean_key_label(keyt.label) if keyt.label else lookup,
+                "description": attrs.get("snmp.ifalias") or (keyt.description or ""),
+                "attrs": attrs,
+            }
+            if is_flowintfs:
+                entry.update(_flowintf_fields_from_keyt(keyt, attrs, router_names))
+            key_entries.append(entry)
+
+        use_webtrisul_util = is_flowintfs and meter_ids and all(
+            _is_pct_meter(meters_info[mid]) for mid in meter_ids
+        )
+
+        if resolved_layout == "per_key_meter":
+            rows = _build_per_key_meter_rows(
+                s._get_key_meter_stats, s.fmt_volume, s.fmt_bw,
+                counter_group_guid, key_entries, meter_ids, meters_info,
+                from_ts_val, to_ts_val, zmq_endpoint,
+            )
+            report_merge = report_merge or ["name"]
+        elif use_webtrisul_util:
+            bw_meters, _ = s._resolve_meter_ids(
+                counter_group_guid, ["Recv", "Xmit"], zmq_endpoint
+            )
+            bw_meter_ids = [m["id"] for m in bw_meters]
+            bw_meters_info = {m["id"]: m for m in bw_meters}
+            topper_bucket_secs = _topper_bucket_secs(cg_group)
+            logging.info(
+                "[report_engine] FlowIntfs util via webtrisul formula "
+                f"(retro latest Recv/Xmit + ifspeed, crop={topper_bucket_secs}s), "
+                f"bw_meters={bw_meter_ids}"
+            )
+            rows = _build_flowintf_util_rows(
+                s.get_response,
+                trp_pb2,
+                s._get_key_meter_stats,
+                counter_group_guid,
+                key_entries,
+                meters_info,
+                from_ts_val,
+                to_ts_val,
+                zmq_endpoint,
+                bw_meter_ids,
+                bw_meters_info,
+                topper_bucket_secs,
+            )
+            rows.sort(key=lambda r: r.get("_sort_total", 0), reverse=True)
+            for row in rows:
+                row.pop("_sort_total", None)
+        else:
+            rows = _build_aggregate_rows(
+                s._get_key_meter_stats,
+                counter_group_guid,
+                key_entries,
+                meter_ids,
+                meters_info,
+                from_ts_val,
+                to_ts_val,
+                zmq_endpoint,
+            )
+            rows.sort(key=lambda r: r.get("_sort_total", 0), reverse=True)
+            for row in rows:
+                row.pop("_sort_total", None)
+
+    elif resolved_source == "key_stats":
+        if not key_entries:
+            raise ReportDataError("keys required.")
+        if resolved_layout == "per_key_meter":
+            rows = _build_per_key_meter_rows(
+                s._get_key_meter_stats, s.fmt_volume, s.fmt_bw,
+                counter_group_guid, key_entries, meter_ids, meters_info,
+                from_ts_val, to_ts_val, zmq_endpoint,
+            )
+            report_merge = report_merge or ["name"]
+        else:
+            rows = _build_aggregate_rows(
+                s._get_key_meter_stats, counter_group_guid, key_entries,
+                meter_ids, meters_info, from_ts_val, to_ts_val, zmq_endpoint,
+            )
+
+    if not rows:
+        raise ReportDataError("No data rows collected from Trisul.")
+
+    auto_columns = (
+        _flowintf_auto_columns(resolved_meters)
+        if (
+            not columns
+            and data_type == DATA_TYPE_TOPPER
+            and counter_group_guid.upper() == s.FLOWINTFS_GUID.upper()
+        )
+        else _auto_columns(resolved_layout, resolved_meters, data_type)
+    )
+    columns = _finalize_report_columns(
+        auto_columns, columns, exclude_columns, computed_columns,
+    )
+    rows = _apply_column_computations(rows, columns, resolved_meters)
+    columns, report_merge = _normalize_custom_columns(
+        columns, resolved_meters, rows, report_merge,
+    )
+
+    verification = _verify_report(
+        data_type, resolved_source, rows, keys, max_count, from_ts_val, to_ts_val,
+        stat_bucket_secs=stat_bucket_secs if data_type == DATA_TYPE_KEY_TRAFFIC else None,
+        duration_secs=duration_secs if data_type == DATA_TYPE_KEY_TRAFFIC else None,
+        cg_group=cg_group if data_type == DATA_TYPE_KEY_TRAFFIC else None,
+        columns=columns,
+        resolved_meters=resolved_meters,
+    )
+    if not verification["verified"]:
+        logging.warning(f"[report_engine] verification issues: {verification['issues']}")
+
+    if not title:
+        if data_type == DATA_TYPE_KEY_TRAFFIC:
+            key_names = ", ".join(keys or [])
+            title = f"{key_names} Key Traffic — {cg_name}"
+        elif data_type == DATA_TYPE_TOPPER:
+            title = f"Top {len(rows)} {cg_name}"
+        else:
+            title = f"{cg_name} Report"
+
+    column_headers = [c.get("header") or c.get("key") for c in s._normalize_excel_columns(columns)]
+    payload = {
+        "title": title,
+        "subtitle": subtitle,
+        "columns": columns,
+        "rows": rows,
+        "column_headers": column_headers,
+        "visualization": visualization,
+        "chart_series": chart_series,
+        "chart_category": chart_category,
+        "report_merge": report_merge,
+        "data_type": data_type,
+        "source": resolved_source,
+        "row_layout": resolved_layout,
+        "verification": verification,
+        "from_ts": from_ts_val,
+        "to_ts": to_ts_val,
+        "duration": s.epoch_to_duration(from_ts_val, to_ts_val),
+    }
+    if data_type == DATA_TYPE_KEY_TRAFFIC:
+        payload["bucket_interval_secs"] = stat_bucket_secs
+        if bucket_warning:
+            payload["warning"] = bucket_warning
+    return payload
+
+
+def _report_error(exc: Exception) -> dict:
+    """Normalize an exception into the tool's error contract."""
+    logging.error(f"[report_engine] Error: {exc}", exc_info=True)
+    msg = str(exc)
+    if "ZMQ timeout" in msg and "ipc://" in msg:
+        msg = (
+            f"{msg} — no local Trisul TRP on IPC. "
+            "Pass zmq_endpoint (e.g. tcp://host:port) or connect in the CLI first."
+        )
+    return {"status": "error", "message": msg, "file_path": None}
+
+
+def _auto_filename(title: str, ext: str) -> str:
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in title or "report")[:40]
+    return f"report_{safe}_{int(datetime.now().timestamp())}.{ext}"
+
+
+def run_dynamic_report(
+    counter_group_guid: Optional[str] = None,
+    intent: str = "auto",
+    source: str = "auto",
+    keys: Optional[List[str]] = None,
+    meters: Optional[List[str]] = None,
+    duration_secs: int = 3600,
+    start_ts: Optional[int] = None,
+    end_ts: Optional[int] = None,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    max_count: Optional[int] = None,
+    sort_meter: int = 0,
+    row_layout: str = "auto",
     output_format: str = "xlsx",
+    visualization: str = "table",
+    chart_series: Optional[List[str]] = None,
+    chart_category: Optional[str] = None,
     columns: Optional[List[dict]] = None,
     title: Optional[str] = None,
     filename: Optional[str] = None,
@@ -1319,306 +1856,213 @@ def run_dynamic_report(
     merge_columns: Optional[List[str]] = None,
     exclude_columns: Optional[List[str]] = None,
     computed_columns: Optional[List[dict]] = None,
+    sections: Optional[List[dict]] = None,
+    report_title: Optional[str] = None,
 ) -> dict:
     s = _lazy_server()
-    from trisul_ai_cli import trp_pb2
-
     try:
-        counter_group_guid = str(counter_group_guid).strip()
-        duration_secs = int(duration_secs)
-        sort_meter = int(sort_meter)
         output_format = (output_format or "xlsx").lower()
 
-        if not zmq_endpoint:
-            ctx = s.normalize_context(context)
-            zmq_endpoint = f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{ctx}/run/trp_0"
-
-        data_type, resolved_source, resolved_layout = _resolve_intent_and_source(
-            intent, source, row_layout, keys, max_count
-        )
-
-        if data_type == DATA_TYPE_TOPPER and not max_count:
-            max_count = 10
-
-        from_ts_val, to_ts_val = s._get_time_window(
-            zmq_endpoint, duration_secs, start_ts, end_ts, start_time, end_time
-        )
-
-        is_flowintfs = counter_group_guid.upper() == s.FLOWINTFS_GUID.upper()
-
-        if meters is None:
-            if is_flowintfs and data_type == DATA_TYPE_TOPPER:
-                inferred_util = _infer_util_meter_refs(columns, computed_columns)
-                if inferred_util:
-                    meters = inferred_util
-                    logging.info(f"[report_engine] inferred FlowIntfs util meters: {meters}")
-            if meters is None:
-                if resolved_source == "key_timeseries":
-                    meters = ["Total", "Into Homenet", "Outof Homenet"]
-                    try:
-                        s._resolve_meter_ids(counter_group_guid, meters, zmq_endpoint)
-                    except Exception:
-                        meters = ["0", "1", "2"]
-                else:
-                    meters = ["0", "1", "2"]
-
-        resolved_meters, cg_group = s._resolve_meter_ids(counter_group_guid, meters, zmq_endpoint)
-        meter_ids = [m["id"] for m in resolved_meters]
-        meters_info = {m["id"]: m for m in resolved_meters}
-
-        if is_flowintfs and meter_ids and all(
-            _is_pct_meter(meters_info[mid]) for mid in meter_ids
-        ):
-            if sort_meter not in meter_ids:
-                sort_meter = 4 if 4 in meter_ids else meter_ids[0]
-        bucket_secs = _bucket_size_secs(cg_group)
-        cg_name = cg_group.get("name", "Counter Group")
-
-        logging.info(
-            f"[report_engine] data_type={data_type} source={resolved_source} "
-            f"layout={resolved_layout} keys={keys} max_count={max_count}"
-        )
-
-        rows: List[dict] = []
-        report_merge = merge_columns
-        key_entries: List[dict] = []
-        stat_bucket_secs = bucket_secs
-        bucket_warning: Optional[str] = None
-
-        if keys:
-            for k in keys:
-                key_entries.append(_search_resolve_key(
-                    s.get_response, trp_pb2, zmq_endpoint, counter_group_guid, k
-                ))
-
-        if resolved_source == "key_timeseries":
-            if not key_entries:
-                return {"status": "error", "message": "keys required for key traffic reports.", "file_path": None}
-            for i, entry in enumerate(key_entries):
-                user_key = keys[i] if keys and i < len(keys) else entry.get("lookup", "")
-                resp = _fetch_key_timeseries(
-                    s.get_response, trp_pb2, zmq_endpoint,
-                    counter_group_guid, entry, from_ts_val, to_ts_val, user_key,
-                )
-                if not resp.stats:
-                    logging.warning(f"[report_engine] no stats for key {entry['lookup']}")
-                    continue
-                stat_bucket_secs = _infer_bucket_secs_from_stats(list(resp.stats), bucket_secs)
-                if stat_bucket_secs != bucket_secs:
-                    logging.info(
-                        f"[report_engine] key={entry['lookup']} using stat bucket "
-                        f"{stat_bucket_secs}s (cg bucket {bucket_secs}s)"
-                    )
-                rows.extend(
-                    _build_timeseries_rows(resp, entry, meter_ids, meters_info, stat_bucket_secs)
-                )
-            bucket_warning = _key_traffic_bucket_warning(
-                cg_group, stat_bucket_secs, duration_secs, len(rows)
-            )
-            if bucket_warning:
-                logging.warning(f"[report_engine] {bucket_warning}")
-
-        elif resolved_source == "topper":
-            mc = int(max_count or 10)
-            if sort_meter not in meters_info:
-                sr, _ = s._resolve_meter_ids(counter_group_guid, [str(sort_meter)], zmq_endpoint)
-                sort_meter = sr[0]["id"] if sr else sort_meter
-
-            topper_keys = _fetch_cg_topper(
-                s.get_response, trp_pb2, zmq_endpoint, counter_group_guid,
-                sort_meter, mc, from_ts_val, to_ts_val,
-                s._is_system_key, s._is_interface_key, s.FLOWINTFS_GUID,
-            )
-            if not topper_keys:
-                return {"status": "error", "message": "No topper keys found.", "file_path": None}
-
-            router_names = {}
-            if is_flowintfs:
-                router_keys = {
-                    keyt.key.split("_")[0]
-                    for keyt in topper_keys
-                    if s._is_interface_key(keyt.key)
-                }
-                router_names = s._fetch_router_names(router_keys, zmq_endpoint)
-
-            key_entries = []
-            for keyt in topper_keys:
-                lookup = keyt.readable or keyt.label or keyt.key
-                attrs = s._key_attrs_to_dict(keyt)
-                entry = {
-                    "lookup": lookup,
-                    "internal_key": keyt.key,
-                    "readable": keyt.readable or keyt.key,
-                    "label": _clean_key_label(keyt.label) if keyt.label else lookup,
-                    "description": attrs.get("snmp.ifalias") or (keyt.description or ""),
-                    "attrs": attrs,
-                }
-                if is_flowintfs:
-                    entry.update(_flowintf_fields_from_keyt(keyt, attrs, router_names))
-                key_entries.append(entry)
-
-            use_webtrisul_util = is_flowintfs and meter_ids and all(
-                _is_pct_meter(meters_info[mid]) for mid in meter_ids
+        if sections:
+            return _run_multi_section_report(
+                sections=sections,
+                report_title=report_title or title,
+                filename=filename,
+                output_format=output_format,
+                counter_group_guid=counter_group_guid,
+                duration_secs=duration_secs,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                start_time=start_time,
+                end_time=end_time,
+                context=context,
+                zmq_endpoint=zmq_endpoint,
             )
 
-            if resolved_layout == "per_key_meter":
-                rows = _build_per_key_meter_rows(
-                    s._get_key_meter_stats, s.fmt_volume, s.fmt_bw,
-                    counter_group_guid, key_entries, meter_ids, meters_info,
-                    from_ts_val, to_ts_val, zmq_endpoint,
-                )
-                report_merge = report_merge or ["name"]
-            elif use_webtrisul_util:
-                bw_meters, _ = s._resolve_meter_ids(
-                    counter_group_guid, ["Recv", "Xmit"], zmq_endpoint
-                )
-                bw_meter_ids = [m["id"] for m in bw_meters]
-                bw_meters_info = {m["id"]: m for m in bw_meters}
-                topper_bucket_secs = _topper_bucket_secs(cg_group)
-                logging.info(
-                    "[report_engine] FlowIntfs util via webtrisul formula "
-                    f"(retro latest Recv/Xmit + ifspeed, crop={topper_bucket_secs}s), "
-                    f"bw_meters={bw_meter_ids}"
-                )
-                rows = _build_flowintf_util_rows(
-                    s.get_response,
-                    trp_pb2,
-                    s._get_key_meter_stats,
-                    counter_group_guid,
-                    key_entries,
-                    meters_info,
-                    from_ts_val,
-                    to_ts_val,
-                    zmq_endpoint,
-                    bw_meter_ids,
-                    bw_meters_info,
-                    topper_bucket_secs,
-                )
-                rows.sort(key=lambda r: r.get("_sort_total", 0), reverse=True)
-                for row in rows:
-                    row.pop("_sort_total", None)
-            else:
-                rows = _build_aggregate_rows(
-                    s._get_key_meter_stats,
-                    counter_group_guid,
-                    key_entries,
-                    meter_ids,
-                    meters_info,
-                    from_ts_val,
-                    to_ts_val,
-                    zmq_endpoint,
-                )
-                rows.sort(key=lambda r: r.get("_sort_total", 0), reverse=True)
-                for row in rows:
-                    row.pop("_sort_total", None)
+        visualization = _normalize_visualization(visualization)
+        if visualization != "table" and output_format != "pdf":
+            raise ValueError("line, area, and pie visualizations require output_format='pdf'")
+        if not counter_group_guid:
+            raise ValueError("counter_group_guid is required (or pass sections=[...])")
 
-        elif resolved_source == "key_stats":
-            if not key_entries:
-                return {"status": "error", "message": "keys required.", "file_path": None}
-            if resolved_layout == "per_key_meter":
-                rows = _build_per_key_meter_rows(
-                    s._get_key_meter_stats, s.fmt_volume, s.fmt_bw,
-                    counter_group_guid, key_entries, meter_ids, meters_info,
-                    from_ts_val, to_ts_val, zmq_endpoint,
-                )
-                report_merge = report_merge or ["name"]
-            else:
-                rows = _build_aggregate_rows(
-                    s._get_key_meter_stats, counter_group_guid, key_entries,
-                    meter_ids, meters_info, from_ts_val, to_ts_val, zmq_endpoint,
-                )
-
-        if not rows:
-            return {"status": "error", "message": "No data rows collected from Trisul.", "file_path": None}
-
-        auto_columns = (
-            _flowintf_auto_columns(resolved_meters)
-            if (
-                not columns
-                and data_type == DATA_TYPE_TOPPER
-                and counter_group_guid.upper() == s.FLOWINTFS_GUID.upper()
-            )
-            else _auto_columns(resolved_layout, resolved_meters, data_type)
-        )
-        columns = _finalize_report_columns(
-            auto_columns, columns, exclude_columns, computed_columns,
-        )
-        rows = _apply_column_computations(rows, columns, resolved_meters)
-        columns, report_merge = _normalize_custom_columns(
-            columns, resolved_meters, rows, report_merge,
-        )
-
-        verification = _verify_report(
-            data_type, resolved_source, rows, keys, max_count, from_ts_val, to_ts_val,
-            stat_bucket_secs=stat_bucket_secs if data_type == DATA_TYPE_KEY_TRAFFIC else None,
-            duration_secs=duration_secs if data_type == DATA_TYPE_KEY_TRAFFIC else None,
-            cg_group=cg_group if data_type == DATA_TYPE_KEY_TRAFFIC else None,
+        payload = _collect_section_payload(
+            counter_group_guid=counter_group_guid,
+            intent=intent,
+            source=source,
+            keys=keys,
+            meters=meters,
+            duration_secs=duration_secs,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            start_time=start_time,
+            end_time=end_time,
+            max_count=max_count,
+            sort_meter=sort_meter,
+            row_layout=row_layout,
+            visualization=visualization,
+            chart_series=chart_series,
+            chart_category=chart_category,
             columns=columns,
-            resolved_meters=resolved_meters,
+            title=title,
+            context=context,
+            zmq_endpoint=zmq_endpoint,
+            merge_columns=merge_columns,
+            exclude_columns=exclude_columns,
+            computed_columns=computed_columns,
         )
-        if not verification["verified"]:
-            logging.warning(f"[report_engine] verification issues: {verification['issues']}")
-
-        if not title:
-            if data_type == DATA_TYPE_KEY_TRAFFIC:
-                key_names = ", ".join(keys or [])
-                title = f"{key_names} Key Traffic — {cg_name}"
-            elif data_type == DATA_TYPE_TOPPER:
-                title = f"Top {len(rows)} {cg_name}"
-            else:
-                title = f"{cg_name} Report"
 
         ext = "pdf" if output_format == "pdf" else "xlsx"
-        if not filename:
-            safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in title)[:40]
-            filename = f"report_{safe}_{int(datetime.now().timestamp())}.{ext}"
+        filename = filename or _auto_filename(payload["title"], ext)
 
         if output_format == "pdf":
-            filepath = _build_pdf_table(title, columns, rows, from_ts_val, to_ts_val, filename, title)
+            filepath = _build_pdf_document(
+                [payload], filename, payload["title"],
+                payload["from_ts"], payload["to_ts"],
+            )
         else:
             filepath = s._build_excel_report(
-                columns=columns, rows=rows, title=title,
-                from_ts=from_ts_val, to_ts=to_ts_val, filename=filename,
-                sheet_name=sheet_name, merge_columns=report_merge,
+                columns=payload["columns"], rows=payload["rows"], title=payload["title"],
+                from_ts=payload["from_ts"], to_ts=payload["to_ts"], filename=filename,
+                sheet_name=sheet_name, merge_columns=payload["report_merge"],
             )
 
         if not os.path.isfile(filepath):
             return {"status": "error", "message": f"File not written: {filepath}", "file_path": None}
 
-        column_headers = [c.get("header") or c.get("key") for c in s._normalize_excel_columns(columns)]
+        column_headers = payload["column_headers"]
         result = {
             "status": "success",
             "message": f"Report generated at {filepath}",
             "file_path": filepath,
-            "row_count": len(rows),
+            "row_count": len(payload["rows"]),
             "columns": column_headers,
-            "data_type": data_type,
-            "source": resolved_source,
-            "row_layout": resolved_layout,
+            "data_type": payload["data_type"],
+            "source": payload["source"],
+            "row_layout": payload["row_layout"],
             "output_format": output_format,
-            "verification": verification,
-            "duration": s.epoch_to_duration(from_ts_val, to_ts_val),
+            "visualization": payload["visualization"],
+            "verification": payload["verification"],
+            "duration": payload["duration"],
             "reply_guidance": (
-                "When confirming to the user, quote the `columns` list above EXACTLY — "
-                f"in this order: {', '.join(column_headers)}. "
-                "Do not claim a different column order or duplicate columns."
+                f"Confirm that the PDF uses the '{payload['visualization']}' visualization. "
+                "The source columns are, in this exact order: "
+                f"{', '.join(column_headers)}. "
+                "Do not describe a chart as a table or claim a different visualization."
             ),
         }
-        if data_type == DATA_TYPE_KEY_TRAFFIC:
-            result["bucket_interval_secs"] = stat_bucket_secs
-            if bucket_warning:
-                result["warning"] = bucket_warning
+        if payload["data_type"] == DATA_TYPE_KEY_TRAFFIC:
+            result["bucket_interval_secs"] = payload.get("bucket_interval_secs")
+            if payload.get("warning"):
+                result["warning"] = payload["warning"]
         return result
 
     except Exception as e:
-        logging.error(f"[report_engine] Error: {e}", exc_info=True)
-        msg = str(e)
-        if "ZMQ timeout" in msg and "ipc://" in msg:
-            msg = (
-                f"{msg} — no local Trisul TRP on IPC. "
-                "Pass zmq_endpoint (e.g. tcp://host:port) or connect in the CLI first."
+        return _report_error(e)
+
+
+def _run_multi_section_report(
+    sections: List[dict],
+    report_title: Optional[str] = None,
+    filename: Optional[str] = None,
+    output_format: str = "pdf",
+    counter_group_guid: Optional[str] = None,
+    duration_secs: int = 3600,
+    start_ts: Optional[int] = None,
+    end_ts: Optional[int] = None,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    context: str = "context0",
+    zmq_endpoint: Optional[str] = None,
+) -> dict:
+    """Build one multi-page PDF where each section is fetched and verified server-side."""
+    if output_format != "pdf":
+        raise ValueError("sections require output_format='pdf'")
+    if not isinstance(sections, (list, tuple)) or not sections:
+        raise ValueError("sections must be a non-empty list of section specs")
+
+    shared = {
+        "counter_group_guid": counter_group_guid,
+        "duration_secs": duration_secs,
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+        "start_time": start_time,
+        "end_time": end_time,
+        "context": context,
+        "zmq_endpoint": zmq_endpoint,
+    }
+    allowed = {
+        "counter_group_guid", "intent", "source", "keys", "meters", "duration_secs",
+        "start_ts", "end_ts", "start_time", "end_time", "max_count", "sort_meter",
+        "row_layout", "visualization", "chart_series", "chart_category", "columns",
+        "title", "subtitle", "context", "zmq_endpoint", "merge_columns",
+        "exclude_columns", "computed_columns",
+    }
+
+    payloads: List[dict] = []
+    for index, raw_section in enumerate(sections, start=1):
+        if not isinstance(raw_section, dict):
+            raise ValueError(f"section {index} must be an object")
+        unknown = set(raw_section) - allowed
+        if unknown:
+            raise ValueError(
+                f"section {index} has unsupported fields: {', '.join(sorted(unknown))}"
             )
-        return {"status": "error", "message": msg, "file_path": None}
+        spec = {k: v for k, v in shared.items() if v is not None}
+        spec.update({k: v for k, v in raw_section.items() if v is not None})
+        if not spec.get("counter_group_guid"):
+            raise ValueError(f"section {index} is missing counter_group_guid")
+
+        logging.info(
+            f"[report_engine] section {index}/{len(sections)} "
+            f"guid={spec['counter_group_guid']} intent={spec.get('intent', 'auto')} "
+            f"visualization={spec.get('visualization', 'table')}"
+        )
+        try:
+            payloads.append(_collect_section_payload(**spec))
+        except ReportDataError as exc:
+            raise ReportDataError(f"section {index} ({spec.get('title') or 'untitled'}): {exc}")
+
+    from_ts = min(p["from_ts"] for p in payloads)
+    to_ts = max(p["to_ts"] for p in payloads)
+    report_title = report_title or payloads[0]["title"]
+    filename = filename or _auto_filename(report_title, "pdf")
+
+    filepath = _build_pdf_document(payloads, filename, report_title, from_ts, to_ts)
+    if not os.path.isfile(filepath):
+        return {"status": "error", "message": f"File not written: {filepath}", "file_path": None}
+
+    s = _lazy_server()
+    section_summaries = [
+        {
+            "page": index,
+            "title": p["title"],
+            "visualization": p["visualization"],
+            "data_type": p["data_type"],
+            "row_count": len(p["rows"]),
+            "columns": p["column_headers"],
+            "verification": p["verification"],
+        }
+        for index, p in enumerate(payloads, start=1)
+    ]
+    guidance = "; ".join(
+        f"page {sec['page']} is a {sec['visualization']} of {sec['title']}"
+        for sec in section_summaries
+    )
+    return {
+        "status": "success",
+        "message": f"Report generated at {filepath}",
+        "file_path": filepath,
+        "output_format": "pdf",
+        "page_count": len(payloads),
+        "sections": section_summaries,
+        "row_count": sum(len(p["rows"]) for p in payloads),
+        "duration": s.epoch_to_duration(from_ts, to_ts),
+        "reply_guidance": (
+            f"This is ONE PDF with {len(payloads)} pages: {guidance}. "
+            "Report a single file path and describe each page's visualization exactly. "
+            "Do not claim separate files were created."
+        ),
+    }
 
 
 def run_dynamic_excel_report(**kwargs) -> dict:

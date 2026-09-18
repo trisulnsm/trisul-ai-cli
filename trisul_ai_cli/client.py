@@ -749,6 +749,17 @@ class TrisulAIClient:
             return query
         return f"{query}\n\n[SYSTEM: {' '.join(hints)}]"
 
+    def _chart_kind(self, q: str, for_topper: bool = False) -> str:
+        """Pick the PDF chart type named in the query, else one that fits the data shape."""
+        if re.search(r"\bpie\b|\bdistribution\b|\bbreakdown\b|\bshare\b", q):
+            return "pie"
+        if re.search(r"\barea\b|\bstacked\b|\bfilled\b", q):
+            return "area"
+        if re.search(r"\bline\b|\btrend\b|\bover time\b", q):
+            return "line"
+        # Toppers are aggregates with no time axis, so a pie is the only chart that fits.
+        return "pie" if for_topper else "line"
+
     def _report_query_hints(self, query: str) -> str:
         """Derive server-side report routing hints from natural language."""
         q = (query or "").lower()
@@ -766,20 +777,63 @@ class TrisulAIClient:
             and "topper" not in q
         )
         is_topper = bool(re.search(r"\btop\s+\d+\b", q)) or "topper" in q or "top " in q
+        wants_table = bool(re.search(r"\btables?\b|\btabular\b", q))
+        wants_chart = bool(
+            re.search(r"\b(?:chart|graph|plot)s?\b", q) or "traffic trend" in q
+        )
+        is_multi_section = (wants_table and wants_chart) or (
+            is_topper and is_key_traffic and wants_chart
+        )
 
-        if is_key_traffic and not is_topper:
+        if is_multi_section:
+            # Compound request: each part becomes its own page, with its own
+            # intent and visualization. A single global route would force one
+            # wrong visualization onto every section.
+            specs = []
+            if is_topper:
+                specs.append(
+                    '{intent:"topper", max_count:N, visualization:"%s"}'
+                    % (self._chart_kind(q, for_topper=True) if not wants_table else "table")
+                )
+            if is_key_traffic or wants_chart:
+                specs.append(
+                    '{intent:"key_traffic", keys:[...], visualization:"%s"}'
+                    % self._chart_kind(q, for_topper=False)
+                )
             hints.append(
-                'REPORT ROUTE: intent="key_traffic", keys=[...], use generate_dynamic_report. '
-                "Do NOT use source=topper or max_count. One row per time bucket (COUNTER_ITEM)."
+                'REPORT ROUTE: this request needs ONE multi-page PDF. Call '
+                'generate_dynamic_report EXACTLY ONCE with output_format="pdf" and '
+                f'sections=[{", ".join(specs)}]. '
+                "Each section keeps its own intent and visualization — a key_traffic "
+                "section must NOT be turned into a topper. Do not call the tool twice "
+                "and do not create separate files."
             )
-        elif is_topper:
-            hints.append(
-                'REPORT ROUTE: intent="topper", max_count=N, use generate_dynamic_report. '
-                "Do NOT use intent=key_traffic."
-            )
+        else:
+            if is_key_traffic and not is_topper:
+                hints.append(
+                    'REPORT ROUTE: intent="key_traffic", keys=[...], use generate_dynamic_report. '
+                    "Do NOT use source=topper or max_count. One row per time bucket (COUNTER_ITEM)."
+                )
+            elif is_topper:
+                hints.append(
+                    'REPORT ROUTE: intent="topper", max_count=N, use generate_dynamic_report. '
+                    "Do NOT use intent=key_traffic."
+                )
 
-        if "pdf" in q:
-            hints.append('output_format="pdf" on generate_dynamic_report.')
+            if wants_chart:
+                visualization = self._chart_kind(
+                    q, for_topper=is_topper and not is_key_traffic
+                )
+                hints.append(
+                    f'PDF VISUALIZATION: set output_format="pdf" and '
+                    f'visualization="{visualization}" on generate_dynamic_report. '
+                    "Do not substitute a table and do not call a separate UI chart tool."
+                )
+            elif "pdf" in q:
+                hints.append(
+                    'Set output_format="pdf" and visualization="table" on '
+                    "generate_dynamic_report."
+                )
 
         from trisul_ai_cli.time_utils import extract_time_range_from_query
 
