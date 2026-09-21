@@ -2,7 +2,9 @@ import warnings
 warnings.filterwarnings("ignore",category=FutureWarning,module="google.api_core")
 
 import asyncio
+import base64
 import json
+import mimetypes
 from contextlib import AsyncExitStack
 from typing import Any, Dict, List, Optional
 import nest_asyncio
@@ -1000,7 +1002,9 @@ class TrisulAIClient:
                 f"Connect first, e.g. `connect to {endpoint_hint}`, then retry the report."
             )
         if self.verified_report_path and os.path.isfile(self.verified_report_path):
-            if self.verified_report_path not in content:
+            if api_mode:
+                content = content.replace(self.verified_report_path, "the downloadable report")
+            elif self.verified_report_path not in content:
                 suffix = f"Excel report saved to `{self.verified_report_path}`."
                 content = f"{content}\n\n{suffix}" if content else suffix
         if self.dashboard_path and os.path.isfile(self.dashboard_path):
@@ -1187,6 +1191,39 @@ class TrisulAIClient:
             "List the modules that were included. Do not print the JSON contents."
         )
         return json.dumps(sanitized)
+
+    def _api_tool_result_for_report(self, json_result, tool_result_text: str) -> str:
+        """Hide the AI server path while preserving report metadata for the model."""
+        if not json_result or json_result.get("status") != "success":
+            return tool_result_text
+
+        sanitized = {
+            k: v
+            for k, v in json_result.items()
+            if k not in ("file_path", "message", "reply_guidance")
+        }
+        sanitized["message"] = "Report generated successfully and is available for download."
+        return json.dumps(sanitized)
+
+    def _api_report_file(self) -> Optional[dict]:
+        """Encode the verified report into the API JSON so servers need no shared disk."""
+        file_path = self.verified_report_path
+        if not file_path or not os.path.isfile(file_path):
+            return None
+
+        path = Path(file_path)
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        try:
+            content = base64.b64encode(path.read_bytes()).decode("ascii")
+        except OSError as exc:
+            logging.warning(f"[Client] Could not read generated report {file_path}: {exc}")
+            return None
+
+        return {
+            "filename": path.name,
+            "content_type": content_type,
+            "content_base64": content,
+        }
 
     def _open_report_file(self, file_path: str) -> bool:
         """Open a generated report with the OS default application."""
@@ -1606,6 +1643,7 @@ class TrisulAIClient:
                     "tool_calls": collected_tool_calls,
                     "chart_data": chart_data,
                     "table_data": table_data,
+                    "report_file": self._api_report_file(),
                     "dashboard_json": self.dashboard_json,
                     "dashboard_filename": self.dashboard_filename,
                 }
@@ -1675,6 +1713,20 @@ class TrisulAIClient:
                     tool_result_text, tool_result_json = self._handle_report_tool_result(
                         function_name, tool_result_json, tool_result_text
                     )
+
+                    if function_name in self.REPORT_GENERATION_TOOLS:
+                        tool_result_text = self._api_tool_result_for_report(
+                            tool_result_json, tool_result_text
+                        )
+                        if isinstance(tool_result_json, dict) and tool_result_json.get("status") == "success":
+                            tool_result_json = {
+                                k: v
+                                for k, v in tool_result_json.items()
+                                if k not in ("file_path", "message", "reply_guidance")
+                            }
+                            tool_result_json["message"] = (
+                                "Report generated successfully and is available for download."
+                            )
 
                     if function_name == "generate_dashboard_json":
                         self._record_dashboard_file(tool_result_json, tool_result_text)
@@ -1760,6 +1812,7 @@ class TrisulAIClient:
             "tool_calls": collected_tool_calls,
             "chart_data": chart_data,
             "table_data": table_data,
+            "report_file": self._api_report_file(),
             "dashboard_json": self.dashboard_json,
             "dashboard_filename": self.dashboard_filename,
         }

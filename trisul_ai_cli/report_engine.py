@@ -1355,6 +1355,30 @@ def _chart_category_key(
     raise ValueError("no category column is available for the pie chart")
 
 
+def _compact_volume_unit(units: Optional[str]) -> str:
+    """Map volume units like Bytes/Bps onto a compact suffix (B)."""
+    compact = str(units or "").replace("ps", "").strip()
+    aliases = {"bytes": "B", "byte": "B", "bits": "b", "bit": "b"}
+    return aliases.get(compact.lower(), compact)
+
+
+def _format_chart_value(value: float, fmt: Optional[str], fmt_args: Optional[dict]) -> str:
+    """Format a pie-slice value with compact units, e.g. 8.17 MB."""
+    s = _lazy_server()
+    fmt_args = fmt_args or {}
+    if fmt == "volume":
+        prefix = s.fmt_prefix_2(value)
+        unit = _compact_volume_unit(fmt_args.get("units"))
+        if prefix == "0" or not unit:
+            return prefix
+        if prefix[-1].isalpha():
+            return f"{prefix}{unit}"
+        return f"{prefix} {unit}"
+    if fmt in (None, "", "text", "number"):
+        return s.fmt_prefix_10(value) if abs(value) >= 1000 else f"{value:,.0f}"
+    return str(s._format_excel_value(value, fmt, fmt_args))
+
+
 def _build_chart_image(
     visualization: str,
     title: str,
@@ -1426,10 +1450,21 @@ def _build_chart_image(
         totals = {label: value for label, value in totals.items() if value > 0}
         if not totals:
             raise ValueError("pie chart values are all zero")
+        grand_total = sum(totals.values())
+        value_fmt = value_col.get("format")
+        value_fmt_args = value_col.get("format_args")
+
+        def _slice_label(pct: float) -> str:
+            if pct < 3:
+                return ""
+            value = grand_total * pct / 100.0
+            return f"{_format_chart_value(value, value_fmt, value_fmt_args)}\n({pct:.1f}%)"
+
         wedges, _, _ = axis.pie(
             list(totals.values()),
             startangle=90,
-            autopct=lambda pct: f"{pct:.1f}%" if pct >= 3 else "",
+            autopct=_slice_label,
+            textprops={"fontsize": 8},
         )
         axis.legend(
             wedges,

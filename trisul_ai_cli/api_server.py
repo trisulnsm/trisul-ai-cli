@@ -115,12 +115,19 @@ class TableData(BaseModel):
     rows: List[List[Any]]
 
 
+class ReportFile(BaseModel):
+    filename: str
+    content_type: str
+    content_base64: str
+
+
 class QueryResponse(BaseModel):
     status: str        # "success" | "error"
     answer: Optional[str] = None   # AI text (Q&A or summary fallback)
     tool_calls: List[ToolCallRecord] = []
     chart_data: Optional[ChartData] = None
     table_data: Optional[TableData] = None
+    report_file: Optional[ReportFile] = None  # complete file embedded for cross-server browser download
     dashboard_json: Optional[str] = None  # raw dashboard package JSON string for UI download
     dashboard_filename: Optional[str] = None
     message: Optional[str] = None  # error message when status == "error"
@@ -177,6 +184,8 @@ async def query(req: QueryRequest):
       answer is returned in the `answer` field.
     - `chart_data` is populated when a chart tool was invoked so the caller
       can render the chart directly.
+    - `report_file` contains a generated XLSX/PDF as base64 so WebTrisul can
+      return it to the browser without sharing a filesystem with this server.
     - `dashboard_json` is populated when a dashboard package was generated so
       the Web UI can offer a client-side download without exposing server paths.
     """
@@ -202,10 +211,12 @@ async def query(req: QueryRequest):
         num_tools = len(result.get("tool_calls", []))
         has_chart = "yes" if result.get("chart_data") else "no"
         has_table = "yes" if result.get("table_data") else "no"
+        has_report = "yes" if result.get("report_file") else "no"
         has_dashboard = "yes" if result.get("dashboard_json") else "no"
         logging.info(
             f"[API] Query processed: status={status}, ans_len={ans_len}, "
-            f"tool_calls={num_tools}, chart={has_chart}, table={has_table}, dashboard={has_dashboard}"
+            f"tool_calls={num_tools}, chart={has_chart}, table={has_table}, "
+            f"report={has_report}, dashboard={has_dashboard}"
         )
 
     except Exception as e:
@@ -235,6 +246,11 @@ async def query(req: QueryRequest):
                 rows=result["table_data"].get("rows", []) if isinstance(result["table_data"], dict) else []
             )
             if result.get("table_data")
+            else None
+        ),
+        report_file=(
+            ReportFile(**result["report_file"])
+            if result.get("report_file")
             else None
         ),
         dashboard_json=result.get("dashboard_json"),
