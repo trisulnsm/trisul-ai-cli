@@ -24,20 +24,14 @@ from pydantic import BaseModel
 import uvicorn
 
 from trisul_ai_cli.client import TrisulAIClient
+from trisul_ai_cli.runtime_env import configure_logging, uvicorn_log_config
 from importlib.metadata import version as pkg_version
-import os
-from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
 # Logging configuration: ensure we capture logs in the same file as CLI/Server
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    filename=Path(os.getcwd()) / "trisul_ai_cli.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    force=True
-)
+configure_logging()
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +49,13 @@ async def lifespan(app: FastAPI):
     _client = TrisulAIClient()
     await _client.connect_to_server("trisul_ai_cli.server")
     logging.info("[API] MCP server connected.")
+    if _client.llm_factory.is_configured():
+        logging.info("[API] LLM configuration loaded.")
+    else:
+        logging.warning(
+            "[API] LLM is not configured. /api/health is available. "
+            "Queries return an error until the LLM is configured."
+        )
     yield
     # Shutdown
     if _client:
@@ -142,10 +143,12 @@ class QueryResponse(BaseModel):
 async def health():
     """Liveness check. Returns server version and MCP connection status."""
     connected = _client is not None and _client.session is not None
+    llm_configured = _client is not None and _client.llm_factory.is_configured()
     return {
         "status": "ok",
         "version": pkg_version("trisul_ai_cli"),
         "mcp_connected": connected,
+        "llm_configured": llm_configured,
     }
 
 
@@ -275,15 +278,24 @@ def start_server(
     protocol = "https" if ssl_keyfile and ssl_certfile else "http"
     mode = "HTTPS" if protocol == "https" else "HTTP"
 
-    print(f"\n🚀 Trisul AI REST API starting in {mode} mode on {protocol}://{host}:{port}")
-    print(f"   Interactive docs: {protocol}://{host}:{port}/docs")
-    print(f"   Health check:     {protocol}://{host}:{port}/api/health\n")
-    
+    log_file = configure_logging()
+    logging.info(
+        "Trisul AI REST API starting in %s mode on %s://%s:%s",
+        mode,
+        protocol,
+        host,
+        port,
+    )
+    logging.info("Interactive docs: %s://%s:%s/docs", protocol, host, port)
+    logging.info("Health check: %s://%s:%s/api/health", protocol, host, port)
+    logging.info("Log file: %s", log_file)
+
     uvicorn.run(
         "trisul_ai_cli.api_server:app",
         host=host,
         port=port,
         log_level=log_level,
+        log_config=uvicorn_log_config(log_file),
         loop="asyncio",
         ssl_keyfile=ssl_keyfile,
         ssl_certfile=ssl_certfile,

@@ -29,14 +29,10 @@ from dotenv import dotenv_values
 from pathlib import Path
 from trisul_ai_cli.llm_factory import LLMFactory
 from trisul_ai_cli import dashboard_builder
+from trisul_ai_cli.runtime_env import chroma_store_path, configure_logging, env_file_path
 
 
-logging.basicConfig(
-    filename= Path(os.getcwd()) / "trisul_ai_cli.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    force=True
-)
+configure_logging()
 
 
 global _global_zmq_context
@@ -47,6 +43,8 @@ mcp = FastMCP(name="trisul-mcp-server")
 
 FLOWINTFS_GUID = "{C0B04CA7-95FA-44EF-8475-3835F3314761}"
 FLOWGENS_GUID = "{2314BB8E-2BCC-4B86-8AA2-677E5554C0FE}"
+DOMAIN_ZMQ_ENDPOINT = "ipc:///usr/local/var/lib/trisul-hub/domain0/run/ctl_local_req.hub0"
+TRISUL_CONFIG_ROOT = "/usr/local/var/lib/trisul-config/domain0"
 
 # Helper functions
 
@@ -128,6 +126,335 @@ def _filter_zmq_endpoint(context, zmq_endpoint):
         return zmq_endpoint
     ctx = normalize_context(context)
     return f"ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/{ctx}/run/trp_0"
+
+
+def _tv_sec(ts):
+    if ts is None:
+        return None
+    try:
+        return int(ts.tv_sec)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _iso_from_tv_sec(tv_sec):
+    if tv_sec is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(tv_sec), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except (OSError, OverflowError, TypeError, ValueError):
+        return None
+
+
+def _interval_dict(tint):
+    if tint is None:
+        return None
+    from_sec = _tv_sec(getattr(tint, "from", None))
+    to_sec = _tv_sec(getattr(tint, "to", None))
+    if from_sec is None and to_sec is None:
+        return None
+    return {
+        "from_ts": from_sec,
+        "to_ts": to_sec,
+        "from": _iso_from_tv_sec(from_sec),
+        "to": _iso_from_tv_sec(to_sec),
+    }
+
+
+def _fmt_bytes(n):
+    if n is None:
+        return None
+    try:
+        value = float(n)
+    except (TypeError, ValueError):
+        return None
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    idx = 0
+    while value >= 1024 and idx < len(units) - 1:
+        value /= 1024.0
+        idx += 1
+    if idx == 0:
+        return f"{int(value)} {units[idx]}"
+    return f"{value:.2f} {units[idx]}"
+
+
+def _trisul_context_name(context_name):
+    """Map tool/UI names (context0, context_XYZ) to the Trisul context name (default, XYZ)."""
+    if not context_name:
+        return None
+    name = str(context_name).strip()
+    if not name:
+        return None
+    if name in ("context0", "context_default"):
+        return "default"
+    if name.startswith("context_"):
+        return name.split("_", 1)[-1]
+    return name
+
+
+def _enum_name(enum_cls, value):
+    try:
+        return enum_cls.Name(int(value))
+    except Exception:
+        return str(value)
+
+
+def _domain_message(command, destination_node="hub0"):
+    req = trp_pb2.Message()
+    req.trp_command = command
+    if destination_node:
+        req.destination_node = destination_node
+    return req
+
+
+def _response_items(resp, nested_field=None, repeated_field="items"):
+    raw = getattr(resp, repeated_field, None)
+    if raw is None and nested_field and hasattr(resp, nested_field):
+        raw = getattr(getattr(resp, nested_field), repeated_field, None)
+    return list(raw or [])
+
+
+def _fetch_context_info(
+    zmq_endpoint,
+    context_name=None,
+    destination_node="hub0",
+    get_size_on_disk=False,
+    timeout_ms=10000,
+):
+    req = _domain_message(trp_pb2.Message.CONTEXT_INFO_REQUEST, destination_node)
+    info_req = req.context_info_request
+    info_req.get_size_on_disk = bool(get_size_on_disk)
+    trisul_name = _trisul_context_name(context_name)
+    if trisul_name:
+        info_req.context_name = trisul_name
+    resp = get_response(zmq_endpoint, req, timeout_ms=timeout_ms)
+    return _response_items(resp, "context_info_response")
+
+
+def _fetch_context_config(zmq_endpoint, context_name, destination_node="hub0", timeout_ms=10000):
+    req = _domain_message(trp_pb2.Message.CONTEXT_CONFIG_REQUEST, destination_node)
+    req.context_config_request.context_name = _trisul_context_name(context_name) or "default"
+    return get_response(zmq_endpoint, req, timeout_ms=timeout_ms)
+
+
+def _query_probe_config(zmq_endpoint, context_name, probe_id, names, profile=None, timeout_ms=10000):
+    """CONTEXT_CONFIG_REQUEST query_config, same path as WebTrisul TrpContext.get_query_config."""
+    req = _domain_message(trp_pb2.Message.CONTEXT_CONFIG_REQUEST, probe_id)
+    if probe_id and probe_id != "all_probes":
+        req.probe_id = probe_id
+    cfg = req.context_config_request
+    cfg.context_name = _trisul_context_name(context_name) or "default"
+    if profile:
+        cfg.profile = profile
+    for name in names:
+        nv = cfg.query_config.add()
+        nv.name = name
+    resp = get_response(zmq_endpoint, req, timeout_ms=timeout_ms)
+    values = list(getattr(resp, "config_values", []) or [])
+    if not values and hasattr(resp, "context_config_response"):
+        values = list(resp.context_config_response.config_values)
+    return [{"name": item.name, "value": item.value} for item in values]
+
+
+def _config_db_path(internal_context, profile):
+    return os.path.join(TRISUL_CONFIG_ROOT, internal_context, profile, "TRISULCONFIG.SQDB")
+
+
+def _capture_profile_row(row):
+    """One TRISUL_CAPTURE_PROFILES row, matching the Manage Capture Adapters list."""
+    status = row["RowStatus"] or ""
+    filter_expression = row["FilterExpression"] or ""
+    modified = row["ModifyTimestamp"] or 0
+    created = row["CreateTimestamp"] or 0
+    return {
+        "id": row["id"],
+        "name": row["ProfileName"],
+        "description": row["Description"],
+        "adapter": row["Adapter"],
+        "row_status": status,
+        "status": "Enabled" if status == "Active" else "Disabled",
+        "filter_expression": filter_expression,
+        "has_filter": bool(filter_expression.strip()),
+        "enable_erspan": row["EnableERSPAN"],
+        "add_ethernet_fcs": row["AddEthernetFCS"],
+        "netflow_packet_mode": row["NetflowPacketMode"],
+        "promiscuous_mode": row["PromiscuousMode"],
+        "snap_len": row["SnapLen"],
+        "rx_block_count_exponent": row["RX_BlockCountExponent"],
+        "pf_cluster_id": row["PF_ClusterID"],
+        "af_fanout_group_id": row["AF_FanoutGroupID"],
+        "nt_stream_id": row["NT_StreamID"],
+        "nt_hash_mode": row["NT_HashMode"],
+        "nt_stream_config": row["NT_StreamConfig"],
+        "kernel_buf_size": row["KernelBufSize"],
+        "circ_buffer_size": row["CircBufferSize"],
+        "circ_buffer_queue_length": row["CircBufferQueueLength"],
+        "read_timeout_ms": row["ReadTimeoutMS"],
+        "flush_frequency": row["FlushFrequency"],
+        "has_fake_timestamp": row["HasFakeTimestamp"],
+        "create_timestamp": created or None,
+        "create_time": _iso_from_tv_sec(created) if created else None,
+        "modify_timestamp": modified or None,
+        "modify_time": _iso_from_tv_sec(modified) if modified else None,
+    }
+
+
+def _read_capture_profiles(db_path, row_status=None):
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        sql = "SELECT * FROM TRISUL_CAPTURE_PROFILES"
+        params = []
+        if row_status:
+            sql += " WHERE RowStatus = ?"
+            params.append(row_status)
+        sql += " ORDER BY id"
+        return [_capture_profile_row(row) for row in conn.execute(sql, params)]
+    finally:
+        conn.close()
+
+
+def _fetch_node_config(zmq_endpoint, destination_node="hub0", timeout_ms=10000):
+    req = _domain_message(trp_pb2.Message.NODE_CONFIG_REQUEST, destination_node)
+    req.node_config_request.get_all_nodes = True
+    return get_response(zmq_endpoint, req, timeout_ms=timeout_ms)
+
+
+def _profile_dirs_for_context(internal_context):
+    """List profile directories on disk, same source as WebTrisul Admin::TrisulProfile.get_profiles."""
+    config_root_ctx = os.path.join(TRISUL_CONFIG_ROOT, internal_context)
+    profiles = []
+    if not os.path.isdir(config_root_ctx):
+        return profiles
+    names = sorted(
+        name
+        for name in os.listdir(config_root_ctx)
+        if name.lower().startswith("profile")
+        and os.path.isdir(os.path.join(config_root_ctx, name))
+    )
+    for name in names:
+        path = os.path.join(config_root_ctx, name)
+        desc = ""
+        info_txt = os.path.join(path, "info.txt")
+        if os.path.isfile(info_txt):
+            try:
+                with open(info_txt, "r", encoding="utf-8", errors="replace") as handle:
+                    desc = handle.read().strip()
+            except OSError as e:
+                logging.warning(f"[_profile_dirs_for_context] Could not read {info_txt}: {e}")
+        config_db = os.path.join(path, "TRISULCONFIG.SQDB")
+        try:
+            ino = os.stat(path).st_ino
+        except OSError:
+            ino = None
+        profiles.append(
+            {
+                "name": name,
+                "desc": desc,
+                "ino": ino,
+                "path": path,
+                "config_db_path": config_db if os.path.isfile(config_db) else None,
+            }
+        )
+    return profiles
+
+
+def _probe_ids_for_context(zmq_endpoint, ctx_name):
+    """Probe IDs from CONTEXT_CONFIG layers, same as WebTrisul get_all_probes_id."""
+    config_resp = _fetch_context_config(zmq_endpoint, ctx_name)
+    layers = list(getattr(config_resp, "layers", []) or [])
+    if not layers and hasattr(config_resp, "context_config_response"):
+        layers = list(config_resp.context_config_response.layers)
+    return [layer.probe_id for layer in layers if getattr(layer, "probe_id", None)]
+
+
+def _assigned_profile_for_node(zmq_endpoint, ctx_name, destination_node):
+    """Assigned profile from CONTEXT_INFO items.first.profile (WebTrisul @node.items.first.profile)."""
+    items = _fetch_context_info(
+        zmq_endpoint,
+        context_name=ctx_name,
+        destination_node=destination_node,
+    )
+    if not items:
+        return None, []
+    first = items[0]
+    assigned = first.profile if first.HasField("profile") and first.profile else None
+    return assigned, items
+
+
+def _probe_stats_dict(resp):
+    stats = {
+        "instance_name": resp.instance_name,
+        "is_running": bool(resp.is_running) if resp.HasField("is_running") else None,
+        "connections": int(resp.connections),
+        "uptime_seconds": int(resp.uptime_seconds),
+        "cpu_usage_percent_trisul": resp.cpu_usage_percent_trisul,
+        "cpu_usage_percent_total": resp.cpu_usage_percent_total,
+        "mem_usage_trisul": resp.mem_usage_trisul,
+        "mem_usage_total": resp.mem_usage_total,
+        "mem_total": resp.mem_total,
+        "drop_percent_cap": resp.drop_percent_cap,
+        "drop_percent_trisul": resp.drop_percent_trisul,
+    }
+    if resp.HasField("proc_bytes"):
+        stats["proc_bytes"] = int(resp.proc_bytes)
+    if resp.HasField("proc_packets"):
+        stats["proc_packets"] = int(resp.proc_packets)
+    if resp.HasField("offline_pcap_file") and resp.offline_pcap_file:
+        stats["offline_pcap_file"] = resp.offline_pcap_file
+    return stats
+
+
+def _fetch_probe_stats(zmq_endpoint, context_name, destination_node, timeout_ms=15000):
+    req = _domain_message(trp_pb2.Message.PROBE_STATS_REQUEST, destination_node)
+    req.probe_stats_request.context_name = _trisul_context_name(context_name) or "default"
+    resp = get_response(zmq_endpoint, req, timeout_ms=timeout_ms)
+    if hasattr(resp, "instance_name"):
+        return _probe_stats_dict(resp)
+    if hasattr(resp, "probe_stats_response"):
+        return _probe_stats_dict(resp.probe_stats_response)
+    return None
+
+
+def _context_info_item_dict(item):
+    size_on_disk = None
+    if item.HasField("size_on_disk"):
+        size_on_disk = int(item.size_on_disk)
+
+    time_interval = None
+    if item.HasField("time_interval"):
+        time_interval = _interval_dict(item.time_interval)
+
+    run_history = []
+    for window in item.run_history:
+        interval = _interval_dict(window)
+        if interval:
+            run_history.append(interval)
+
+    name = item.context_name
+    details = {
+        "context_name": name,
+        "tool_context": normalize_context(name) if name else None,
+        "is_initialized": bool(item.is_initialized),
+        "is_running": bool(item.is_running),
+        "time_interval": time_interval,
+        "run_history": run_history,
+        "run_history_count": len(run_history),
+    }
+    if item.HasField("is_clean"):
+        details["is_clean"] = bool(item.is_clean)
+    if size_on_disk is not None:
+        details["size_on_disk"] = size_on_disk
+        details["size_on_disk_readable"] = _fmt_bytes(size_on_disk)
+    if item.HasField("profile") and item.profile:
+        details["profile"] = item.profile
+    if item.HasField("runmode") and item.runmode:
+        details["runmode"] = item.runmode
+    if item.HasField("node_version") and item.node_version:
+        details["node_version"] = item.node_version
+    if item.HasField("extrainfo") and item.extrainfo:
+        details["extrainfo"] = item.extrainfo
+    return details
 
 
 def _search_filter_key_matches(key_str, filter_counter_guid, zmq_endpoint, maxitems=10):
@@ -1005,6 +1332,10 @@ _RESPONSE_FIELD_MAP = {
     'QUERY_ALERTS_RESPONSE': 'query_alerts_response',
     'QUERY_SESSIONS_RESPONSE': 'query_sessions_response',
     'SEARCH_KEYS_RESPONSE': 'search_keys_response',
+    'CONTEXT_INFO_RESPONSE': 'context_info_response',
+    'CONTEXT_CONFIG_RESPONSE': 'context_config_response',
+    'NODE_CONFIG_RESPONSE': 'node_config_response',
+    'PROBE_STATS_RESPONSE': 'probe_stats_response',
 }
 
 def unwrap_response(data):
@@ -1072,6 +1403,541 @@ def get_response(zmq_endpoint, req, timeout_ms=10000):
 
 
 # TRP tools
+
+@mcp.tool()
+def list_all_contexts(
+    context_name: str = None,
+    get_size_on_disk: bool = False,
+    destination_node: str = "hub0",
+    zmq_endpoint: str = None,
+):
+    """List details of all Trisul contexts (or one named context) from the domain hub.
+
+    Uses CONTEXT_INFO_REQUEST on the domain control socket, the same source WebTrisul
+    uses for context inventory. Omit context_name to return every context.
+
+    Arguments:
+        context_name (str): Optional Trisul context name such as default or XYZ.
+            Leave empty to list all contexts.
+        get_size_on_disk (bool): If true, include disk usage. This is expensive.
+        destination_node (str): Domain node to query, usually hub0.
+        zmq_endpoint (str): Domain ZMQ endpoint. Defaults to the local hub control
+            socket ipc:///usr/local/var/lib/trisul-hub/domain0/run/ctl_local_req.hub0.
+
+    Returns: dict with contexts[] containing name, running/initialized flags,
+        data time window, run history, profile, runmode, and optional disk size.
+        tool_context is the value to pass as context= to other Trisul tools.
+    """
+    try:
+        zmq_endpoint = zmq_endpoint or DOMAIN_ZMQ_ENDPOINT
+        context_name = (context_name or "").strip() or None
+        timeout_ms = 30000 if get_size_on_disk else 10000
+
+        logging.info(
+            f"[list_all_contexts] Listing contexts endpoint={zmq_endpoint} "
+            f"destination_node={destination_node} context_name={context_name!r} "
+            f"get_size_on_disk={get_size_on_disk}"
+        )
+
+        raw_items = _fetch_context_info(
+            zmq_endpoint,
+            context_name=context_name,
+            destination_node=destination_node,
+            get_size_on_disk=get_size_on_disk,
+            timeout_ms=timeout_ms,
+        )
+        items = [_context_info_item_dict(item) for item in raw_items]
+        logging.info(f"[list_all_contexts] Retrieved {len(items)} context(s)")
+        return json_to_toon({
+            "context_count": len(items),
+            "destination_node": destination_node,
+            "contexts": items,
+        })
+    except Exception as e:
+        logging.error(f"[list_all_contexts] Error: {str(e)}", exc_info=True)
+        return json_to_toon({"error": str(e), "contexts": []})
+
+
+@mcp.tool()
+def list_all_probes(
+    context_name: str = None,
+    include_stats: bool = False,
+    include_hubs: bool = False,
+    zmq_endpoint: str = None,
+):
+    """List Trisul probe details (and optionally hubs) from the domain hub.
+
+    Uses NODE_CONFIG_REQUEST for registered nodes, CONTEXT_CONFIG_REQUEST layers
+    for per-context probe IDs, and CONTEXT_INFO_REQUEST with destination_node set
+    to each probe for running status. Optionally adds PROBE_STATS_REQUEST.
+
+    Arguments:
+        context_name (str): Optional Trisul context such as default or XYZ.
+            Leave empty to collect probes for every context.
+        include_stats (bool): If true, include CPU/memory/drop stats per probe.
+            This is slower.
+        include_hubs (bool): If true, also return hub nodes from NODE_CONFIG.
+        zmq_endpoint (str): Domain ZMQ endpoint. Defaults to the local hub control
+            socket ipc:///usr/local/var/lib/trisul-hub/domain0/run/ctl_local_req.hub0.
+
+    Returns: dict with probes[] containing probe_id, description, nodetype,
+        per-context running status, and optional stats.
+    """
+    try:
+        zmq_endpoint = zmq_endpoint or DOMAIN_ZMQ_ENDPOINT
+        context_name = (context_name or "").strip() or None
+        logging.info(
+            f"[list_all_probes] endpoint={zmq_endpoint} context_name={context_name!r} "
+            f"include_stats={include_stats} include_hubs={include_hubs}"
+        )
+
+        node_index = {}
+        hubs = []
+        try:
+            node_resp = _fetch_node_config(zmq_endpoint)
+            probe_nodes = _response_items(node_resp, "node_config_response", "probes")
+            hub_nodes = _response_items(node_resp, "node_config_response", "hubs")
+            for node in list(probe_nodes) + list(hub_nodes):
+                node_index[node.id] = {
+                    "node_id": node.id,
+                    "nodetype": _enum_name(trp_pb2.DomainNodeType, node.nodetype),
+                    "description": node.description,
+                }
+            if include_hubs:
+                hubs = [dict(node_index[n.id]) for n in hub_nodes]
+        except Exception as e:
+            logging.warning(f"[list_all_probes] NODE_CONFIG failed: {e}")
+
+        if context_name:
+            context_names = [_trisul_context_name(context_name)]
+        else:
+            try:
+                context_names = [
+                    item.context_name
+                    for item in _fetch_context_info(zmq_endpoint)
+                    if item.context_name
+                ]
+            except Exception as e:
+                logging.warning(f"[list_all_probes] CONTEXT_INFO for all contexts failed: {e}")
+                context_names = ["default"]
+
+        probes_by_id = {}
+        for ctx_name in context_names:
+            layers = []
+            try:
+                config_resp = _fetch_context_config(zmq_endpoint, ctx_name)
+                layers = list(getattr(config_resp, "layers", []) or [])
+                if not layers and hasattr(config_resp, "context_config_response"):
+                    layers = list(config_resp.context_config_response.layers)
+            except Exception as e:
+                logging.warning(f"[list_all_probes] CONTEXT_CONFIG failed for {ctx_name}: {e}")
+                continue
+
+            for layer in layers:
+                probe_id = layer.probe_id
+                if not probe_id:
+                    continue
+                entry = probes_by_id.setdefault(
+                    probe_id,
+                    {
+                        "probe_id": probe_id,
+                        "description": (
+                            layer.probe_description
+                            or node_index.get(probe_id, {}).get("description")
+                        ),
+                        "nodetype": node_index.get(probe_id, {}).get("nodetype", "PROBE"),
+                        "contexts": [],
+                    },
+                )
+                if layer.probe_description and not entry.get("description"):
+                    entry["description"] = layer.probe_description
+
+                context_detail = {
+                    "context_name": ctx_name,
+                    "tool_context": normalize_context(ctx_name),
+                    "layer": int(layer.layer) if layer.layer else None,
+                }
+                try:
+                    info_items = _fetch_context_info(
+                        zmq_endpoint,
+                        context_name=ctx_name,
+                        destination_node=probe_id,
+                    )
+                    if info_items:
+                        context_detail.update(_context_info_item_dict(info_items[0]))
+                        context_detail["context_name"] = ctx_name
+                        context_detail["tool_context"] = normalize_context(ctx_name)
+                except Exception as e:
+                    context_detail["error"] = str(e)
+
+                if include_stats:
+                    try:
+                        context_detail["stats"] = _fetch_probe_stats(
+                            zmq_endpoint, ctx_name, probe_id
+                        )
+                    except Exception as e:
+                        context_detail["stats_error"] = str(e)
+
+                entry["contexts"].append(context_detail)
+
+        probes = list(probes_by_id.values())
+        logging.info(f"[list_all_probes] Retrieved {len(probes)} probe(s)")
+        result = {
+            "probe_count": len(probes),
+            "probes": probes,
+        }
+        if include_hubs:
+            result["hubs"] = hubs
+            result["hub_count"] = len(hubs)
+        return json_to_toon(result)
+    except Exception as e:
+        logging.error(f"[list_all_probes] Error: {str(e)}", exc_info=True)
+        return json_to_toon({"error": str(e), "probes": []})
+
+
+@mcp.tool()
+def list_all_profiles(
+    context_name: str = None,
+    profile_name: str = None,
+    destination_node: str = None,
+    zmq_endpoint: str = None,
+):
+    """List Trisul capture-profile details for a context (or all contexts).
+
+    Mirrors WebTrisul Manage Profiles: directories under
+    /usr/local/var/lib/trisul-config/domain0/<context>/profile* (name, info.txt
+    description, inode) plus which probes use each profile. Probe assignment is
+    CONTEXT_INFO_REQUEST items.first.profile, the same field WebTrisul uses as
+    @node.items.first.profile.
+
+    Arguments:
+        context_name (str): Optional Trisul context such as default, context0, or XYZ.
+            Leave empty to list profiles for every context.
+        profile_name (str): Optional profile to return only that one (for example profile0).
+        destination_node (str): Optional probe or hub id (for example probe0). When set,
+            include that node's currently assigned profile from CONTEXT_INFO.
+        zmq_endpoint (str): Domain ZMQ endpoint. Defaults to the local hub control
+            socket ipc:///usr/local/var/lib/trisul-hub/domain0/run/ctl_local_req.hub0.
+
+    Returns: dict with contexts[] each containing profiles[] (name, desc, used_by_probes,
+        config_db_path). When destination_node is set, also returns assigned_profile.
+    """
+    try:
+        zmq_endpoint = zmq_endpoint or DOMAIN_ZMQ_ENDPOINT
+        context_name = (context_name or "").strip() or None
+        profile_name = (profile_name or "").strip() or None
+        destination_node = (destination_node or "").strip() or None
+        logging.info(
+            f"[list_all_profiles] endpoint={zmq_endpoint} context_name={context_name!r} "
+            f"profile_name={profile_name!r} destination_node={destination_node!r}"
+        )
+
+        if context_name:
+            context_names = [_trisul_context_name(context_name)]
+        else:
+            try:
+                context_names = [
+                    item.context_name
+                    for item in _fetch_context_info(zmq_endpoint)
+                    if item.context_name
+                ]
+            except Exception as e:
+                logging.warning(f"[list_all_profiles] CONTEXT_INFO for all contexts failed: {e}")
+                context_names = ["default"]
+
+        contexts = []
+        for ctx_name in context_names:
+            tool_context = normalize_context(ctx_name)
+            profiles = _profile_dirs_for_context(tool_context)
+            probe_ids = []
+            try:
+                probe_ids = _probe_ids_for_context(zmq_endpoint, ctx_name)
+            except Exception as e:
+                logging.warning(f"[list_all_profiles] CONTEXT_CONFIG failed for {ctx_name}: {e}")
+
+            assigned_by_probe = {}
+            for probe_id in probe_ids:
+                try:
+                    assigned, _items = _assigned_profile_for_node(
+                        zmq_endpoint, ctx_name, probe_id
+                    )
+                    assigned_by_probe[probe_id] = assigned
+                except Exception as e:
+                    logging.warning(
+                        f"[list_all_profiles] CONTEXT_INFO failed for {ctx_name}/{probe_id}: {e}"
+                    )
+                    assigned_by_probe[probe_id] = None
+
+            probes_by_profile = {}
+            for probe_id, assigned in assigned_by_probe.items():
+                if not assigned:
+                    continue
+                probes_by_profile.setdefault(assigned, []).append(probe_id)
+
+            known_names = {p["name"] for p in profiles}
+            for assigned in probes_by_profile:
+                if assigned not in known_names:
+                    profiles.append(
+                        {
+                            "name": assigned,
+                            "desc": "",
+                            "ino": None,
+                            "path": None,
+                            "config_db_path": None,
+                        }
+                    )
+                    known_names.add(assigned)
+
+            if profile_name:
+                profiles = [p for p in profiles if p["name"] == profile_name]
+
+            for profile in profiles:
+                profile["used_by_probes"] = probes_by_profile.get(profile["name"], [])
+
+            ctx_entry = {
+                "context_name": ctx_name,
+                "tool_context": tool_context,
+                "profile_count": len(profiles),
+                "profiles": profiles,
+                "assigned_by_probe": assigned_by_probe,
+            }
+            if destination_node:
+                try:
+                    assigned, _items = _assigned_profile_for_node(
+                        zmq_endpoint, ctx_name, destination_node
+                    )
+                    ctx_entry["destination_node"] = destination_node
+                    ctx_entry["assigned_profile"] = assigned
+                except Exception as e:
+                    ctx_entry["destination_node"] = destination_node
+                    ctx_entry["assigned_profile"] = None
+                    ctx_entry["assigned_profile_error"] = str(e)
+            contexts.append(ctx_entry)
+
+        result = {
+            "context_count": len(contexts),
+            "contexts": contexts,
+        }
+        if destination_node and len(contexts) == 1:
+            result["destination_node"] = destination_node
+            result["assigned_profile"] = contexts[0].get("assigned_profile")
+        logging.info(
+            f"[list_all_profiles] Retrieved {sum(c['profile_count'] for c in contexts)} "
+            f"profile(s) across {len(contexts)} context(s)"
+        )
+        return json_to_toon(result)
+    except Exception as e:
+        logging.error(f"[list_all_profiles] Error: {str(e)}", exc_info=True)
+        return json_to_toon({"error": str(e), "contexts": []})
+
+
+@mcp.tool()
+def get_trisul_mode(
+    context_name: str,
+    probe_id: str,
+    profile: str = None,
+    zmq_endpoint: str = None,
+):
+    """Return the selected Trisul mode (TAP or NETFLOW_TAP) for one context and probe.
+
+    Uses CONTEXT_CONFIG_REQUEST with query_config name //App/TrisulMode, the same
+    call WebTrisul makes in WebtrisulContext.get_trisul_mode. The request is sent
+    to the probe (destination_node and probe_id). all_probes, and a failed query,
+    both return TAP, matching WebTrisul.
+
+    Arguments:
+        context_name (str): Trisul context such as default, context0, or XYZ.
+        probe_id (str): Probe id such as probe0. all_probes returns TAP.
+        profile (str): Optional profile whose config to read. When omitted, the
+            profile currently assigned to the probe is used.
+        zmq_endpoint (str): Domain ZMQ endpoint. Defaults to the local hub control
+            socket ipc:///usr/local/var/lib/trisul-hub/domain0/run/ctl_local_req.hub0.
+
+    Returns: dict with trisul_mode (TAP or NETFLOW_TAP), context_name, probe_id,
+        and the profile that was queried.
+    """
+    try:
+        zmq_endpoint = zmq_endpoint or DOMAIN_ZMQ_ENDPOINT
+        context_name = (context_name or "").strip()
+        probe_id = (probe_id or "").strip()
+        profile = (profile or "").strip() or None
+        trisul_name = _trisul_context_name(context_name)
+        logging.info(
+            f"[get_trisul_mode] endpoint={zmq_endpoint} context_name={context_name!r} "
+            f"probe_id={probe_id!r} profile={profile!r}"
+        )
+
+        if not trisul_name or not probe_id:
+            return json_to_toon({
+                "error": "context_name and probe_id are required",
+                "trisul_mode": None,
+            })
+
+        if probe_id == "all_probes":
+            return json_to_toon({
+                "context_name": trisul_name,
+                "tool_context": normalize_context(context_name),
+                "probe_id": probe_id,
+                "trisul_mode": "TAP",
+            })
+
+        if not profile:
+            try:
+                assigned, _items = _assigned_profile_for_node(
+                    zmq_endpoint, trisul_name, probe_id
+                )
+                profile = assigned or None
+            except Exception as e:
+                logging.warning(
+                    f"[get_trisul_mode] Could not resolve assigned profile for "
+                    f"{trisul_name}/{probe_id}: {e}"
+                )
+
+        values = _query_probe_config(
+            zmq_endpoint,
+            trisul_name,
+            probe_id,
+            ["//App/TrisulMode"],
+            profile=profile,
+        )
+        mode = values[0]["value"] if values and values[0].get("value") else "TAP"
+        logging.info(f"[get_trisul_mode] {trisul_name}/{probe_id} mode={mode}")
+        return json_to_toon({
+            "context_name": trisul_name,
+            "tool_context": normalize_context(context_name),
+            "probe_id": probe_id,
+            "profile": profile,
+            "trisul_mode": mode,
+        })
+    except Exception as e:
+        logging.error(f"[get_trisul_mode] Error: {str(e)}", exc_info=True)
+        return json_to_toon({
+            "context_name": _trisul_context_name(context_name),
+            "tool_context": normalize_context(context_name) if context_name else None,
+            "probe_id": probe_id,
+            "profile": profile,
+            "trisul_mode": "TAP",
+            "error": str(e),
+        })
+
+
+@mcp.tool()
+def list_capture_interfaces(
+    context_name: str = "context0",
+    profile: str = None,
+    probe_id: str = None,
+    row_status: str = None,
+    page: int = None,
+    per_page: int = 30,
+    zmq_endpoint: str = None,
+):
+    """List capture-adapter (interface) details for a Trisul context and profile.
+
+    Reads TRISUL_CAPTURE_PROFILES from the profile config database, the same
+    table WebTrisul shows with Admin::TrisulCaptureProfile.paginate on
+    Manage Capture Adapters. Each row is one configured capture interface:
+    name, adapter, enabled/disabled status, BPF filter, and provider options.
+
+    Arguments:
+        context_name (str): Trisul context such as default, context0, or XYZ.
+        profile (str): Profile whose config DB to read, for example profile0.
+            When omitted and probe_id is set, the probe's assigned profile is used.
+            Otherwise profile0.
+        probe_id (str): Optional probe id used only to resolve the assigned profile.
+        row_status (str): Optional filter. Active or Enabled, or Inactive or Disabled.
+            Omit to return every adapter.
+        page (int): Optional 1-based page, matching WebTrisul pagination.
+            Omit to return the full list.
+        per_page (int): Page size when page is set. Default 30.
+        zmq_endpoint (str): Domain ZMQ endpoint, used only when resolving the
+            assigned profile from probe_id.
+
+    Returns: dict with interfaces[] plus total, enabled, and disabled counts.
+    """
+    try:
+        context_name = (context_name or "").strip() or "context0"
+        profile = (profile or "").strip() or None
+        probe_id = (probe_id or "").strip() or None
+        row_status = (row_status or "").strip() or None
+        tool_context = normalize_context(context_name)
+        trisul_name = _trisul_context_name(context_name)
+        zmq_endpoint = zmq_endpoint or DOMAIN_ZMQ_ENDPOINT
+
+        status_filter = None
+        if row_status:
+            lowered = row_status.lower()
+            if lowered in ("active", "enabled"):
+                status_filter = "Active"
+            elif lowered in ("inactive", "disabled"):
+                status_filter = "Inactive"
+            else:
+                return json_to_toon({
+                    "error": "row_status must be Active, Inactive, Enabled, or Disabled",
+                    "interfaces": [],
+                })
+
+        if not profile and probe_id and probe_id != "all_probes":
+            try:
+                assigned, _items = _assigned_profile_for_node(
+                    zmq_endpoint, trisul_name, probe_id
+                )
+                profile = assigned or None
+            except Exception as e:
+                logging.warning(
+                    f"[list_capture_interfaces] Could not resolve profile for "
+                    f"{trisul_name}/{probe_id}: {e}"
+                )
+        profile = profile or "profile0"
+        db_path = _config_db_path(tool_context, profile)
+        logging.info(
+            f"[list_capture_interfaces] context={tool_context} profile={profile} "
+            f"probe_id={probe_id!r} row_status={status_filter!r} db={db_path}"
+        )
+
+        if not os.path.isfile(db_path):
+            return json_to_toon({
+                "error": f"Config database not found: {db_path}",
+                "context_name": trisul_name,
+                "tool_context": tool_context,
+                "profile": profile,
+                "interfaces": [],
+            })
+
+        interfaces = _read_capture_profiles(db_path, status_filter)
+        enabled = sum(1 for item in interfaces if item["row_status"] == "Active")
+        disabled = len(interfaces) - enabled
+        total = len(interfaces)
+        page_num = None
+        page_count = 1
+        if page is not None:
+            page_num = max(int(page), 1)
+            size = max(int(per_page), 1)
+            page_count = max((total + size - 1) // size, 1)
+            start = (page_num - 1) * size
+            interfaces = interfaces[start:start + size]
+
+        logging.info(
+            f"[list_capture_interfaces] {total} adapter(s), "
+            f"enabled={enabled} disabled={disabled}"
+        )
+        return json_to_toon({
+            "context_name": trisul_name,
+            "tool_context": tool_context,
+            "profile": profile,
+            "probe_id": probe_id,
+            "config_db_path": db_path,
+            "total": total,
+            "enabled": enabled,
+            "disabled": disabled,
+            "page": page_num,
+            "per_page": int(per_page) if page_num else None,
+            "page_count": page_count if page_num else None,
+            "interfaces": interfaces,
+        })
+    except Exception as e:
+        logging.error(f"[list_capture_interfaces] Error: {str(e)}", exc_info=True)
+        return json_to_toon({"error": str(e), "interfaces": []})
+
 
 @mcp.tool()
 def list_all_available_counter_groups(context: str = "context0", zmq_endpoint: str = None):
@@ -2950,7 +3816,7 @@ def rag_query(question: str):
         # Embed query
         logging.info("[rag_query] Initializing Embedding Model via LLMFactory")
         try:
-            env_path = Path(__file__).resolve().parent / ".env"
+            env_path = env_file_path(Path(__file__).resolve().parent)
             factory = LLMFactory(env_path=env_path, logging=logging)
             embedding_model = factory.get_embedding_llm()
             
@@ -2968,7 +3834,7 @@ def rag_query(question: str):
         # Search in Chroma
         try:
             logging.info("[rag_query] Initializing ChromaDB client")
-            CHROMA_STORE = Path(__file__).resolve().parent / "chroma_store"
+            CHROMA_STORE = chroma_store_path(Path(__file__).resolve().parent)
             logging.info(f"[rag_query] ChromaDB store path: {CHROMA_STORE}")
             
             if not CHROMA_STORE.exists():

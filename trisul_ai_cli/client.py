@@ -24,6 +24,7 @@ import re
 import subprocess
 from trisul_ai_cli.tools.utils import TrisulAIUtils
 from trisul_ai_cli.llm_factory import LLMFactory
+from trisul_ai_cli.runtime_env import configure_logging, env_file_path
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 import json
 import stdiomask
@@ -36,16 +37,12 @@ class TrisulAIClient:
     def __init__(self):
         # Initialize asyncio
         nest_asyncio.apply()
-        if os.name != "nt":
+        # Interactive charts need a GUI backend. The container sets MPLBACKEND=Agg
+        # before startup, so leave Qt alone there and keep the desktop default.
+        if os.name != "nt" and os.environ.get("MPLBACKEND", "").lower() != "agg":
             os.environ["QT_QPA_PLATFORM"] = "xcb"
         
-        # Initialize logging
-        logging.basicConfig(
-            filename= Path(os.getcwd()) / "trisul_ai_cli.log",
-            level=logging.INFO,
-            format="%(asctime)s - %(levelname)s - %(message)s",
-            force=True
-        )
+        configure_logging()
         
         
         # Initialize utils
@@ -59,7 +56,7 @@ class TrisulAIClient:
         
         # Initialize Global variables
         self.root_dir = Path(__file__).resolve().parent
-        self.env_path = self.root_dir / ".env"
+        self.env_path = env_file_path(self.root_dir)
         self.llm_factory = LLMFactory(env_path=self.env_path, logging=logging)
         self.existing_ai_memory = []
         self.memory_json_path = self.root_dir / "trisul_ai_memory.json"
@@ -345,9 +342,14 @@ class TrisulAIClient:
 
 
     async def connect_to_server(self, server_module: str = "trisul_ai_cli.server"):
+        # The MCP client otherwise starts the tool server with a stripped
+        # environment (PATH, HOME, and little else). Inside Docker that drops
+        # TRISUL_AI_LOG_DIR, TRISUL_AI_ENV_FILE, and TRISUL_AI_CHROMA_DIR, so
+        # the tool process logs to a different file and reads an empty config.
         server_params = StdioServerParameters(
             command=sys.executable,
             args=["-m", server_module],
+            env=os.environ.copy(),
         )
 
         stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
@@ -1513,6 +1515,19 @@ class TrisulAIClient:
                 "dashboard_filename": None,
             }
 
+        if not self.llm_factory.is_configured():
+            logging.warning("[Client][API] Query rejected because the LLM is not configured")
+            return {
+                "status": "error",
+                "message": "LLM is not configured.",
+                "answer": None,
+                "tool_calls": [],
+                "chart_data": None,
+                "table_data": None,
+                "dashboard_json": None,
+                "dashboard_filename": None,
+            }
+
         if session_id and session_id in self.sessions:
             logging.info(f"[Client][API] [Session: {session_id}] Reusing existing session history.")
             history = self.sessions[session_id]
@@ -1523,7 +1538,9 @@ class TrisulAIClient:
             else:
                 base_prompt = self.conversation_history[0].content
             
-            logging.info(f"[Client][API] [Session: {session_id}] System Prompt: {base_prompt[:100]}...")
+            logging.info(
+                f"[Client][API] [Session: {session_id}] System Prompt:\n{base_prompt}"
+            )
             
             # Append API-specific instructions to omit tables and pop-up mentions in Web UI mode
             api_instructions = (
@@ -1575,10 +1592,11 @@ class TrisulAIClient:
             self._update_connection_from_text(query)
 
         llm = self.llm_factory.get_llm()
+        logging.info(f"[Client][API] [Session: {session_id}] LLM: {llm}")
         if not llm:
             return {
                 "status": "error",
-                "message": "LLM not initialized. Please set API key via CLI first.",
+                "message": "LLM is not configured.",
                 "answer": None,
                 "tool_calls": [],
                 "chart_data": None,

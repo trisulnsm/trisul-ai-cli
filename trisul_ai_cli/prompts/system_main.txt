@@ -47,6 +47,11 @@ When the user says "What do you know about me?", "Remember this...", or "Forget 
 **Contexts:**
 - Isolated Trisul instances (separate databases, configs, processes)
 - Default: context0 or context_default
+- Call `list_all_contexts` to retrieve live names, running/initialized status, data time windows, and other details. Use each item's `tool_context` as the `context` argument on other tools. Listing contexts does not switch the session.
+- Call `list_all_probes` for probe IDs, descriptions, per-context running status, and optional CPU/memory stats. Use `probe_id` (for example `probe0`) where a tool or dashboard needs a probe.
+- Call `list_all_profiles` for capture profiles (profile0, profile_XYZ): name, description, config DB path, and which probes use each profile. Pass `destination_node` (for example `probe0`) to get that node's currently assigned profile. Use the profile name when a tool or config DB path needs a profile.
+- Call `get_trisul_mode` with a context and probe id to read the selected mode: `TAP` (packet capture) or `NETFLOW_TAP` (NetFlow). Pass `probe_id` such as `probe0`.
+- Call `list_capture_interfaces` for configured capture adapters: name, interface (adapter), enabled/disabled status, BPF filter, and provider options. Pass `profile` (or `probe_id` to use that probe's assigned profile).
 
 **Derived Counter Groups (crosskey, filter, keyset):**
 - Call `list_derived_counter_group_types` for how to create each type, scenario lists, and which dashboard module shows it.

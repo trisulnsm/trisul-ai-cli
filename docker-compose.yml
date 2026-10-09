@@ -1,0 +1,43 @@
+# Run Trisul AI in API mode on the Trisul hub host.
+# WebTrisul calls http://<hub-ip>:8200 . The container reaches Trisul through
+# the same IPC sockets and config directory a local pip install uses.
+
+services:
+  trisul-ai:
+    image: ${TRISUL_AI_IMAGE:-unleashnetworks/trisul-ai-cli:1.0.2}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: trisul-ai
+    restart: unless-stopped
+    ports:
+      - "${TRISUL_AI_PUBLISH_PORT:-8200}:8200"
+    environment:
+      TRISUL_AI_HOST: 0.0.0.0
+      TRISUL_AI_PORT: "8200"
+      TRISUL_AI_LOG_LEVEL: ${TRISUL_AI_LOG_LEVEL:-info}
+      TRISUL_AI_LOG_STDOUT: "1"
+      MPLBACKEND: Agg
+      # Optional. When set, these are saved into /var/lib/trisul-ai/.env.
+      # TRISUL_AI_PROVIDER: gemini
+      # TRISUL_AI_MODEL: gemini-3.6-flash
+      # TRISUL_GEMINI_API_KEY: ...
+    volumes:
+      # Required. Queries, context listing, and counter-group tools use these paths.
+      - /usr/local/var/lib/trisul-hub:/usr/local/var/lib/trisul-hub
+      - /usr/local/var/lib/trisul-config:/usr/local/var/lib/trisul-config
+      # LLM settings saved by the in-container CLI or by environment variables.
+      - trisul-ai-config:/var/lib/trisul-ai
+      - trisul-ai-logs:/var/log/trisul-ai
+    tmpfs:
+      - /tmp:size=512m
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/trisul-ai-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+
+volumes:
+  trisul-ai-config:
+  trisul-ai-logs:

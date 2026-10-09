@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from dotenv import dotenv_values, set_key
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -38,7 +40,7 @@ class LLMFactory:
         self.logging = logging
         self._load_config()
 
-    def _load_config(self):
+    def _load_config(self, log=True):
         self.config = dotenv_values(self.env_path)
         self.provider = self.config.get("TRISUL_AI_PROVIDER", "gemini")
         self.model_name = self.config.get("TRISUL_AI_MODEL")
@@ -59,12 +61,35 @@ class LLMFactory:
         
         self.embedding_api_key = self.config.get(f"TRISUL_{str(self.embedding_provider).upper()}_API_KEY") if self.embedding_provider else None
 
-        self.logging.info(
-            f"[LLMFactory] Loaded config: provider={self.provider}, model={self.model_name}, "
-            f"api_base_url={self.api_base_url}, embedding_model={self.embedding_model}, "
-            f"embedding_provider={self.embedding_provider}, "
-            f"max_output_tokens={self.max_output_tokens}"
-        )
+        if log and self.logging:
+            self.logging.info(
+                f"[LLMFactory] Loaded config: provider={self.provider}, model={self.model_name}, "
+                f"api_base_url={self.api_base_url}, embedding_model={self.embedding_model}, "
+                f"embedding_provider={self.embedding_provider}, "
+                f"max_output_tokens={self.max_output_tokens}"
+            )
+
+    def _ensure_env_file(self):
+        path = Path(self.env_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.touch(mode=0o600)
+
+    def is_configured(self) -> bool:
+        """True when a query can be sent to an LLM.
+
+        Re-reads the env file so a CLI session in the same container is picked
+        up by the already-running API without a restart.
+        """
+        self._load_config(log=False)
+        model = str(self.model_name or "").strip()
+        if not model:
+            return False
+        if self.provider == "custom":
+            return bool(str(self.api_base_url or "").strip())
+        if self.provider not in ("gemini", "openai", "anthropic"):
+            return False
+        return bool(str(self.api_key or "").strip())
 
     def _read_max_output_tokens(self):
         """Return (limit, explicitly_configured) for the completion token budget."""
@@ -167,13 +192,15 @@ class LLMFactory:
     def set_provider(self, provider: str):
         if provider not in self.SUPPORTED_MODELS:
             raise ValueError(f"Unsupported provider: {provider}")
-        
+
+        self._ensure_env_file()
         self.provider = provider
         set_key(self.env_path, "TRISUL_AI_PROVIDER", provider)
         self.logging.info(f"[LLMFactory] Provider set to {provider}")
         self._load_config()
 
     def set_model(self, model_name: str):
+        self._ensure_env_file()
         self.model_name = model_name
         set_key(self.env_path, "TRISUL_AI_MODEL", model_name)
         self.logging.info(f"[LLMFactory] Model set to {model_name}")
@@ -187,6 +214,7 @@ class LLMFactory:
                 provider = prov
                 break
         
+        self._ensure_env_file()
         set_key(self.env_path, "TRISUL_EMBEDDING_MODEL", model_name)
         if provider:
             set_key(self.env_path, "TRISUL_EMBEDDING_PROVIDER", provider)
@@ -195,6 +223,7 @@ class LLMFactory:
         self._load_config()
 
     def set_api_key(self, api_key: str):
+        self._ensure_env_file()
         self.api_key = api_key
         set_key(self.env_path, f"TRISUL_{self.provider.upper()}_API_KEY", api_key)
         self.logging.info(f"[LLMFactory] API key updated for provider {self.provider}")
@@ -263,11 +292,13 @@ class LLMFactory:
         return self.embedding_api_key
 
     def set_api_key_for_provider(self, provider: str, api_key: str):
+        self._ensure_env_file()
         set_key(self.env_path, f"TRISUL_{provider.upper()}_API_KEY", api_key)
         self.logging.info(f"[LLMFactory] API key updated for provider {provider}")
         self._load_config()
 
     def set_custom_llm(self, base_url: str, model_name: str, api_key: str = None):
+        self._ensure_env_file()
         normalized_url = self._normalize_openai_base_url(base_url)
         self.set_provider("custom")
         self.set_model(model_name)

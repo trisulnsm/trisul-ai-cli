@@ -39,7 +39,7 @@ Trisul AI CLI combines several cutting-edge technologies:
                      │
                      ▼
 ┌─────────────────────────────────────────────────────────┐
-│              Gemini AI (Google LLM)                     │
+│         LLM (Gemini / OpenAI / Anthropic / local)       │
 │        • Query Understanding                            │
 │        • Function Calling                               │
 │        • Response Generation                            │
@@ -59,16 +59,16 @@ Trisul AI CLI combines several cutting-edge technologies:
 ┌──────────┐  ┌──────────┐  ┌──────────┐
 │ Trisul   │  │   RAG    │  │  SQLite  │
 │ TRP API  │  │ ChromaDB │  │  Config  │
-│ (ZMQ)    │  │ Gemini   │  │   DB     │
+│ (ZMQ)    │  │ Embeds   │  │   DB     │
 └──────────┘  └──────────┘  └──────────┘
 ```
 
 ### Components
 
-- **Gemini AI**: Google's large language model for natural language understanding
+- **LLM**: Gemini, OpenAI, Anthropic, or a custom OpenAI-compatible local endpoint
 - **MCP Server**: Model Context Protocol server with specialized Trisul tools
 - **Trisul TRP API**: Low-level network analytics API via ZeroMQ
-- **RAG System**: ChromaDB + Gemini embeddings for documentation retrieval
+- **RAG System**: ChromaDB plus Gemini, OpenAI, or VoyageAI embeddings for documentation retrieval
 - **Visualization**: Matplotlib for interactive traffic charts
 
 ## Installation
@@ -77,7 +77,7 @@ Trisul AI CLI combines several cutting-edge technologies:
 
 - Python 3.10 or higher
 - Trisul Network Analytics installed and running
-- Gemini API key ([Get one here](https://aistudio.google.com/app/api-keys))
+- An LLM API key for Gemini, OpenAI, or Anthropic — or a local OpenAI-compatible endpoint (Ollama, LM Studio, vLLM, LocalAI). An embedding provider (Gemini, OpenAI, or VoyageAI) is required for documentation RAG.
 
 ### Setup
 
@@ -98,12 +98,19 @@ Trisul AI CLI combines several cutting-edge technologies:
   ```bash
    trisul_ai_cli
   ```
-5. **Enter your Gemini API key** when prompted (stored securely in `.env`)
+5. **Choose an LLM** when prompted (cloud provider or custom local endpoint), then enter the matching API key if required. Settings are stored in `.env`. You can change them later with the commands in **User Commands**.
 
-Trisul AI can run in two ways:
+Trisul AI can run in two ways from the pip package:
 
 1. **CLI mode** — interactive chat in the terminal (`trisul_ai_cli`)
 2. **API mode** — REST server that the WebTrisul UI chat window talks to (`trisul_ai_cli api`)
+
+The same package can also run as a Docker container. The container starts the API on `http://<host>:8200` even when no LLM is configured. `/api/health` succeeds either way. A query returns `LLM is not configured.` until the model is set. Pip installs are unchanged.
+
+Inside Docker, configure the LLM in one of these ways only:
+
+1. `docker exec -it <container> trisul_ai_cli`, choose the model and API key, then exit. The running API reads that saved configuration.
+2. Pass `TRISUL_AI_PROVIDER`, `TRISUL_AI_MODEL`, and the matching API key as environment variables when you run or start the container. Those values are written to `/var/lib/trisul-ai/.env` and reused the next time that container starts without them.
 
 ## Using Trisul AI in the WebTrisul UI (API mode)
 
@@ -153,7 +160,7 @@ curl http://127.0.0.1:8200/api/health
 
 A healthy response looks like `{"status":"ok","mcp_connected":true,...}`.
 
-The first time you run the CLI or API on a machine, complete LLM setup (API key / model) the same way as CLI mode. The API server uses the same `.env` config.
+The first time you run the CLI or API on a machine, complete LLM setup (model and API key, or a custom endpoint) the same way as CLI mode. The API server uses the same `.env` config.
 
 ### Step 2: Point WebTrisul at the API server
 
@@ -298,6 +305,11 @@ and 'Destination IP' counter groups to track traffic between specific IP pairs..
 
 | Tool                                | Purpose                                                                                                         |
 | ----------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `list_all_contexts`                 | List all Trisul contexts (name, running/initialized, time window, optional disk size)                           |
+| `list_all_probes`                   | List probes (id, description, per-context running status, optional CPU/memory stats)                            |
+| `list_all_profiles`                 | List capture profiles (name, description, probes using each, assigned profile for a node)                       |
+| `get_trisul_mode`                   | Selected mode for a context and probe (`TAP` or `NETFLOW_TAP`)                                                  |
+| `list_capture_interfaces`           | Capture adapters for a profile (name, interface, status, BPF filter, provider options)                          |
 | `list_all_available_counter_groups` | List all available counter groups                                                                               |
 | `get_cginfo_from_countergroup_name` | Get counter group details by name                                                                               |
 | `get_counter_group_topper`          | Fetch top N items by traffic/metrics                                                                            |
@@ -367,8 +379,18 @@ complete absolute path including the JSON filename.
 
 ### User Commands
 
-- `**exit`** or `**quit**`: Exit the CLI
-- `**change_api_key**`: Update your Gemini API key
+Type these in the CLI chat prompt (case-insensitive). They are handled by the client, not sent to the LLM.
+
+
+| Command                                       | What it does                                                                                                      |
+| --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `exit` or `quit`                              | Saves user memory, then exits the CLI                                                                             |
+| `change_llm_api_key`                          | Updates the API key for the **current LLM** provider                                                              |
+| `change_embedding_api_key`                    | Updates the API key for the **current embedding** provider (select an embedding model first if none is set)       |
+| `change_llm_model`                            | Pick a Gemini, OpenAI, or Anthropic model, or choose **custom:local** to configure an OpenAI-compatible endpoint  |
+| `change_custom_llm` or `configure_custom_llm` | Set a local/self-hosted LLM: API base URL, model name, and optional API key (skip the key for Ollama and similar) |
+| `change_embedding_model`                      | Pick an embedding model (Gemini, OpenAI, or VoyageAI) and set its API key if missing                              |
+
 
 ## Configuration
 
@@ -381,11 +403,20 @@ By default, Trisul AI connects to `context0` (local IPC socket). You can specify
 
 ### Environment Variables
 
-The CLI stores your API key in `.env`:
+The CLI writes provider, model, and keys to `.env`. Typical keys:
 
 ```bash
-TRISUL_GEMINI_API_KEY=your_api_key_here
+TRISUL_AI_PROVIDER=gemini          # gemini | openai | anthropic | custom
+TRISUL_AI_MODEL=gemini-3.6-flash
+TRISUL_GEMINI_API_KEY=...          # or TRISUL_OPENAI_API_KEY / TRISUL_ANTHROPIC_API_KEY
+TRISUL_CUSTOM_API_BASE_URL=http://localhost:11434   # custom LLM only
+TRISUL_CUSTOM_API_KEY=not-needed                    # optional for local servers
+TRISUL_EMBEDDING_PROVIDER=gemini   # gemini | openai | voyageai
+TRISUL_EMBEDDING_MODEL=models/gemini-embedding-001
+TRISUL_AI_MAX_TOKENS=16384         # optional completion token cap
 ```
+
+Prefer the **User Commands** above over editing `.env` by hand.
 
 ## Logging
 
@@ -411,7 +442,7 @@ Error: ZMQ timeout - no response from ipc://...
 Error: Invalid API key
 ```
 
-**Solution**: Run `change_api_key` command and enter a valid Gemini API key.
+**Solution**: In the CLI, run `change_llm_api_key` (or `change_embedding_api_key` if RAG/embeddings fail) and enter a valid key for the current provider. Use `change_llm_model` if you meant to switch providers.
 
 ### Empty Responses
 
