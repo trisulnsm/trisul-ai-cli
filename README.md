@@ -271,16 +271,58 @@ Those paths are on the host. Queries from the container cannot open them.
 
 Do both of the following.
 
-**Once, on the Trisul hub.** Change the hub from IPC to TCP in the hub configuration and note the hub IP and the TRP port. After this, the engine can be pointed at `tcp://<hub-ip>:<port>` (for example `tcp://10.16.8.44:5008`).
+**Once, on the Trisul hub.** Switch that context from IPC to TCP.
+
+Open the hub config for the context:
+
+```text
+/usr/local/etc/trisul-hub/domain0/hub0/<context_name>/trisulHubConfig.xml
+```
+
+For the `default` context (`context0`) that file is:
+
+```text
+/usr/local/etc/trisul-hub/domain0/hub0/context0/trisulHubConfig.xml
+```
+
+Find `ZmqConnection`. On IPC it looks like this:
+
+```xml
+<ZmqConnection>
+	ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/<context_name>/run/trp_0
+</ZmqConnection>
+```
+
+Change it to a TCP endpoint on the hub host. Use the hub machine's IP and the port you want TRP to listen on:
+
+```xml
+<ZmqConnection>
+	tcp://192.168.10.20:5000
+</ZmqConnection>
+```
+
+Restart that context so the hub picks up the new endpoint:
+
+```bash
+trisulctl_hub restart context <context_name>@hub0
+```
+
+For `context0`:
+
+```bash
+trisulctl_hub restart context context0@hub0
+```
+
+After the restart, the engine can be pointed at that same address, for example `tcp://192.168.10.20:5000`.
 
 **At the start of every new conversation.** In the CLI or on the Trisul AI page, tell the assistant the hub address before you ask for traffic data. Any of these phrases sets the endpoint:
 
 ```text
-Connect to tcp://10.16.8.44:5008
+Connect to tcp://192.168.10.20:5000
 ```
 
 ```text
-Connect to IP address 10.16.8.44 and port 5008
+Connect to IP address 192.168.10.20 and port 5000
 ```
 
 Later questions in that **same** conversation keep using that endpoint. A refresh, or a new conversation, starts without it, so say the address again.
@@ -506,7 +548,7 @@ The API is up and the model is not saved.
 
 ### Docker answers cannot see traffic
 
-The container is still using the IPC socket. Enable TCP on the hub (once), then start the conversation with the hub IP and port, for example `Connect to tcp://10.16.8.44:5008`. Repeat that line after a refresh or a new conversation.
+The container is still using the IPC socket. Switch the hub context from IPC to TCP as described in [Reach hub data over TCP](#23-reach-hub-data-over-tcp), then start the conversation with the hub IP and port, for example `Connect to tcp://192.168.10.20:5000`. Repeat that line after a refresh or a new conversation.
 
 ### ZMQ timeout on an IPC socket
 
