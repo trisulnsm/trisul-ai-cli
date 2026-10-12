@@ -14,7 +14,10 @@ RUN apt-get update \
 WORKDIR /build
 COPY pyproject.toml setup.cfg MANIFEST.in README.md ./
 COPY trisul_ai_cli ./trisul_ai_cli
-RUN pip install --upgrade pip wheel \
+# Local session memory is excluded by .dockerignore. Ship an empty file so
+# a fresh container starts with no user name or preferences.
+RUN printf '%s\n' '[]' > trisul_ai_cli/trisul_ai_memory.json \
+    && pip install --upgrade pip wheel \
     && pip wheel --wheel-dir /wheels .
 
 FROM python:3.12-slim-bookworm

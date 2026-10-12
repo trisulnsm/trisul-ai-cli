@@ -1,36 +1,390 @@
 # Trisul AI CLI
 
-> Conversational AI for Next-Generation Network Monitoring 
+> Conversational AI for Next-Generation Network Monitoring
 
 [Python 3.10+](https://www.python.org/downloads/)
 
-## Overview
-
-Trisul AI CLI is a conversational AI interface for [Trisul Network Analytics](https://www.trisul.org/) that transforms network monitoring from complex dashboards and CLI commands into natural language conversations. Simply ask questions about your network in plain English, and get actionable insights instantly.
-
-**Think ChatGPT, but for your network.**
-
-Instead of navigating through menus, logs, and reports, just ask:
+Trisul AI turns [Trisul Network Analytics](https://www.trisul.org/) into a conversation. Ask a question in plain English. The assistant reads live traffic from the Trisul hub and answers with text, tables, and charts.
 
 - *"What's the traffic trend on this interface in the last 24 hours?"*
 - *"Which ASNs pushed the most traffic this week?"*
 - *"Show me top IPs on the Airtel WAN"*
 
-Trisul AI handles data retrieval, analysis, and visualization—returning clear answers, tables, charts, and insights directly in your terminal.
+## How Trisul AI is used
 
-## Key Features
+There are two places to ask questions, and two ways to install the engine behind them.
 
-- **Natural Language Queries**: Ask questions in plain English, no need to remember commands or menu paths
-- **Intelligent Context**: Remembers conversation history and user preferences
-- **Multi-Source Data**: Connects to local or remote Trisul servers via IPC or TCP/ZMQ
-- **Rich Visualizations**: Generates tables, charts, and traffic graphs with interactive tooltips
-- **RAG-Powered Knowledge**: Uses Retrieval-Augmented Generation with Trisul's complete documentation
-- **MCP Server Architecture**: Leverages Model Context Protocol for structured tool execution
-- **Real-Time Analytics**: Query live network data, toppers, traffic trends, and anomalies
+**Where you talk to it**
+
+
+| Surface          | What you run                    | When to use it                                   |
+| ---------------- | ------------------------------- | ------------------------------------------------ |
+| **CLI**          | `trisul_ai_cli`                 | Interactive chat in a terminal                   |
+| **WebTrisul UI** | The Trisul AI page in WebTrisul | Chat in the browser. The page calls the REST API |
+
+
+**How you install the engine**
+
+
+| Install                         | Data path to the Trisul hub                                     | API process                                             |
+| ------------------------------- | --------------------------------------------------------------- | ------------------------------------------------------- |
+| **pip package** on the hub host | Local IPC socket. Context names such as `default` work directly | You start `trisul_ai_cli api` when you want the UI      |
+| **Docker container**            | TCP endpoint. The container cannot see the hub IPC socket       | The container starts the API on port **8200** by itself |
+
+
+```
+                         ┌─────────────────────┐
+                         │  You ask a question │
+                         └──────────┬──────────┘
+                                    │
+                 ┌──────────────────┴──────────────────┐
+                 │                                     │
+                 ▼                                     ▼
+        trisul_ai_cli                          WebTrisul UI
+        (terminal chat)                        Trisul AI page
+                 │                                     │
+                 │                          POST /api/query
+                 │                                     │
+                 └──────────────────┬──────────────────┘
+                                    ▼
+                         Trisul AI engine
+                    LLM  +  Trisul TRP tools
+                                    │
+                 ┌──────────────────┴──────────────────┐
+                 │                                     │
+                 ▼                                     ▼
+        pip on the hub host                    Docker container
+        ipc://…/trp_0                          tcp://<hub-ip>:<port>
+        (context name)                         (you name this endpoint
+                                                in each new chat)
+```
+
+Do the steps for **one** install method, configure the LLM once, then open either the CLI or the WebTrisul page.
+
+---
+
+## 1. Install with pip
+
+Use this when Trisul AI runs on the same machine as the Trisul hub. The process can open the hub IPC socket, so questions about a context name work with no extra endpoint.
+
+Later CLI and API commands must run inside the virtual environment you create here. Activate it again in every new shell.
+
+### 1.1 Install the package
+
+On Debian or Ubuntu:
+
+```bash
+sudo apt update && sudo apt install python3-pip python3.12-venv -y
+```
+
+Create and activate a virtual environment, then install the package:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install trisul_ai_cli
+```
+
+### 1.2 Configure the LLM (first launch only)
+
+```bash
+trisul_ai_cli
+```
+
+The first launch asks you to pick a model from the list (Gemini, OpenAI, Anthropic, or a custom OpenAI-compatible endpoint) and to enter the API key for that provider. The choice is saved in `.env` next to the package. Later launches reuse it.
+
+Change it later from the chat prompt:
+
+
+| Command                    | What it does                                           |
+| -------------------------- | ------------------------------------------------------ |
+| `change_llm_model`         | Pick a different model or a custom endpoint            |
+| `change_llm_api_key`       | Replace the key for the current provider               |
+| `change_embedding_model`   | Pick the embedding model used for documentation search |
+| `change_embedding_api_key` | Replace the embedding provider key                     |
+| `exit` or `quit`           | Leave the chat                                         |
+
+
+### 1.3 Ask questions in the CLI
+
+With the virtual environment active:
+
+```bash
+trisul_ai_cli
+```
+
+The CLI talks to the local hub over IPC and uses `context0` (the `default` context) unless you name another context. Example:
+
+```text
+Show top 10 hosts by traffic in the last hour
+```
+
+Leave the chat with `exit`.
+
+### 1.4 Serve the WebTrisul UI
+
+The Trisul AI page does not start the engine. Start the REST API in the same virtual environment and leave it running.
+
+```bash
+source .venv/bin/activate
+trisul_ai_cli api --host 0.0.0.0 --port 8200
+```
+
+The server listens on port **8200** on all interfaces. From this machine that is `http://127.0.0.1:8200`. From another machine, use this host's IP and the same port.
+
+Check it:
+
+```bash
+curl http://127.0.0.1:8200/api/health
+```
+
+A healthy process returns `"status": "ok"` and `"mcp_connected": true`.
+
+Run it in the background and return to the shell:
+
+```bash
+trisul_ai_cli api --host 0.0.0.0 --port 8200 -d
+```
+
+The background process writes `trisul_ai_cli.log` and `trisul_ai_api.pid` in the current directory.
+
+
+| Flag                              | Meaning                                                               |
+| --------------------------------- | --------------------------------------------------------------------- |
+| `--host`                          | Bind address. Default `0.0.0.0`.                                      |
+| `--port`                          | Listen port. Default `8200`. Use the same value in WebTrisul.         |
+| `-d`, `--daemon`                  | Detach and keep running after the terminal closes.                    |
+| `--log-level`                     | `debug`, `info`, `warning`, `error`, or `critical`.                   |
+| `--ssl-certfile`, `--ssl-keyfile` | Serve HTTPS. Turn on **AI SSL Mode** in WebTrisul when you use these. |
+
+
+HTTPS:
+
+```bash
+trisul_ai_cli api --host 0.0.0.0 --port 8200 \
+  --ssl-certfile /path/to/cert.pem \
+  --ssl-keyfile /path/to/key.pem
+```
+
+Then connect WebTrisul once, using the steps in [Connect WebTrisul](#3-connect-webtrisul).
+
+A pip install does **not** need the TCP hub change in the Docker section. Context names resolve to the local IPC socket.
+
+---
+
+## 2. Install with Docker
+
+Use this when you want the API as a container. The image already contains the pip package. Starting the container starts API mode. You do not run `trisul_ai_cli api` yourself.
+
+```bash
+docker pull parthasarathy369/trisul-ai-cli:latest
+```
+
+The API listens on container port **8200**. Publish it with `-p 8200:8200`.
+
+On startup the container always brings the API up.
+
+- `/api/health` succeeds even when no model is set.
+- A question returns **LLM is not configured.** until you set a provider, model, and API key.
+- After the model is saved, the running API reads it on the next question. You do not restart the container.
+
+LLM settings are stored in `/var/lib/trisul-ai/.env` inside the container. Mount a volume on that path so the file survives `docker rm` and a later `docker run`.
+
+### 2.1 Configure the LLM with environment variables
+
+Pass the provider, model, and matching API key on the first `docker run`. They are written into the `trisul-ai-config` volume.
+
+```bash
+docker run -d \
+  --name trisul-ai-cli \
+  -p 8200:8200 \
+  -v trisul-ai-config:/var/lib/trisul-ai \
+  -e TRISUL_AI_PROVIDER=gemini \
+  -e TRISUL_AI_MODEL=gemini-3.6-flash \
+  -e TRISUL_GEMINI_API_KEY=your-api-key \
+  parthasarathy369/trisul-ai-cli:latest
+```
+
+
+| Variable                     | Example                                         |
+| ---------------------------- | ----------------------------------------------- |
+| `TRISUL_AI_PROVIDER`         | `gemini`, `openai`, `anthropic`, or `custom`    |
+| `TRISUL_AI_MODEL`            | `gemini-3.6-flash`                              |
+| `TRISUL_GEMINI_API_KEY`      | Gemini key                                      |
+| `TRISUL_OPENAI_API_KEY`      | OpenAI key, when the provider is `openai`       |
+| `TRISUL_ANTHROPIC_API_KEY`   | Anthropic key, when the provider is `anthropic` |
+| `TRISUL_CUSTOM_API_BASE_URL` | Base URL, when the provider is `custom`         |
+| `TRISUL_CUSTOM_API_KEY`      | Optional for a local server such as Ollama      |
+
+
+The next start reuses the volume and omits the keys:
+
+```bash
+docker run -d \
+  --name trisul-ai-cli \
+  -p 8200:8200 \
+  -v trisul-ai-config:/var/lib/trisul-ai \
+  parthasarathy369/trisul-ai-cli:latest
+```
+
+If the name `trisul-ai-cli` is already in use, remove the old container before `docker run` (`docker rm -f trisul-ai-cli`). The named volume keeps the saved model.
+
+Run again with a different provider, model, or key **and the same volume** to replace the saved settings. The new values are what the following start uses.
+
+Omit `-v trisul-ai-config:/var/lib/trisul-ai` and a new container has an empty configuration. WebTrisul then shows **LLM is not configured.**
+
+### 2.2 Configure the LLM from inside the container
+
+Start the container without LLM variables, open a shell, and use the same first-run prompts as the pip CLI.
+
+```bash
+docker run -d \
+  --name trisul-ai-cli \
+  -p 8200:8200 \
+  -v trisul-ai-config:/var/lib/trisul-ai \
+  parthasarathy369/trisul-ai-cli:latest
+
+docker exec -it trisul-ai-cli bash
+trisul_ai_cli
+```
+
+Choose a model and enter its API key, then leave the chat and the container:
+
+```text
+exit
+exit
+```
+
+The API process that is already running picks up the saved file. No container restart.
+
+Add the volume in the `docker run` above if you want that choice to survive a removed container. Without the volume, the file lives only in that container's writable layer.
+
+### 2.3 Reach hub data over TCP
+
+A container does not have the hub IPC socket, even when the container and the hub are on the same machine. The pip install uses paths such as:
+
+```text
+ipc:///usr/local/var/lib/trisul-hub/domain0/hub0/<context>/run/trp_0
+```
+
+Those paths are on the host. Queries from the container cannot open them.
+
+Do both of the following.
+
+**Once, on the Trisul hub.** Change the hub from IPC to TCP in the hub configuration and note the hub IP and the TRP port. After this, the engine can be pointed at `tcp://<hub-ip>:<port>` (for example `tcp://10.16.8.44:5008`).
+
+**At the start of every new conversation.** In the CLI or on the Trisul AI page, tell the assistant the hub address before you ask for traffic data. Any of these phrases sets the endpoint:
+
+```text
+Connect to tcp://10.16.8.44:5008
+```
+
+```text
+Connect to IP address 10.16.8.44 and port 5008
+```
+
+Later questions in that **same** conversation keep using that endpoint. A refresh, or a new conversation, starts without it, so say the address again.
+
+A context name alone still tries the IPC socket. From Docker, name the TCP endpoint.
+
+This TCP step applies only to the container. A pip install on the hub host keeps using IPC and the context you already selected.
+
+### 2.4 Ask questions
+
+The container is already in API mode, so WebTrisul can use it as soon as you [connect the UI](#3-connect-webtrisul).
+
+For a terminal chat against the same container:
+
+```bash
+docker exec -it trisul-ai-cli trisul_ai_cli
+```
+
+Name the TCP endpoint at the start of the chat, then ask the traffic question.
+
+Logs from the API process:
+
+```bash
+docker logs trisul-ai-cli
+```
+
+The same lines are written to `/var/log/trisul-ai/trisul_ai_cli.log` inside the container.
+
+---
+
+## 3. Connect WebTrisul
+
+Do this once, after the API is running from either pip or Docker.
+
+1. Open WebTrisul and go to the **Trisul AI** page.
+2. Click the **configure** (gear) button in the chat header. It opens **WebTrisul Options** on the **Trisul AI** tab (`/webtrisul_options/edit?active_tab=tab_trisulai`).
+3. Fill in **Trisul AI API Endpoint Configuration**.
+
+
+| Field                | What to enter                                                                                                                      |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| **AI SSL Mode**      | Leave off for HTTP. Turn on only when the API was started with a certificate and key.                                              |
+| **AI Endpoint IP**   | The address the **browser** uses to reach the API. Use the host IP. Use `127.0.0.1` only when the browser is on that same machine. |
+| **AI Endpoint Port** | `8200`, unless you published a different host port.                                                                                |
+
+
+1. Click **Save**.
+
+The page then calls `{http or https}://{AI Endpoint IP}:{AI Endpoint Port}/api/query`. A mismatch of protocol, IP, or port shows **Connection Failed**. The same gear button is available from that error.
+
+Open the chat from the Trisul context you want to query. The header shows that context, and each request carries it.
+
+- **pip API:** tools use that context over the local IPC socket.
+- **Docker API:** the context lock stays in effect, and traffic questions still need the TCP endpoint from [Reach hub data over TCP](#23-reach-hub-data-over-tcp) at the start of each new conversation.
+
+---
+
+## What you can ask
+
+- *Show top 10 hosts by traffic in the last hour*
+- *How much HTTPS traffic did we see today?*
+- *Show a pie chart of top applications*
+- *Create a host dashboard* (the assistant previews the layout, then builds it after you confirm)
+
+A reply can include a written answer, a table, a line or pie chart, or a dashboard package.
+
+### Install a dashboard from chat
+
+When the assistant generates a dashboard:
+
+1. Read the layout preview and confirm it.
+2. Use the buttons on that message:
+  - **Preview dashboard** opens a preview without installing
+  - **Download dashboard JSON** saves the package
+  - **Install dashboard** installs it into WebTrisul, then **View dashboard** opens it
+
+Dashboards and queries follow the context the chat was opened from.
+
+### CLI examples
+
+```text
+Show top 10 hosts by traffic in the last hour
+```
+
+```text
+How much HTTPS traffic did we see today?
+```
+
+```text
+Show HTTPS traffic trend for 192.168.10.25 over the last 6 hours with a chart
+```
+
+```text
+Connect to the remote server with IP address 10.16.8.44 and port 5008.
+Show top apps by traffic
+```
+
+```text
+What is a crosskey counter group?
+```
+
+---
 
 ## Architecture
-
-Trisul AI CLI combines several cutting-edge technologies:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -63,347 +417,49 @@ Trisul AI CLI combines several cutting-edge technologies:
 └──────────┘  └──────────┘  └──────────┘
 ```
 
-### Components
+- **LLM:** Gemini, OpenAI, Anthropic, or a custom OpenAI-compatible endpoint (Ollama, LM Studio, vLLM, LocalAI).
+- **MCP server:** Trisul tools exposed over the Model Context Protocol.
+- **Trisul TRP API:** ZeroMQ. IPC on the hub host, or `tcp://<ip>:<port>` from Docker and from remote clients.
+- **RAG:** ChromaDB with Gemini, OpenAI, or VoyageAI embeddings for the documentation.
+- **Charts:** Matplotlib. The container uses a non-interactive backend; the WebTrisul page draws charts in the browser.
 
-- **LLM**: Gemini, OpenAI, Anthropic, or a custom OpenAI-compatible local endpoint
-- **MCP Server**: Model Context Protocol server with specialized Trisul tools
-- **Trisul TRP API**: Low-level network analytics API via ZeroMQ
-- **RAG System**: ChromaDB plus Gemini, OpenAI, or VoyageAI embeddings for documentation retrieval
-- **Visualization**: Matplotlib for interactive traffic charts
+---
 
-## Installation
+## Tools the assistant calls
 
-### Prerequisites
+You do not type these names. The model calls them while answering.
 
-- Python 3.10 or higher
-- Trisul Network Analytics installed and running
-- An LLM API key for Gemini, OpenAI, or Anthropic — or a local OpenAI-compatible endpoint (Ollama, LM Studio, vLLM, LocalAI). An embedding provider (Gemini, OpenAI, or VoyageAI) is required for documentation RAG.
 
-### Setup
+| Tool                                | Purpose                                                              |
+| ----------------------------------- | -------------------------------------------------------------------- |
+| `list_all_contexts`                 | List contexts (name, running state, time window, optional disk size) |
+| `list_all_probes`                   | List probes and optional CPU or memory stats                         |
+| `list_all_profiles`                 | List capture profiles                                                |
+| `get_trisul_mode`                   | `TAP` or `NETFLOW_TAP` for a context and probe                       |
+| `list_capture_interfaces`           | Capture adapters for a profile                                       |
+| `list_all_available_counter_groups` | List counter groups                                                  |
+| `get_cginfo_from_countergroup_name` | Look up a counter group by name                                      |
+| `get_counter_group_topper`          | Top N items by a meter                                               |
+| `get_key_traffic_data`              | Time series for specific keys                                        |
+| `create_crosskey_counter_group`     | Propose, confirm, then create a crosskey group                       |
+| `create_filter_counter_group`       | Propose, confirm, then create a filtered group                       |
+| `create_keyset_counter_group`       | Propose, confirm, then create a keyset group                         |
+| `list_derived_counter_group_types`  | Catalog of crosskey, filter, and keyset                              |
+| `list_dashboard_module_types`       | Dashboard module templates                                           |
+| `generate_dashboard_json`           | Validate against live Trisul, preview, then write a dashboard JSON   |
+| `rag_query`                         | Search Trisul documentation                                          |
+| `generate_and_show_chart`           | Build a traffic chart                                                |
 
-1. **Update system and install dependencies** (Debian/Ubuntu):
-  ```bash
-   sudo apt update && sudo apt install python3-pip python3.12-venv -y
-  ```
-2. **Create and activate virtual environment**:
-  ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-  ```
-3. **Install Trisul AI CLI**:
-  ```bash
-   pip install trisul_ai_cli
-  ```
-4. **Launch the CLI**:
-  ```bash
-   trisul_ai_cli
-  ```
-5. **Choose an LLM** when prompted (cloud provider or custom local endpoint), then enter the matching API key if required. Settings are stored in `.env`. You can change them later with the commands in **User Commands**.
 
-Trisul AI can run in two ways from the pip package:
+Creating a crosskey, filter, or keyset group is a two-step confirm. The first call (`confirm=False`) returns the proposal and writes nothing. The second call (`confirm=True`) with the same arguments creates it.
 
-1. **CLI mode** — interactive chat in the terminal (`trisul_ai_cli`)
-2. **API mode** — REST server that the WebTrisul UI chat window talks to (`trisul_ai_cli api`)
+Dashboard generation checks live counter groups and keys. `generate_dashboard_json(confirm=False)` returns a layout preview. After you approve, `confirm=True` writes the package under `/tmp`.
 
-The same package can also run as a Docker container. The container starts the API on `http://<host>:8200` even when no LLM is configured. `/api/health` succeeds either way. A query returns `LLM is not configured.` until the model is set. Pip installs are unchanged.
+---
 
-Inside Docker, configure the LLM in one of these ways only:
+## Configuration reference
 
-1. `docker exec -it <container> trisul_ai_cli`, choose the model and API key, then exit. The running API reads that saved configuration.
-2. Pass `TRISUL_AI_PROVIDER`, `TRISUL_AI_MODEL`, and the matching API key as environment variables when you run or start the container. Those values are written to `/var/lib/trisul-ai/.env` and reused the next time that container starts without them.
-
-## Using Trisul AI in the WebTrisul UI (API mode)
-
-The WebTrisul chat page does not start the AI engine itself. You start the API server on the Trisul hub (or another host that can reach Trisul), then tell WebTrisul the IP, port, and HTTP/HTTPS.
-
-### Step 1: Start the API server
-
-Use the same virtualenv where `trisul_ai_cli` is installed. The process must stay running.
-
-```bash
-source .venv/bin/activate
-trisul_ai_cli api --host 0.0.0.0 --port 8200
-```
-
-You should see something like:
-
-```
-Trisul AI REST API starting in HTTP mode on http://0.0.0.0:8200
-   Interactive docs: http://0.0.0.0:8200/docs
-   Health check:     http://0.0.0.0:8200/api/health
-```
-
-Useful options:
-
-
-| Flag                               | Meaning                                                              |
-| ---------------------------------- | -------------------------------------------------------------------- |
-| `--host`                           | Bind address. `0.0.0.0` lets the WebTrisul browser reach the server. |
-| `--port`                           | Listen port (default `8200`). Must match the WebTrisul setting.      |
-| `--log-level`                      | `debug`, `info`, `warning`, `error`                                  |
-| `--ssl-certfile` / `--ssl-keyfile` | Enable HTTPS. Check **AI SSL Mode** in WebTrisul if you use these.   |
-
-
-HTTPS example:
-
-```bash
-trisul_ai_cli api --host 0.0.0.0 --port 8200 \
-  --ssl-certfile /path/to/cert.pem \
-  --ssl-keyfile /path/to/key.pem
-```
-
-Confirm the server is up:
-
-```bash
-curl http://127.0.0.1:8200/api/health
-```
-
-A healthy response looks like `{"status":"ok","mcp_connected":true,...}`.
-
-The first time you run the CLI or API on a machine, complete LLM setup (model and API key, or a custom endpoint) the same way as CLI mode. The API server uses the same `.env` config.
-
-### Step 2: Point WebTrisul at the API server
-
-1. Log in to WebTrisul as an administrator.
-2. Open **WebTrisul Options** (`/webtrisul_options/edit`).
-3. Select the **Trisul AI** tab (left sidebar).
-4. Fill in **Trisul AI API Endpoint Configuration**:
-
-  | Field                | What to enter                                                                                                          |
-  | -------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-  | **AI SSL Mode**      | Unchecked for HTTP. Checked only if the API was started with `--ssl-certfile` / `--ssl-keyfile`.                       |
-  | **AI Endpoint IP**   | Host the **browser** can reach (the hub IP, or `127.0.0.1` if the UI and API are on the same machine you browse from). |
-  | **AI Endpoint Port** | Same port as `--port` (for example `8200`).                                                                            |
-
-5. Click **Save**.
-
-The chat page calls `{http or https}://{AI Endpoint IP}:{AI Endpoint Port}/api/query`. If SSL mode and the server protocol do not match, or the IP/port is wrong, the chat shows **Connection Failed**.
-
-You can reopen the same settings from a failed chat via **Configure Server Settings**, or go directly to `/webtrisul_options/edit?active_tab=tab_trisulai`.
-
-### Step 3: Open the chat from the current context
-
-1. In WebTrisul, switch to the Trisul **context** you want to query.
-2. Open the **Trisul AI** page (`/trisul_ai/index`). The header shows that context (for example `default`).
-3. Type a question and send it. Every request includes that context; the API locks all Trisul tools to it.
-
-Do not ask the chat to switch context. Change context in WebTrisul, then open Trisul AI again.
-
-### Step 4: What you can ask
-
-Examples:
-
-- *Show top 10 hosts by traffic in the last hour*
-- *How much HTTPS traffic did we see today?*
-- *Show a pie chart of top applications*
-- *Create a host dashboard* (preview first, then confirm)
-
-The reply can include:
-
-- A written answer
-- A **table**
-- A **line or pie chart**
-- A **dashboard package** (after you confirm the layout)
-
-### Step 5: Install a dashboard from chat
-
-When the assistant generates a dashboard:
-
-1. Read the **layout preview** in chat and confirm if it looks right.
-2. After generation, use the buttons on that message:
-  - **Preview dashboard** — opens a preview without installing
-  - **Download dashboard JSON** — saves the package file
-  - **Install dashboard** — installs it into WebTrisul, then **View dashboard** opens it
-
-The chat is bound to the context you opened it from, so dashboards and queries apply to that context only.
-
-### If the chat cannot connect
-
-1. Confirm `trisul_ai_cli api` is still running.
-2. Hit `/api/health` on the same IP and port you configured.
-3. Recheck SSL, IP, and port on the **Trisul AI** options tab.
-4. If the browser is on another machine, do not use `127.0.0.1` as **AI Endpoint IP** — use the hub’s reachable address.
-5. Check `trisul_ai_cli.log` in the directory where you started the API.
-
-## Usage (CLI mode)
-
-### Basic Queries
-
-```bash
-👤 (You): Show top 10 hosts by traffic in the last hour
-
-🤖 (Bot): Here are the top 10 hosts by traffic:
-+---------------------+----------------+
-| Host IP             | Traffic (GB)   |
-+---------------------+----------------+
-| 10.25.30.151        | 2.42 GB        |
-| 10.26.12.104        | 1.89 GB        |
-| 192.168.1.50        | 1.23 GB        |
-...
-+---------------------+----------------+
-```
-
-```bash
-👤 (You): Top 5 IPs in last 10 minutes
-
-🤖 (Bot): Here are the top 5 hosts by traffic:
-[Returns formatted table with IPs and traffic volumes]
-```
-
-```bash
-👤 (You): How much HTTPS traffic did we see today?
-
-🤖 (Bot): Total HTTPS traffic today: 127.45 GB
-Upload: 45.23 GB, Download: 82.22 GB
-```
-
-### Traffic Charts
-
-```bash
-👤 (You): Show HTTPS traffic trend for 192.168.10.25 over last 6 hours with a chart
-
-🤖 (Bot): [Generates interactive matplotlib chart in popup window]
-
-+---------------------+---------------------+----------------------+
-| Time (IST)          | HTTPS Total Traffic | HTTPS Upload Traffic |
-|---------------------+---------------------+----------------------|
-| 2025-01-27 15:00:00 | 5.51 MB             | 4.51 MB              |
-| 2025-01-27 15:01:00 | 3.46 MB             | 3.22 MB              |
-...
-+---------------------+---------------------+----------------------+
-
-Peak traffic occurred at 15:23:00 with 8.91 MB total.
-```
-
-### Connecting to Remote Servers
-
-```bash
-👤 (You): Connect to the remote server with IP address 10.16.8.44 and port 5008.
-
-🤖 (Bot): OK. I will use the ZMQ endpoint 'tcp://10.16.8.44:5008' for all subsequent queries.
-
-👤 (You): Show top apps by traffic
-
-🤖 (Bot): [Retrieves data from remote server...]
-```
-
-### Knowledge Queries
-
-```bash
-👤 (You): What is a crosskey counter group?
-
-🤖 (Bot): Crosskey is a feature in Trisul that allows you to combine 
-multiple counter groups to create a new composite counter group. For 
-example, you can create a crosskey counter group that combines 'Source IP' 
-and 'Destination IP' counter groups to track traffic between specific IP pairs...
-```
-
-## Available Commands
-
-### MCP Tools (Automatically Called)
-
-
-| Tool                                | Purpose                                                                                                         |
-| ----------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `list_all_contexts`                 | List all Trisul contexts (name, running/initialized, time window, optional disk size)                           |
-| `list_all_probes`                   | List probes (id, description, per-context running status, optional CPU/memory stats)                            |
-| `list_all_profiles`                 | List capture profiles (name, description, probes using each, assigned profile for a node)                       |
-| `get_trisul_mode`                   | Selected mode for a context and probe (`TAP` or `NETFLOW_TAP`)                                                  |
-| `list_capture_interfaces`           | Capture adapters for a profile (name, interface, status, BPF filter, provider options)                          |
-| `list_all_available_counter_groups` | List all available counter groups                                                                               |
-| `get_cginfo_from_countergroup_name` | Get counter group details by name                                                                               |
-| `get_counter_group_topper`          | Fetch top N items by traffic/metrics                                                                            |
-| `get_key_traffic_data`              | Get time-series traffic for specific keys                                                                       |
-| `create_crosskey_counter_group`     | Propose, confirm, then create custom multi-dimensional counter groups                                           |
-| `create_filter_counter_group`       | Propose, confirm, then create filtered counter groups (parent + filter keys)                                    |
-| `create_keyset_counter_group`       | Propose, confirm, then create keyset counter groups (parent + named key buckets)                                |
-| `list_derived_counter_group_types`  | Catalog of crosskey / filter / keyset: when to use, how to create, scenarios, which dashboard module shows them |
-| `list_dashboard_module_types`       | Browse dashboard module templates and their accepted options                                                    |
-| `generate_dashboard_json`           | Validate against live Trisul, preview, then write an importable dashboard JSON under `/tmp`                     |
-| `rag_query`                         | Search Trisul documentation and knowledge base                                                                  |
-| `generate_and_show_chart`           | Generate interactive traffic visualizations                                                                     |
-
-
-#### Filtered counter groups (`create_filter_counter_group`)
-
-Creates a filtered counter group by writing to the Trisul config SQLite DB (same pattern as `create_crosskey_counter_group`). Filter keys are stored in **DB key format** (e.g. `p-0035` for DNS port 53, or `p-0050,p-01BB,p-0019` for multiple ports).
-
-
-| User provides            | Tool behavior                                                                                         |
-| ------------------------ | ----------------------------------------------------------------------------------------------------- |
-| Explicit or partial keys | With `confirm=False`, returns `pending_confirmation` with the complete resolved proposal; no DB write |
-| Proposal                 | Includes arguments/rules, `creation_reason`, and the exact `dashboard_usage`                          |
-| User confirms            | Call again with `confirm=True` and identical parameters; returns the created GUID                     |
-
-
-Example: Parent=FlowIntfs, Filter=Apps, name=`DNSPorts`, keys=`Port-53` → saved as `FilterKeyList=p-0035`.
-
-#### Keyset counter groups (`create_keyset_counter_group`)
-
-Groups keys from a parent counter group into named buckets (KeysetKey → KeyFrom). Keys in KeyFrom are stored in **DB key format** (e.g. `p-0050,p-01BB,p-1F90`).
-
-
-| User provides                                 | Tool behavior                                                                                |
-| --------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| Name + parent, explicit keys, or partial keys | With `confirm=False`, returns the complete proposal; no DB write                             |
-| Proposal                                      | Includes resolved KeysetKey/KeyFrom rules, why it is needed, and where the dashboard uses it |
-| User confirms                                 | Call again with `confirm=True` and identical parameters; returns the created GUID            |
-
-
-Example: Parent=Apps, name=`P2P Traffic`, keyset_key=`p2ptraffic`, keys_from=`Port-6890,Port-6891,...` → saved as comma-separated `p-XXXX` keys.
-
-#### Derived counter groups catalog (`list_derived_counter_group_types`)
-
-Static catalog (not live inventory) covering **crosskey**, **filter**, and **keyset**: what each is, create-tool arguments and confirm workflow, example scenarios, and which dashboard template receives the created GUID (109/110 for crosskey; ordinary toppers/charts for filter and keyset). Always resolve GUIDs from live `list_all_available_counter_groups` — never copy examples from the catalog.
-
-#### Dashboard JSON generation
-
-Dashboard generation never trusts a static counter-group GUID map. It always sends a
-live `COUNTER_GROUP_INFO` request and validates every key with `SEARCH_KEYS`. If the
-requested data requires a new crosskey, filter, or keyset group, the assistant first
-shows the proposed type, name, arguments/rules, reason, and dashboard module usage.
-Creation begins only after explicit confirmation.
-
-Each module also carries an `intent` holding the user's own words for that one panel.
-Every catalog template declares the `presentation` it renders (table, time-series chart,
-single-value badge, tree, sankey, embedded page, alert feed), and
-validation rejects a module whose template contradicts the presentation those words ask
-for — so "https traffic chart" cannot be generated as a toppers list. An option the
-template does not accept is an error too, and the hint names the templates that do
-accept it.
-
-`generate_dashboard_json(confirm=False)` returns a layout preview that states the shape
-each panel renders and the words it was built from. After approval,
-`generate_dashboard_json(confirm=True)` writes the package to `/tmp` and returns the
-complete absolute path including the JSON filename.
-
-### User Commands
-
-Type these in the CLI chat prompt (case-insensitive). They are handled by the client, not sent to the LLM.
-
-
-| Command                                       | What it does                                                                                                      |
-| --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `exit` or `quit`                              | Saves user memory, then exits the CLI                                                                             |
-| `change_llm_api_key`                          | Updates the API key for the **current LLM** provider                                                              |
-| `change_embedding_api_key`                    | Updates the API key for the **current embedding** provider (select an embedding model first if none is set)       |
-| `change_llm_model`                            | Pick a Gemini, OpenAI, or Anthropic model, or choose **custom:local** to configure an OpenAI-compatible endpoint  |
-| `change_custom_llm` or `configure_custom_llm` | Set a local/self-hosted LLM: API base URL, model name, and optional API key (skip the key for Ollama and similar) |
-| `change_embedding_model`                      | Pick an embedding model (Gemini, OpenAI, or VoyageAI) and set its API key if missing                              |
-
-
-## Configuration
-
-### Default Context
-
-By default, Trisul AI connects to `context0` (local IPC socket). You can specify:
-
-- **Context name**: `context_XYZ`, `default`, `context0`
-- **ZMQ endpoint**: `tcp://<ip>:<port>` for remote servers
-
-### Environment Variables
-
-The CLI writes provider, model, and keys to `.env`. Typical keys:
+On a pip install the file is `.env` in the package directory. In Docker it is `/var/lib/trisul-ai/.env` (the `trisul-ai-config` volume).
 
 ```bash
 TRISUL_AI_PROVIDER=gemini          # gemini | openai | anthropic | custom
@@ -416,63 +472,67 @@ TRISUL_EMBEDDING_MODEL=models/gemini-embedding-001
 TRISUL_AI_MAX_TOKENS=16384         # optional completion token cap
 ```
 
-Prefer the **User Commands** above over editing `.env` by hand.
+Prefer the chat commands (`change_llm_model`, `change_llm_api_key`, and the embedding commands) over editing the file by hand. In Docker, either those commands via `docker exec` or the environment variables on `docker run` write the same file.
 
-## Logging
+**Connection the tools use**
 
-Detailed logs are written to `trisul_ai_cli.log` in the installation directory, including:
 
-- Query history
-- Function calls and responses
-- Error messages and debugging information
+| Install             | Default                                                 | Override                                                                     |
+| ------------------- | ------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| pip on the hub host | IPC for `context0` / `default`, or another context name | Say `connect to tcp://<ip>:<port>` for a remote hub                          |
+| Docker              | No usable IPC socket                                    | Say `connect to tcp://<hub-ip>:<port>` at the start of each new conversation |
 
-## Troubleshooting
-
-### Connection Issues
-
-```bash
-Error: ZMQ timeout - no response from ipc://...
-```
-
-**Solution**: Verify Trisul Network Analytics is running and the context exists.
-
-### API Key Issues
-
-```bash
-Error: Invalid API key
-```
-
-**Solution**: In the CLI, run `change_llm_api_key` (or `change_embedding_api_key` if RAG/embeddings fail) and enter a valid key for the current provider. Use `change_llm_model` if you meant to switch providers.
-
-### Empty Responses
-
-If the bot returns empty responses, check:
-
-1. Query clarity (be specific about timeframes and entities)
-2. Counter group availability (`list_all_available_counter_groups`)
-3. Log file for detailed error messages
-
-### WebTrisul chat: Connection Failed
-
-The UI cannot reach `{protocol}://{AI Endpoint IP}:{AI Endpoint Port}/api/query`.
-
-1. Start the API: `trisul_ai_cli api --port 8200`
-2. Confirm `/api/health` returns `"mcp_connected": true`
-3. Match **AI SSL Mode**, **AI Endpoint IP**, and **AI Endpoint Port** on the WebTrisul **Trisul AI** options tab
-
-## Roadmap
-
-- Multi-user conversation history
-- Advanced filtering and correlation queries
-- Integration with alerting systems
-
-## Support
-
-- **Documentation**: [https://www.trisul.org/docs](https://www.trisul.org/docs)
-- **Issues**: [GitHub Issues](https://github.com/trisulnsm/trisul-ai-cli/issues)
 
 ---
 
-**Trisul AI CLI** - Because your network should talk back.
+## Troubleshooting
 
-*Built with care and precision 🔬 by [Unleash Networks](https://www.unleashnetworks.com/)*
+### WebTrisul says "Connection Failed"
+
+The browser cannot reach `{protocol}://{AI Endpoint IP}:{AI Endpoint Port}/api/query`.
+
+1. Pip: the virtual environment is active and `trisul_ai_cli api` is still running. Docker: `docker ps` shows `trisul-ai-cli`.
+2. `curl http://127.0.0.1:8200/api/health` returns `"mcp_connected": true`. From another machine, curl the same IP you entered in WebTrisul.
+3. **AI SSL Mode**, **AI Endpoint IP**, and **AI Endpoint Port** match how the API was started.
+4. Use the host address in **AI Endpoint IP** when the browser is on a different machine.
+
+### WebTrisul says "LLM is not configured."
+
+The API is up and the model is not saved.
+
+- Pip: run `trisul_ai_cli` once and complete the model and API key prompts.
+- Docker: pass `TRISUL_AI_PROVIDER`, `TRISUL_AI_MODEL`, and the matching key on `docker run`, or run `docker exec -it trisul-ai-cli trisul_ai_cli` and complete the prompts.
+- Confirm the container was started with `-v trisul-ai-config:/var/lib/trisul-ai` if you expect a previous choice to still be there.
+
+### Docker answers cannot see traffic
+
+The container is still using the IPC socket. Enable TCP on the hub (once), then start the conversation with the hub IP and port, for example `Connect to tcp://10.16.8.44:5008`. Repeat that line after a refresh or a new conversation.
+
+### ZMQ timeout on an IPC socket
+
+```text
+Error: ZMQ timeout - no response from ipc://...
+```
+
+On a pip install, confirm the Trisul hub is running and the context exists. Inside Docker, switch to the TCP endpoint described above.
+
+### Invalid API key
+
+In the CLI, run `change_llm_api_key`. If documentation search fails, run `change_embedding_api_key`. Use `change_llm_model` when the provider itself should change.
+
+### Empty answers
+
+Be specific about the time range and the entity (host, application, interface). Check `trisul_ai_cli.log` in the directory where you started the API. In Docker, use `docker logs trisul-ai-cli`.
+
+---
+
+## Support
+
+- **Documentation:** [https://www.trisul.org/docs](https://www.trisul.org/docs)
+- **Issues:** [GitHub Issues](https://github.com/trisulnsm/trisul-ai-cli/issues)
+
+---
+
+**Trisul AI CLI** — Because your network should talk back.
+
+*Built with care and precision by [Unleash Networks](https://www.unleashnetworks.com/)*

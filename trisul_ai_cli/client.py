@@ -392,10 +392,18 @@ class TrisulAIClient:
     def _parse_connect_endpoint(self, text: str) -> Optional[str]:
         if not text:
             return None
-        m = re.search(r"connect\s+to\s+(tcp://\S+)", text, re.I)
+        m = re.search(r"\bconnect\s+to\s+(tcp://[^\s,;)]+)", text, re.I)
         if m:
             return m.group(1).rstrip(".,;")
-        m = re.search(r"connect\s+to\s+([\d.]+:\d+)", text, re.I)
+        m = re.search(
+            r"\bconnect\s+to\s+(?:ip(?:\s+address)?\s+)?"
+            r"((?:\d{1,3}\.){3}\d{1,3})\s+(?:on\s+)?port\s+(\d{1,5})\b",
+            text,
+            re.I,
+        )
+        if m:
+            return f"tcp://{m.group(1)}:{m.group(2)}"
+        m = re.search(r"\bconnect\s+to\s+([\d.]+:\d+)\b", text, re.I)
         if m:
             return f"tcp://{m.group(1)}"
         return None
@@ -408,6 +416,43 @@ class TrisulAIClient:
             ctx = m.group(1).strip()
             return ctx if ctx.startswith("context") else f"context{ctx}"
         return None
+
+    _EXPLICIT_CONTEXT_REQUEST_RE = re.compile(
+        r"\b(?:connect\s+to|use|switch\s+to|query|go\s+back\s+to|return\s+to)\s+"
+        r"(?:the\s+)?(?:context\b|context[_-][A-Za-z0-9][\w-]*)"
+        r"|"
+        r"\b(?:connect\s+to|use|switch\s+to)\s+(?:the\s+)?[A-Za-z][\w-]*\s+context\b",
+        re.I,
+    )
+
+    def _explicitly_requests_context(self, text: str) -> bool:
+        """True when the user asks to connect to or use a context name."""
+        if not text:
+            return False
+        user_text = text.split("[SYSTEM:", 1)[0]
+        return self._EXPLICIT_CONTEXT_REQUEST_RE.search(user_text) is not None
+
+    def _active_session_endpoint(self, history: list, query: str) -> Optional[str]:
+        """Keep the latest explicit TCP endpoint until a context is requested.
+
+        A direct endpoint applies to later queries in the same chat. It is cleared
+        only when the user explicitly asks to connect to or use a context name.
+        """
+        endpoint = None
+        texts = []
+        for msg in history or []:
+            if isinstance(msg, HumanMessage):
+                texts.append(str(msg.content or ""))
+        texts.append(query or "")
+        for text in texts:
+            user_text = text.split("[SYSTEM:", 1)[0]
+            found = self._parse_connect_endpoint(user_text)
+            if found:
+                endpoint = found
+                continue
+            if self._explicitly_requests_context(user_text):
+                endpoint = None
+        return endpoint
 
     def _update_connection_from_text(self, text: str) -> None:
         endpoint = self._parse_connect_endpoint(text)
@@ -486,7 +531,16 @@ class TrisulAIClient:
             f"This Web UI session is bound to Trisul context `{locked_context}` only.\n"
             f"- ALWAYS pass `context=\"{locked_context}\"` to every tool that accepts a context argument.\n"
             "- NEVER use any other context name, even if the user asks for it.\n"
-            "- NEVER use a ZMQ/tcp endpoint to reach another context or server.\n"
+            "- The context-name lock does NOT prohibit a direct TCP connection. If the user "
+            "explicitly supplies an IP address and port or a `tcp://host:port` endpoint, connect "
+            "to that exact endpoint and fetch the requested data. Do not tell the user that a "
+            "direct endpoint is blocked by the Web UI context lock.\n"
+            "- Once connected, keep using that same `zmq_endpoint` for every later data query "
+            "in this chat. Do not fall back to the locked context on the next question.\n"
+            "- Stop using the TCP endpoint only when the user explicitly asks to connect to or "
+            "use a context name. Then resume the locked context.\n"
+            "- NEVER infer or discover a TCP endpoint from a requested context name. Direct TCP "
+            "access is allowed only when the user explicitly supplies the endpoint.\n"
             "- If the user asks to use a different context, do NOT switch and do NOT query it. "
             "Tell them clearly: they must switch to that context in the WebTrisul UI and open "
             "the Trisul AI chat window from there.\n"
@@ -509,8 +563,11 @@ class TrisulAIClient:
             first.content = content + self._locked_context_instructions(locked_context)
 
     def _locked_context_override_notice(
-        self, function_name: str, original_args: dict, locked_context: str
+        self, function_name: str, original_args: dict, locked_context: str,
+        direct_endpoint: str = None,
     ) -> Optional[str]:
+        if direct_endpoint:
+            return None
         if not locked_context or function_name not in self.CONTEXT_TOOLS:
             return None
         original_args = original_args or {}
@@ -524,11 +581,18 @@ class TrisulAIClient:
         return None
 
     def _normalize_tool_args(
-        self, function_name: str, function_args: dict, locked_context: str = None
+        self, function_name: str, function_args: dict, locked_context: str = None,
+        direct_endpoint: str = None,
     ) -> dict:
         args = dict(function_args or {})
         if "report_title" in args and "title" not in args:
             args["title"] = args.pop("report_title")
+        if direct_endpoint and function_name in self.TRP_ENDPOINT_TOOLS:
+            # An endpoint explicitly supplied by the user takes precedence over the
+            # Web UI's named-context lock. Pin it to the parsed value so the model
+            # cannot accidentally substitute a different host.
+            args["zmq_endpoint"] = direct_endpoint
+            return args
         if locked_context and function_name in self.CONTEXT_TOOLS:
             args["context"] = locked_context
             args.pop("zmq_endpoint", None)
@@ -1467,7 +1531,9 @@ class TrisulAIClient:
         """Process a query for the REST API. Returns structured JSON data.
         
         Does NOT call any interactive/terminal methods.
-        When context_id is provided (Web UI), all tool calls are locked to that context.
+        When context_id is provided (Web UI), named-context tool calls are locked to
+        that context. An explicit TCP endpoint stays active for later queries in the
+        same session until the user asks to use a context name.
         """
         import time
         start_time = time.time()
@@ -1568,9 +1634,25 @@ class TrisulAIClient:
 
         if locked_context:
             self._ensure_locked_context_prompt(history, locked_context)
+
+        direct_endpoint = self._active_session_endpoint(history, query)
+        if direct_endpoint:
+            logging.info(
+                f"[Client][API] [Session: {session_id}] Using direct TRP endpoint "
+                f"'{direct_endpoint}'"
+            )
         
         logging.info(f"[Client][API] [Session: {session_id}] User Query: {query}")
         user_content = self._augment_query_with_hints(query)
+        if direct_endpoint:
+            endpoint_note = (
+                f"[SYSTEM: This chat is connected to the direct TCP endpoint "
+                f"{direct_endpoint}. Keep using exactly this zmq_endpoint for this query "
+                f"and every later data query until the user explicitly asks to connect to "
+                f"or use a context name. Do not fall back to the locked Web UI context "
+                f"and do not refuse.]"
+            )
+            user_content = f"{user_content}\n\n{endpoint_note}"
         other_contexts = self._mentioned_other_contexts(query, locked_context) if locked_context else []
         if other_contexts:
             mentioned = ", ".join(other_contexts)
@@ -1672,10 +1754,12 @@ class TrisulAIClient:
                 function_name = tool_call["name"]
                 original_args = tool_call["args"]
                 lock_notice = self._locked_context_override_notice(
-                    function_name, original_args, locked_context
+                    function_name, original_args, locked_context,
+                    direct_endpoint=direct_endpoint,
                 )
                 function_args = self._normalize_tool_args(
-                    function_name, original_args, locked_context=locked_context
+                    function_name, original_args, locked_context=locked_context,
+                    direct_endpoint=direct_endpoint,
                 )
                 tool_call_id = tool_call["id"]
 

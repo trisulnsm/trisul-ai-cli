@@ -11,6 +11,9 @@ env/
 *.log
 logs/
 
+# Runtime pid files
+*.pid
+
 # Python egg info
 *.egg-info/
 *.egg

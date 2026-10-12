@@ -1,8 +1,111 @@
 import argparse
 import asyncio
+import atexit
+import os
+import signal
+import subprocess
 import sys
+from pathlib import Path
 from .client import TrisulAIClient
 from importlib.metadata import version
+
+
+def _runtime_dir() -> Path:
+    log_dir = os.environ.get("TRISUL_AI_LOG_DIR", "").strip()
+    if log_dir:
+        directory = Path(log_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+    return Path.cwd()
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _print_recent_log(log_file: Path, max_bytes: int = 4000) -> None:
+    try:
+        with open(log_file, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - max_bytes))
+            data = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return
+    text = data.strip()
+    if text:
+        print(text, file=sys.stderr)
+
+
+def _remove_daemon_pidfile(pid_file: str) -> None:
+    path = Path(pid_file)
+    try:
+        if path.read_text(encoding="utf-8").strip() == str(os.getpid()):
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _start_api_daemon() -> None:
+    """Re-exec the API server detached from this terminal."""
+    if os.name != "posix":
+        print("Daemon mode (-d) is only supported on Unix.", file=sys.stderr)
+        sys.exit(1)
+
+    runtime_dir = _runtime_dir()
+    pid_file = runtime_dir / "trisul_ai_api.pid"
+    log_file = runtime_dir / "trisul_ai_cli.log"
+
+    if pid_file.exists():
+        try:
+            existing = int(pid_file.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            existing = None
+        if existing and _pid_alive(existing):
+            print(
+                f"Trisul AI API is already running in the background (pid {existing}).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        pid_file.unlink(missing_ok=True)
+
+    # Always re-exec as a module. `python -m trisul_ai_cli.cli` sets
+    # argv[0] to cli.py, and running that file directly breaks its
+    # relative imports.
+    argv = [sys.executable, "-m", "trisul_ai_cli.cli"]
+    argv.extend(arg for arg in sys.argv[1:] if arg not in ("-d", "--daemon"))
+    env = os.environ.copy()
+    env["TRISUL_AI_DAEMON_PIDFILE"] = str(pid_file)
+
+    with open(log_file, "ab") as log_handle:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=env,
+            cwd=os.getcwd(),
+        )
+    try:
+        proc.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        pid_file.write_text(f"{proc.pid}\n", encoding="utf-8")
+        print(f"Trisul AI API started in the background (pid {proc.pid}).")
+        print(f"Log file: {log_file}")
+        sys.exit(0)
+
+    print(
+        f"Trisul AI API exited immediately (code {proc.returncode}).",
+        file=sys.stderr,
+    )
+    _print_recent_log(log_file)
+    sys.exit(1)
 
 
 def docs(args=None):
@@ -26,6 +129,8 @@ Examples:
   trisul_ai_cli api --port 8200
   trisul_ai_cli api --host 192.168.1.10 --port 8200 
   trisul_ai_cli api --log-level debug
+  trisul_ai_cli api -d
+  trisul_ai_cli api --port 8200 -d
 
   # 3. Documentation
   trisul_ai_cli docs
@@ -61,6 +166,12 @@ Examples:
         help="Start the Trisul AI REST API server",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=EPILOG
+    )
+    api_parser.add_argument(
+        "-d",
+        "--daemon",
+        action="store_true",
+        help="Run the API server in the background and return immediately",
     )
     api_parser.add_argument(
         "--host",
@@ -100,6 +211,23 @@ Examples:
 
     # 'api' subcommand
     if args.command == "api":
+        pidfile = os.environ.get("TRISUL_AI_DAEMON_PIDFILE", "").strip()
+        if pidfile:
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            atexit.register(_remove_daemon_pidfile, pidfile)
+
+            def _stop_daemon(signum, _frame, pid_file=pidfile):
+                # Uvicorn handles the signal, then raises it again on the way
+                # out. Remove the pid file before that second signal ends the
+                # process without running atexit handlers.
+                _remove_daemon_pidfile(pid_file)
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+
+            signal.signal(signal.SIGTERM, _stop_daemon)
+            signal.signal(signal.SIGINT, _stop_daemon)
+        if args.daemon:
+            _start_api_daemon()
         from trisul_ai_cli.api_server import start_server
         start_server(
             host=args.host, 
