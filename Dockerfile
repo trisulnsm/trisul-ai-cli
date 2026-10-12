@@ -22,7 +22,7 @@ RUN printf '%s\n' '[]' > trisul_ai_cli/trisul_ai_memory.json \
 
 FROM python:3.12-slim-bookworm
 
-ARG TRISUL_AI_VERSION=1.0.2
+ARG TRISUL_AI_VERSION=1.0.3
 
 LABEL org.opencontainers.image.title="Trisul AI" \
       org.opencontainers.image.description="Trisul AI REST API for WebTrisul. Starts the API even when no LLM is configured." \

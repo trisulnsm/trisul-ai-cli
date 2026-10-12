@@ -7,7 +7,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 IMAGE="${1:-unleashnetworks/trisul-ai-cli}"
-VERSION="${2:-1.0.2}"
+VERSION="${2:-1.0.3}"
 
 if ! docker info >/dev/null 2>&1; then
     echo "Docker is not running. Start the Docker engine, then run this script again." >&2

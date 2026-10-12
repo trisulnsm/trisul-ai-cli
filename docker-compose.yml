@@ -4,7 +4,7 @@
 
 services:
   trisul-ai:
-    image: ${TRISUL_AI_IMAGE:-unleashnetworks/trisul-ai-cli:1.0.2}
+    image: ${TRISUL_AI_IMAGE:-unleashnetworks/trisul-ai-cli:1.0.3}
     build:
       context: .
       dockerfile: Dockerfile
